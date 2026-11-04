@@ -1,4 +1,4 @@
-// BUILD_ID: cf-worker-zeus-usage-revoke-v7-20261104-admin-usage-tcp-ui
+// BUILD_ID: cf-worker-zeus-usage-revoke-v8-20261104-iran-tcp-ech-dns-kv-fixes
 // Enhanced with ZEUS-inspired features + Exact Vision UI Dashboard Redesign:
 // - Multi-user structure (users[] with traffic/expire/device/request limits, startOnFirstConnect, resetPeriod)
 // - Fragment profiles for operators (hamrah, irancell, rightel, mokhaberat, gaming, custom)
@@ -26,7 +26,13 @@ const DEFAULT_REMOTE_DNS = "https://8.8.8.8/dns-query";
 const DEFAULT_CLEAN_IP_SOURCE = "https://raw.githubusercontent.com/babaeali626-dot/clean-ips/refs/heads/main/clean-ips.txt";
 const USER_USAGE_PREFIX = "panel-user-usage-v1:";
 const ADMIN_USAGE_KEY = "panel-admin-usage-v1";
-const USER_TRAFFIC_FLUSH_BYTES = 32 * 1024;
+// KV allows one write per second per key. Traffic is therefore buffered in memory and
+// persisted only after 2 MB or every 30 s (and once more when a tunnel closes).
+const USER_TRAFFIC_FLUSH_BYTES = 2 * 1024 * 1024;
+const USER_TRAFFIC_FLUSH_INTERVAL_MS = 30000;
+const KV_MIN_WRITE_INTERVAL_MS = 1100;
+// Worker subrequest budget kept for DoH lookups inside one tunnel (hard platform cap: 50 on Free).
+const DNS_DOH_SUBREQUEST_LIMIT = 45;
 const TCP_TEST_HISTORY_KEY = "panel-tcp-test-history-v1";
 const TCP_TEST_HISTORY_LIMIT = 500;
 const userActiveConnections = new Map();
@@ -483,10 +489,75 @@ function shortExternalError(data, bodyText, fallback) {
   return String(value).replace(/\s+/g, " ").slice(0, 180);
 }
 
+// Explicit Iranian probe nodes, sent in the `node` field to target Iran.
+const CHECK_HOST_IRAN_NODES = [
+  "ir1.node.check-host.net", "ir2.node.check-host.net", "ir3.node.check-host.net",
+  "ir4.node.check-host.net", "ir5.node.check-host.net", "ir6.node.check-host.net"
+];
+
+// True only for Check-Host probe nodes located in Iran: country code "ir",
+// a node id such as "ir1.node.check-host.net", or an explicit Iran country name.
+function isIranCheckHostNode(locationName, node) {
+  const key = String(locationName || "").trim().toLowerCase();
+  const code = String(node?.countryCode ?? node?.country_code ?? node?.cc ?? node?.region ?? "").trim().toLowerCase();
+  const country = String(node?.country || "").trim().toLowerCase();
+  return code === "ir"
+    || /^ir\d*(?:[.\-_:]|$)/.test(key)
+    || country === "ir" || country === "iran" || country.startsWith("iran");
+}
+
+// A node report is either an array of checks directly (e.g. [[1, 0.045, "Connected"]],
+// null while still pending) or an object that carries them in `checks`.
 function externalChecksArray(node) {
+  if (Array.isArray(node)) {
+    // A single un-nested check such as [1, 0.045, "Connected"] is wrapped.
+    if (node.length && !Array.isArray(node[0]) && typeof node[0] !== "object") return [node];
+    return node;
+  }
   if (Array.isArray(node?.checks)) return node.checks;
   if (node?.checks && typeof node.checks === "object") return [node.checks];
   return [];
+}
+
+// Check-Host reports `time` in seconds (0.045) in array/classic checks, while the
+// `connectiontime` object field is already milliseconds. Normalise both to whole ms.
+function checkHostLatencyToMs(value, unit) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const isSeconds = unit === "s" ? true : (n < 10 && !Number.isInteger(n));
+  const ms = isSeconds ? n * 1000 : n;
+  return n > 0 ? Math.max(1, Math.round(ms)) : 0;
+}
+
+// Supports array checks [code, time, message] and object checks
+// {status, connectiontime | time, errortext | error}.
+function parseCheckHostCheck(check) {
+  let rawStatus, rawLatency = null, unit = "auto", message = "";
+  if (Array.isArray(check)) {
+    rawStatus = check[0]; rawLatency = check[1]; unit = "s"; message = check[2];
+  } else if (check && typeof check === "object") {
+    rawStatus = check.status ?? check.code;
+    const connectionTime = check.connectiontime ?? check.connection_time ?? check.latency;
+    if (connectionTime !== undefined && connectionTime !== null) rawLatency = connectionTime;
+    else if (check.time !== undefined && check.time !== null) { rawLatency = check.time; unit = "s"; }
+    message = check.errortext ?? check.error ?? check.message ?? "";
+    if (rawStatus === undefined || rawStatus === null || String(rawStatus).trim() === "") {
+      if (check.error || check.errortext) rawStatus = 0;
+      else if (rawLatency !== null && Number.isFinite(Number(rawLatency))) rawStatus = 1;
+    }
+  } else {
+    rawStatus = check;
+  }
+  const statusText = String(rawStatus ?? "").trim().toLowerCase();
+  const code = statusText === "" ? NaN : Number(statusText);
+  if (code === 1 || ["ok", "success", "connected", "open", "true"].includes(statusText)) {
+    return { state: "ok", latency: checkHostLatencyToMs(rawLatency, unit), error: "" };
+  }
+  if (code === 0 || ["error", "failed", "closed", "timeout", "false"].includes(statusText)) {
+    return { state: "error", latency: null, error: String(message || "") };
+  }
+  return { state: "pending", latency: null, error: "" };
 }
 
 async function checkHostExternalTcp(host, port, dispatchDelayMs = 0, env = {}) {
@@ -521,25 +592,39 @@ async function checkHostExternalTcp(host, port, dispatchDelayMs = 0, env = {}) {
       }
     } catch { /* Continue when the read-only usage endpoint is temporarily unavailable. */ }
 
-    // Primary path: official POST API with no region property, which asks all
-    // available Check-Host nodes instead of the old hard-coded IR-only subset.
+    // Primary path: official POST API restricted to the Iranian probe nodes
+    // (ir1..ir6 via `node`); if the API rejects that body (HTTP 400/422) a plain
+    // body is tried once. The report is additionally filtered below, because the
+    // result must reflect reachability from inside Iran only.
     let started = null;
     let method = "POST";
     let postTransportError = "";
-    try {
-      started = await fetchJsonWithTimeout(`${CHECK_HOST_API}/tcp`, 7000, {
-        method: "POST", headers,
-        body: JSON.stringify({ target: host, port: Number(port), timeout: 2500 })
-      });
-    } catch (error) {
-      postTransportError = String(error?.message || error).slice(0, 120);
+    const baseBody = { target: host, port: Number(port), timeout: 2500 };
+    const postBodies = [
+      { ...baseBody, node: CHECK_HOST_IRAN_NODES },
+      { ...baseBody }
+    ];
+    for (const payload of postBodies) {
+      try {
+        started = await fetchJsonWithTimeout(`${CHECK_HOST_API}/tcp`, 7000, {
+          method: "POST", headers, body: JSON.stringify(payload)
+        });
+        postTransportError = "";
+      } catch (error) {
+        postTransportError = String(error?.message || error).slice(0, 120);
+        started = null;
+        break;
+      }
+      const httpStatus = started?.response?.status;
+      if (isValidStart(started) || (httpStatus !== 400 && httpStatus !== 422)) break;
     }
 
     // Check-Host also publishes an official GET shortcut. Use it if POST was
     // rejected or failed at transport level (except 429, which must not be retried).
     if (!isValidStart(started) && started?.response?.status !== 429) {
       try {
-        const getUrl = `${CHECK_HOST_API}/tcp/${encodeURIComponent(host)}/${Number(port)}?timeout=2500`;
+        const getUrl = `${CHECK_HOST_API}/tcp/${encodeURIComponent(host)}/${Number(port)}?timeout=2500`
+          + CHECK_HOST_IRAN_NODES.map(n => `&node=${encodeURIComponent(n)}`).join("");
         const fallback = await fetchJsonWithTimeout(getUrl, 7000, {
           headers: apiKey ? { Authorization: "Bearer " + apiKey } : {}
         });
@@ -600,17 +685,26 @@ async function checkHostExternalTcp(host, port, dispatchDelayMs = 0, env = {}) {
       }
       reportData = poll.data;
       const map = reportData.data && typeof reportData.data === "object" ? reportData.data : {};
-      const nodes = Object.values(map);
-      const allNodesReported = nodes.length > 0 && nodes.every(node => externalChecksArray(node).length > 0);
-      if (allNodesReported) break;
+      // Only Iranian nodes matter: stop polling once every Iranian node has reported.
+      const iranNodes = Object.entries(map).filter(([name, node]) => isIranCheckHostNode(name, node)).map(([, node]) => node);
+      const allIranNodesReported = iranNodes.length > 0 && iranNodes.every(node => externalChecksArray(node).length > 0);
+      if (allIranNodesReported) break;
     }
 
     const map = reportData?.data && typeof reportData.data === "object" ? reportData.data : {};
-    const entries = Object.entries(map);
-    if (!entries.length) {
-      return { host, port, status: "pending", latency: null, successes: 0, nodes: 0,
+    const allEntries = Object.entries(map);
+    if (!allEntries.length) {
+      return { host, port, status: "pending", latency: null, successes: 0, nodes: 0, iranNodes: 0,
         error: lastPollError ? `آزمون ساخته شد اما گزارش هنوز در دسترس نیست (${lastPollError}).` : "آزمون ساخته شد؛ گزارش گره‌ها هنوز آماده نیست.",
         reportUrl, providerMethod: method };
+    }
+    // Discard every non-Iranian probe (EU/US/...): they say nothing about
+    // reachability for a client located inside Iran.
+    const entries = allEntries.filter(([name, node]) => isIranCheckHostNode(name, node));
+    if (!entries.length) {
+      return { host, port, status: "pending", latency: null, successes: 0, nodes: 0, iranNodes: 0,
+        error: "عدم حضور گره فعال در ایران؛ هیچ گرهٔ ایرانی در این آزمون گزارش نداد (گره‌های خارجی عمداً نادیده گرفته شدند). نتیجه‌ای از داخل ایران در دسترس نیست و نباید به‌عنوان موفق یا ناموفق تلقی شود.",
+        reportUrl, providerMethod: method, nodeResults: [], failedNodes: 0, pendingNodes: 0 };
     }
 
     const times = [];
@@ -619,35 +713,27 @@ async function checkHostExternalTcp(host, port, dispatchDelayMs = 0, env = {}) {
       const city = [node?.city || node?.country || "گره نامشخص", node?.isp || node?.datacenter || locationName].filter(Boolean).join(" — ");
       const checks = externalChecksArray(node);
       if (!checks.length) { pending++; return { node: locationName, city, status: "pending", latency: null }; }
-      const check = checks[0] || {};
-      const rawStatus = check.status;
-      const statusText = String(rawStatus ?? "").toLowerCase();
-      const hasStatus = rawStatus !== null && rawStatus !== undefined && statusText.trim() !== "";
-      const code = hasStatus ? Number(rawStatus) : NaN;
-      const isOk = code === 1 || ["ok", "success", "connected", "open", "true"].includes(statusText);
-      const isFailure = code === 0 || ["error", "failed", "closed", "timeout", "false"].includes(statusText);
-      if (isOk) {
+      const parsed = parseCheckHostCheck(checks[0]);
+      if (parsed.state === "ok") {
         successfulNodes++;
-        const rawLatency = check.connectiontime;
-        const latency = rawLatency !== null && rawLatency !== undefined && rawLatency !== "" && Number.isFinite(Number(rawLatency))
-          ? Math.max(0, Math.round(Number(rawLatency))) : null;
-        if (latency !== null) times.push(latency);
-        return { node: locationName, city, status: "ok", latency };
+        if (parsed.latency !== null) times.push(parsed.latency);
+        return { node: locationName, city, status: "ok", latency: parsed.latency };
       }
-      if (!isFailure) { pending++; return { node: locationName, city, status: "pending", latency: null }; }
+      if (parsed.state === "pending") { pending++; return { node: locationName, city, status: "pending", latency: null }; }
       failed++;
-      return { node: locationName, city, status: "error", latency: null, error: String(check.errortext || check.error || "اتصال TCP برقرار نشد").slice(0, 160) };
+      return { node: locationName, city, status: "error", latency: null, error: String(parsed.error || "اتصال TCP برقرار نشد").slice(0, 160) };
     });
     const avg = times.length ? Math.round(times.reduce((a, b) => a + b, 0) / times.length) : null;
+    // Status is derived strictly from Iranian nodes.
     const status = successfulNodes > 0 ? "ok" : pending > 0 ? "pending" : "error";
     return {
-      host, port, status, latency: avg, successes: successfulNodes, nodes: entries.length,
+      host, port, status, latency: avg, successes: successfulNodes, nodes: entries.length, iranNodes: entries.length,
       minLatency: times.length ? Math.min(...times) : null,
       maxLatency: times.length ? Math.max(...times) : null,
       error: status === "error" ? (() => {
         const reasons = nodeResults.filter(node => node.status === "error" && node.error).slice(0, 3).map(node => node.city + ": " + node.error);
-        return "هیچ‌یک از گره‌های پاسخ‌دهنده اتصال TCP برقرار نکردند." + (reasons.length ? " جزئیات: " + reasons.join("؛ ") : "");
-      })() : status === "pending" ? "برخی گره‌ها هنوز پاسخ نداده‌اند؛ نامشخص به‌معنای بسته‌بودن پورت نیست." : null,
+        return "هیچ‌یک از گره‌های ایرانی پاسخ‌دهنده اتصال TCP برقرار نکردند." + (reasons.length ? " جزئیات: " + reasons.join("؛ ") : "");
+      })() : status === "pending" ? "برخی گره‌های ایرانی هنوز پاسخ نداده‌اند؛ نامشخص به‌معنای بسته‌بودن پورت نیست." : null,
       reportUrl, failedNodes: failed, pendingNodes: pending, nodeResults, providerMethod: method
     };
   } catch (err) {
@@ -743,7 +829,7 @@ async function handleExternalPing(request, kv, env, requestUrl) {
   const stampedResults = await appendTcpTestHistory(kv, results);
   const byKey = new Map(stampedResults.map(item => [`${item.host}|${item.port}`, item]));
   const resultsWithTime = results.map(item => ({ ...item, checkedAt: byKey.get(`${item.host}|${item.port}`)?.checkedAt || Date.now() }));
-  return json({ provider: "Check-Host.cc", note: "نتایج از گره‌های فعال جهانی Check-Host.cc هستند؛ این گره‌ها نمایندهٔ تمام اپراتورها یا مسیر دقیق کاربر نیستند.", results: resultsWithTime });
+  return json({ provider: "Check-Host.cc", note: "نتایج فقط از گره‌های ایرانی Check-Host.cc محاسبه می‌شوند؛ گره‌های خارجی نادیده گرفته می‌شوند. این گره‌ها نمایندهٔ همهٔ اپراتورها یا مسیر دقیق کاربر نیستند.", results: resultsWithTime });
 }
 
 // -------------------- Session & Setup Helpers --------------------
@@ -1241,6 +1327,7 @@ async function getUserUsage(kv, user) {
 async function saveUserUsage(kv, userId, usage) {
   if (!kv) throw new Error("برای مدیریت کاربران باید KV متصل باشد.");
   await kv.put(USER_USAGE_PREFIX + userId, JSON.stringify(usage));
+  markKvWrite(USER_USAGE_PREFIX + userId);
 }
 
 function normalizeAdminUsage(raw = {}) {
@@ -1264,6 +1351,48 @@ async function getAdminUsage(kv) {
 async function saveAdminUsage(kv, usage) {
   if (!kv) return;
   await kv.put(ADMIN_USAGE_KEY, JSON.stringify(normalizeAdminUsage(usage)));
+  markKvWrite(ADMIN_USAGE_KEY);
+}
+
+// Per-isolate write pacing/coalescing so that concurrent tunnels of the same account
+// never write the same KV key more than once per second.
+const kvLastWriteAt = new Map();
+const trafficWriteQueues = new Map();
+function markKvWrite(key) {
+  kvLastWriteAt.set(key, Date.now());
+  if (kvLastWriteAt.size > 2000) kvLastWriteAt.delete(kvLastWriteAt.keys().next().value);
+}
+async function paceKvWrite(key) {
+  const wait = (kvLastWriteAt.get(key) || 0) + KV_MIN_WRITE_INTERVAL_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+}
+function enqueueTrafficWrite(kv, accountId, bytes, dailyDeltas) {
+  const id = String(accountId || "default");
+  let entry = trafficWriteQueues.get(id);
+  if (!entry) trafficWriteQueues.set(id, entry = { bytes: 0, daily: {}, promise: null });
+  entry.bytes += Math.max(0, Math.floor(Number(bytes) || 0));
+  for (const [day, value] of Object.entries(dailyDeltas || {})) entry.daily[day] = (entry.daily[day] || 0) + Math.max(0, Math.floor(Number(value) || 0));
+  if (!entry.promise) {
+    entry.promise = (async () => {
+      try {
+        while (entry.bytes > 0) {
+          const amount = entry.bytes, daily = entry.daily;
+          entry.bytes = 0; entry.daily = {};
+          try {
+            if (id === "default") await addAdminTraffic(kv, amount, daily);
+            else await addUserTraffic(kv, id, amount, daily);
+          } catch (err) {
+            // Keep the bytes buffered for the next flush instead of losing them.
+            entry.bytes += amount;
+            for (const [day, value] of Object.entries(daily)) entry.daily[day] = (entry.daily[day] || 0) + value;
+            console.warn("User usage persistence failed:", String(err?.message || err).slice(0, 120));
+            break;
+          }
+        }
+      } finally { entry.promise = null; }
+    })();
+  }
+  return entry.promise;
 }
 
 async function addAdminTraffic(kv, amount, dailyDeltas = null) {
@@ -1281,6 +1410,7 @@ async function addAdminTraffic(kv, amount, dailyDeltas = null) {
       dailyTotal += bytes;
     }
     if (dailyTotal < acceptedAmount) addDailyUsage(usage, utcUsageDayKey(), 0, acceptedAmount - dailyTotal);
+    await paceKvWrite(ADMIN_USAGE_KEY);
     await saveAdminUsage(kv, usage);
     const local = userTrafficState.get("default");
     if (local && local.periodStartedAt === Number(usage.periodStartedAt || 0)) local.usageBytes = Math.max(local.usageBytes, usage.usageBytes);
@@ -1408,6 +1538,7 @@ async function addUserTraffic(kv, userId, amount, dailyDeltas = null) {
       dailyTotal += bytes;
     }
     if (dailyTotal < acceptedAmount) addDailyUsage(usage, utcUsageDayKey(), 0, acceptedAmount - dailyTotal);
+    await paceKvWrite(USER_USAGE_PREFIX + userId);
     await saveUserUsage(kv, userId, usage);
     const local = userTrafficState.get(String(userId));
     if (local && local.periodStartedAt === Number(usage.periodStartedAt || 0)) local.usageBytes = Math.max(local.usageBytes, usage.usageBytes);
@@ -1525,6 +1656,7 @@ function validateSettings(body, env) {
   s.dohUrl = validateDohUrl(s.dohUrl);
   s.remoteDns = validateDohUrl(s.remoteDns);
   if (s.echConfigList.length > 8192 || /[\r\n]{3,}/.test(s.echConfigList)) throw new Error("ECH Config List بیش از حد طولانی یا دارای قالب نامعتبر است.");
+  if (s.echEnabled && s.echConfigList && !normalizeEchConfigList(s.echConfigList)) throw new Error("ECH Config List باید یک ECHConfigList معتبر به‌صورت Base64 (یا بلوک PEM) باشد؛ مقدار ساختگی مانند دامنه+DoH پذیرفته نمی‌شود.");
   s.localDns = validateDnsSetting(s.localDns, "Local DNS", false);
   s.antiSanctionDns = validateDnsSetting(s.antiSanctionDns, "Anti Sanction DNS", true);
   s.logLevel = normalizeLogLevel(s.logLevel, true);
@@ -2102,13 +2234,57 @@ function makeSubscriptionLinks(settings, requestUrl, host) {
   };
 }
 
+// Extracts a valid Base64 ECHConfigList from the free-text setting. Accepts a
+// plain Base64 line (standard or URL-safe) or a PEM "ECH CONFIGS" block.
+// Returns standard padded Base64, or "" when nothing valid was supplied, so
+// callers can omit the ECH field instead of emitting something clients cannot decode.
+function normalizeEchConfigList(raw) {
+  const text = String(raw == null ? "" : raw).trim();
+  if (!text) return "";
+  let candidates;
+  if (/-----BEGIN [A-Z ]*ECH[A-Z ]*-----/i.test(text)) {
+    const body = text.replace(/-----BEGIN [^-]+-----/gi, "\n").replace(/-----END [^-]+-----/gi, "\n");
+    candidates = [body.replace(/\s+/g, "")];
+  } else {
+    candidates = text.split(/\r?\n/).map(line => line.replace(/\s+/g, "")).filter(Boolean);
+  }
+  for (const candidate of candidates) {
+    if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(candidate)) continue;
+    let b64 = candidate.replace(/=+$/, "").replace(/-/g, "+").replace(/_/g, "/");
+    if (b64.length % 4 === 1) continue;
+    b64 += "=".repeat((4 - (b64.length % 4)) % 4);
+    let bytes;
+    try { bytes = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0)); } catch { continue; }
+    // ECHConfigList = uint16 length prefix followed by one or more ECHConfig structures.
+    if (bytes.length < 8 || ((bytes[0] << 8) | bytes[1]) !== bytes.length - 2) continue;
+    return b64;
+  }
+  return "";
+}
+function echConfigForOutput(settings) {
+  return settings.echEnabled ? normalizeEchConfigList(settings.echConfigList) : "";
+}
+function echPemLines(b64) {
+  const lines = ["-----BEGIN ECH CONFIGS-----"];
+  for (let i = 0; i < b64.length; i += 64) lines.push(b64.slice(i, i + 64));
+  lines.push("-----END ECH CONFIGS-----");
+  return lines;
+}
+
+// One source of truth for the WebSocket path so the URI, Xray and Sing-box
+// outputs can never disagree. Xray-style early data: "?ed=N" in the path makes
+// V2RayN/Nekoray/Xray carry the first payload in Sec-WebSocket-Protocol.
+function wsPathFor(settings, proto, withEarlyDataQuery = true) {
+  return "/" + String(proto).toLowerCase() + (withEarlyDataQuery && settings.earlyData ? "?ed=" + EARLY_DATA_SIZE : "");
+}
+
 function makeUris(settings, host) {
   const result = [];
   const publicHost = cleanHost(host);
-  const edPart = settings.earlyData ? "?ed=" + EARLY_DATA_SIZE : "";
-  const pathOf = base => encodeURIComponent(base + edPart);
-  const fp = encodeURIComponent(settings.fingerprint || "chrome");
-  const echValue = settings.echEnabled ? (settings.echConfigList || (publicHost + "+" + (settings.remoteDns || DEFAULT_REMOTE_DNS))) : "";
+  const pathOf = base => encodeURIComponent(wsPathFor(settings, base.replace(/^\//, "")));
+  const fp = encodeURIComponent(normalizeFingerprint(settings.fingerprint));
+  // ECH is emitted only for a valid user-supplied ECHConfigList; never synthesized.
+  const echValue = echConfigForOutput(settings);
   const echExtra = echValue ? "&ech=" + encodeURIComponent(echValue) : "";
   const tlsExtra = "&fp=" + fp + "&alpn=" + encodeURIComponent("http/1.1") + echExtra;
   const pass = settings.trojanPassword ? encodeURIComponent(settings.trojanPassword) : "";
@@ -2133,18 +2309,18 @@ function makeUris(settings, host) {
 function makeXrayConfig(settings, host) {
   const sni = cleanHost(host);
   const endpoints = getEndpoints(settings, sni);
-  const early = settings.earlyData ? "?ed=" + EARLY_DATA_SIZE : "";
   const outboundsData = generateOutboundsData(settings, endpoints);
+  const echConfig = echConfigForOutput(settings);
   const proxies = [];
 
   for (const o of outboundsData) {
     const stream = {
       network: "ws", security: o.isTls ? "tls" : "none",
-      wsSettings: { path: `/${o.proto.toLowerCase()}${early}`, headers: { Host: sni } }
+      wsSettings: { path: wsPathFor(settings, o.proto), headers: { Host: sni } }
     };
     if (o.isTls) {
-      stream.tlsSettings = { serverName: sni, allowInsecure: false, fingerprint: settings.fingerprint || "chrome", alpn: ["http/1.1"] };
-      if (settings.echEnabled) stream.tlsSettings.echConfigList = settings.echConfigList || `${sni}+${settings.remoteDns || DEFAULT_REMOTE_DNS}`;
+      stream.tlsSettings = { serverName: sni, allowInsecure: false, fingerprint: normalizeFingerprint(settings.fingerprint), alpn: ["http/1.1"] };
+      if (echConfig) stream.tlsSettings.echConfigList = echConfig;
     }
     if (settings.fragmentEnabled && o.isTls) stream.sockopt = { dialerProxy: "fragment" };
 
@@ -2156,7 +2332,11 @@ function makeXrayConfig(settings, host) {
   }
 
   const bypass = settings.bypassIran === true;
-  const rules = [];
+  // DNS must never leave through the operator's (filtered) network. Port-53 UDP is
+  // handed to Xray's internal DNS module ("dns-out"), which resolves geosite:ir
+  // names with the local DNS and everything else over the DoH servers; those DoH
+  // requests follow the normal rules below and therefore travel through the tunnel.
+  const rules = [{ type: "field", inboundTag: ["socks-in"], network: "udp", port: "53", outboundTag: "dns-out" }];
   if (bypass) {
     rules.push({ type: "field", ip: ["geoip:private"], outboundTag: "direct" });
     rules.push({ type: "field", domain: ["geosite:ir", "regexp:.*\\.ir$"], outboundTag: "direct" });
@@ -2168,13 +2348,13 @@ function makeXrayConfig(settings, host) {
   if (customDomains.length) rules.push({ type: "field", domain: customDomains, outboundTag: "direct" });
   if (customIps.length) rules.push({ type: "field", ip: customIps, outboundTag: "direct" });
 
-  rules.push({ type: "field", network: "udp", port: "53", outboundTag: "direct" });
   rules.push({ type: "field", network: "udp", outboundTag: "block" });
 
   const routing = { domainStrategy: bypass ? "IPIfNonMatch" : "AsIs", rules };
   const outbounds = [
     ...proxies,
     { tag: "direct", protocol: "freedom", settings: {} },
+    { tag: "dns-out", protocol: "dns", settings: {} },
     { tag: "block", protocol: "blackhole", settings: { response: { type: "http" } } }
   ];
 
@@ -2211,25 +2391,26 @@ function makeSingBoxConfig(settings, host) {
   const outboundsData = generateOutboundsData(settings, endpoints);
   const outbounds = [];
   const tags = [];
+  const echConfig = echConfigForOutput(settings);
 
   const tlsCfg = (isTls) => {
     if (!isTls) return { enabled: false };
     const config = {
       enabled: true, server_name: sni, insecure: false,
-      fragment: settings.fragmentEnabled,
-      fragment_length: settings.fragmentEnabled ? settings.fragmentLength : undefined,
-      fragment_interval: settings.fragmentEnabled ? settings.fragmentInterval : undefined,
+      // Sing-box only understands a boolean "fragment" (no length/interval fields);
+      // unknown keys would make its strict JSON parser reject the whole profile.
+      fragment: settings.fragmentEnabled === true,
       fragment_fallback_delay: "500ms"
     };
-    if (settings.echEnabled) {
-      const echLines = String(settings.echConfigList || "").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-      config.ech = { enabled: true, ...(echLines.length ? { config: echLines } : {}) };
-    }
+    // ECH only with a valid user-supplied ECHConfigList (PEM form is what Sing-box expects).
+    if (echConfig) config.ech = { enabled: true, config: echPemLines(echConfig) };
     config.utls = { enabled: true, fingerprint: normalizeFingerprint(settings.fingerprint) };
     return config;
   };
 
   const transport = path => {
+    // Early data travels in the Sec-WebSocket-Protocol header (Xray-compatible),
+    // so the path stays clean; max_early_data matches the "?ed=" value in URI/Xray outputs.
     const t = { type: "ws", path, headers: { Host: sni } };
     if (settings.earlyData) { t.max_early_data = EARLY_DATA_SIZE; t.early_data_header_name = "Sec-WebSocket-Protocol"; }
     return t;
@@ -2238,9 +2419,9 @@ function makeSingBoxConfig(settings, host) {
   for (const o of outboundsData) {
     tags.push(o.tag);
     if (o.proto === "VLESS") {
-      outbounds.push({ type: "vless", tag: o.tag, server: o.address, server_port: o.port, uuid: settings.uuid, tls: tlsCfg(o.isTls), transport: transport("/vless") });
+      outbounds.push({ type: "vless", tag: o.tag, server: o.address, server_port: o.port, uuid: settings.uuid, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "vless", false)) });
     } else {
-      outbounds.push({ type: "trojan", tag: o.tag, server: o.address, server_port: o.port, password: settings.trojanPassword, tls: tlsCfg(o.isTls), transport: transport("/trojan") });
+      outbounds.push({ type: "trojan", tag: o.tag, server: o.address, server_port: o.port, password: settings.trojanPassword, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "trojan", false)) });
     }
   }
 
@@ -2258,13 +2439,19 @@ function makeSingBoxConfig(settings, host) {
   const customIps = customBypass.filter(x => x.type === "ip").map(x => x.value);
   if (customDomains.length) routeRules.push({ domain_suffix: customDomains, outbound: "direct" });
   if (customIps.length) routeRules.push({ ip_cidr: customIps, outbound: "direct" });
-  routeRules.push({ network: ["udp"], port: [53], outbound: "direct" });
   routeRules.push({ network: ["udp"], outbound: "block" });
+  // DNS is hijacked into Sing-box's own resolver instead of being sent direct to the
+  // operator network. The hijack rule must be evaluated before every other rule.
+  routeRules.unshift({ port: [53], action: "hijack-dns" });
 
   const dnsServers = [toSingBoxDnsServer(settings.localDns || "localhost", "local"), toSingBoxDnsServer(settings.remoteDns || DEFAULT_REMOTE_DNS, "remote")];
   if (settings.antiSanctionDns) dnsServers.push(toSingBoxDnsServer(settings.antiSanctionDns, "anti-sanction"));
+  // Remote DoH servers are reached through the proxy so their queries never leak.
+  // (The panel's own domain is resolved via "local" to avoid a bootstrap loop.)
+  if (tags.length) for (const server of dnsServers) if (server.tag === "remote" || server.tag === "anti-sanction") if (server.type !== "local") server.detour = "proxy";
   if (settings.fakeDnsEnabled) dnsServers.push({ type: "fakeip", tag: "fakeip", inet4_range: "198.18.0.0/15", ...(settings.ipv6Enabled === false ? {} : { inet6_range: "fc00::/18" }) });
   const dnsRules = [];
+  if (sni && !isIPv4Text(sni) && !isIPv6Text(sni)) dnsRules.push({ domain: [sni], server: "local" });
   if (settings.bypassIran) dnsRules.push({ domain_suffix: [".ir"], server: "local" });
   const dnsFinal = settings.fakeDnsEnabled ? "fakeip" : (settings.antiSanctionDns ? "anti-sanction" : "remote");
 
@@ -2272,7 +2459,7 @@ function makeSingBoxConfig(settings, host) {
     log: { level: logLevelForSingBox(settings.logLevel), timestamp: true, ...(normalizeLogLevel(settings.logLevel) === "none" ? { disabled: true } : {}) },
     dns: { servers: dnsServers, ...(dnsRules.length ? { rules: dnsRules } : {}), final: dnsFinal, strategy: settings.ipv6Enabled === false ? "ipv4_only" : "prefer_ipv4" },
     inbounds: [{ type: "mixed", tag: "mixed-in", listen: "127.0.0.1", listen_port: 2080 }],
-    outbounds, route: { final: tags.length ? "proxy" : "direct", auto_detect_interface: true, rules: routeRules }
+    outbounds, route: { final: tags.length ? "proxy" : "direct", auto_detect_interface: true, default_domain_resolver: "local", rules: routeRules }
   };
 }
 
@@ -2355,11 +2542,9 @@ async function handleTunnel(request, env, kv, kind, ctx) {
     const dailyDeltas = Object.fromEntries(userSessionDailyBytes.entries());
     userSessionDailyBytes.clear();
     userSessionPersistedBytes += pending;
-    userTrafficPersistChain = userTrafficPersistChain.then(() => id === "default" ? addAdminTraffic(kv, pending, dailyDeltas) : addUserTraffic(kv, id, pending, dailyDeltas)).catch(err => {
-      userSessionPersistedBytes = Math.max(0, userSessionPersistedBytes - pending);
-      for (const [day, bytes] of Object.entries(dailyDeltas)) userSessionDailyBytes.set(day, (userSessionDailyBytes.get(day) || 0) + bytes);
-      console.warn("User usage persistence failed:", String(err?.message || err).slice(0, 120));
-    });
+    // Bytes are handed to the shared per-account queue, which coalesces concurrent
+    // tunnels and paces KV writes; failures stay buffered there, so no rollback is needed here.
+    userTrafficPersistChain = enqueueTrafficWrite(kv, id, pending, dailyDeltas);
     if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(userTrafficPersistChain);
     return userTrafficPersistChain;
   };
@@ -2465,10 +2650,12 @@ async function handleTunnel(request, env, kv, kind, ctx) {
     if (!isAllowedDestinationPort(parsed.port, env)) throw new Error("port not allowed");
     dest = { host: parsed.host, port: parsed.port };
     rememberWrite(parsed.data);
+    // Acknowledge the VLESS request right away so the client is not left waiting
+    // (and the socket does not stall) while the outbound connection is opened.
+    if (kind === "vless" && !finished) server.send(new Uint8Array([parsed.version, 0]));
     const r = await openOutbound(settings, parsed.host, parsed.port, parsed.data, -1);
     if (finished) { try { r.close(); } catch {} return; }
     remote = r; remoteWriter = r.writable.getWriter();
-    if (kind === "vless") server.send(new Uint8Array([parsed.version, 0]));
     generation++;
     void pumpRemote(r.readable, server, hooks, generation);
   };
@@ -2498,7 +2685,7 @@ async function handleTunnel(request, env, kv, kind, ctx) {
       activeUser = session.user;
       userUsageAtStart = session.usage;
       userTrafficLedger = session.trafficState || null;
-      userUsageFlushTimer = setInterval(() => { void queueUserTrafficFlush(true); }, 5000);
+      userUsageFlushTimer = setInterval(() => { void queueUserTrafficFlush(true); }, USER_TRAFFIC_FLUSH_INTERVAL_MS);
       activeSettings = userScopedSettings(authSettings, activeUser);
       registerUserConnection(activeUser.id || "default", closeAll);
       if (kind === "vless" && !activeSettings.vlessEnabled) throw new Error("VLESS is disabled for this user");
@@ -2532,8 +2719,11 @@ async function handleTunnel(request, env, kv, kind, ctx) {
 
 function getEarlyDataProtocolForResponse(header, earlyBytes) {
   if (!header || !earlyBytes || !earlyBytes.length || earlyBytes.length > EARLY_DATA_SIZE) return null;
-  const value = String(header).trim();
-  if (value.length > MAX_EARLY_HEADER || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  if (String(header).length > MAX_EARLY_HEADER) return null;
+  // The client may list several sub-protocols; the first one carries the early data and
+  // is the only one the server may select in its 101 response.
+  const value = String(header).split(",")[0].trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
   return value;
 }
 
@@ -2688,12 +2878,29 @@ function encodeTrojanUdpPacket(host, port, payload) {
 }
 
 async function forwardDnsQuery(packet, state, dohUrl, ws, trojanSource = null) {
+  // A Worker invocation may issue only a limited number of subrequests (50 on the Free
+  // plan). Long-lived tunnels that keep resolving names would otherwise hit the cap and
+  // throw; instead the budget is tracked, the condition is logged once, and further
+  // lookups are dropped (clients simply retry/fail over) while the tunnel stays open.
+  if (state.dohBudget === undefined) state.dohBudget = DNS_DOH_SUBREQUEST_LIMIT;
+  if (state.dohBudget <= 0) {
+    if (!state.dohBudgetLogged) { state.dohBudgetLogged = true; console.warn("DoH subrequest budget exhausted; dropping further DNS queries for this tunnel."); }
+    return;
+  }
+  state.dohBudget--;
   const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 8000);
   let ans;
   try {
     const res = await fetch(dohUrl || DEFAULT_DOH_URL, { method: "POST", headers: { "content-type": "application/dns-message", "accept": "application/dns-message" }, body: packet, signal: ctrl.signal });
-    if (!res.ok) throw new Error();
+    if (!res.ok) throw new Error("DoH HTTP " + res.status);
     ans = new Uint8Array(await res.arrayBuffer());
+  } catch (err) {
+    if (/subrequest/i.test(String(err && err.message || err))) {
+      state.dohBudget = 0;
+      if (!state.dohBudgetLogged) { state.dohBudgetLogged = true; console.warn("Worker subrequest limit reached while resolving DNS:", String(err.message || err).slice(0, 120)); }
+      return;
+    }
+    throw err;
   } finally { clearTimeout(timer); }
   if (!ans.length || ans.length > 65535) throw new Error();
   if (ws.readyState !== WebSocket.OPEN) return;
@@ -2832,9 +3039,23 @@ function buildVlessUpstreamHeader(uuid, host, port) {
   return out;
 }
 function buildTrojanUpstreamHeader(password, host, port) {
-  const hash = enc.encode(sha224Hex(password) + "\r\n"), addr = encodeAddress(host), out = new Uint8Array(hash.length + 1 + addr.length + 2 + 2);
+  const hash = enc.encode(sha224Hex(password) + "\r\n"), addr = encodeTrojanAddress(host), out = new Uint8Array(hash.length + 1 + addr.length + 2 + 2);
   let p = 0; out.set(hash, p); p += hash.length; out[p++] = 1; out.set(addr, p); p += addr.length; out[p++] = (port >> 8) & 255; out[p++] = port & 255; out[p++] = 13; out[p++] = 10;
   return out;
+}
+// Trojan uses SOCKS5 address types: 1 = IPv4, 3 = domain, 4 = IPv6 (VLESS uses 1/2/3).
+function encodeTrojanAddress(host) {
+  const value = String(host || "");
+  if (isIPv4Text(value)) return new Uint8Array([1, ...value.split(".").map(Number)]);
+  if (value.includes(":")) {
+    const groups = expandIPv6(value.replace(/^\[|\]$/g, "")), out = new Uint8Array(17);
+    out[0] = 4;
+    groups.forEach((n, i) => { out[1 + i * 2] = (n >> 8) & 255; out[2 + i * 2] = n & 255; });
+    return out;
+  }
+  const data = enc.encode(value);
+  if (!data.length || data.length > 255) throw new Error("invalid Trojan upstream domain");
+  return new Uint8Array([3, data.length, ...data]);
 }
 function encodeAddress(host) {
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return new Uint8Array([1, ...host.split(".").map(Number)]);
@@ -3563,7 +3784,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
               <p class="small-note" style="margin:2px 0 0;">جدول، مسیرها و پورت‌های مدیر را نشان می‌دهد؛ عدد کل بالا، ساب‌کاربران فعال را هم دربرمی‌گیرد.</p>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
-              <button type="button" id="dashTestPingBtn">تست TCP از نقاط فعال جهانی</button>
+              <button type="button" id="dashTestPingBtn">تست TCP از گره‌های ایران</button>
               <button type="button" class="secondary" onclick="switchTab('sec-outputs')">مشاهده خروجی‌ها</button>
             </div>
           </div>
@@ -3703,7 +3924,7 @@ Gaming</option></select><p class="small-note">پروفایل فقط مقادیر
           <div class="field"><label for="remoteDns">Remote DNS برای خروجی کلاینت</label><input type="url" id="remoteDns" dir="ltr" placeholder="https://8.8.8.8/dns-query" value="https://8.8.8.8/dns-query"></div>
           <label class="check-label"><span>فعال‌سازی ECH (در خروجی‌های سازگار)</span><input type="checkbox" id="echEnabled"></label>
           <div class="field"><label for="echConfigList">ECH Config List (اختیاری؛ هر خط یک مقدار)</label><textarea id="echConfigList" rows="3" dir="ltr" placeholder="ECH config data"></textarea></div>
-          <p class="small-note">ECH به‌صورت پیش‌فرض خاموش است. مقدار سفارشی باید با قالب کلاینت مقصد سازگار باشد؛ قرار دادن متن نامعتبر می‌تواند خروجی ECH را غیرقابل استفاده کند.</p>
+          <p class="small-note">ECH به‌صورت پیش‌فرض خاموش است و فقط وقتی در خروجی‌ها درج می‌شود که یک ECHConfigList معتبر (Base64 یا بلوک PEM) وارد کرده باشید؛ در غیر این صورت فیلد ECH کاملاً حذف می‌شود.</p>
           <label class="check-label"><span>عبور مستقیم ترافیک ایران (Bypass)</span><input type="checkbox" id="bypassIran"></label>
           <div class="field"><label for="customBypass">قوانین Bypass سفارشی (هر خط یک قانون)</label><textarea id="customBypass" rows="4" dir="ltr" placeholder="domain:example.com&#10;ip:203.0.113.0/24"></textarea><p class="small-note">فرمت‌های پشتیبانی‌شده: domain:example.com و ip:192.0.2.1 یا ip:192.0.2.0/24. این مقصدها در فایل‌های خروجی به مسیر مستقیم (direct) می‌روند.</p></div>
           <div class="bypass-builder" style="display:grid;grid-template-columns:minmax(110px,.7fr) minmax(0,2fr) auto;gap:8px;align-items:end;">
@@ -3748,15 +3969,15 @@ Gaming</option></select><p class="small-note">پروفایل فقط مقادیر
         <div style="display:flex; gap:10px; flex-wrap:wrap;">
           <button id="saveCleanBtn">ذخیره</button>
           <button class="secondary" id="syncCleanBtn">به‌روزرسانی از GitHub</button>
-          <button class="secondary" id="testCleanBtn">تست TCP از نقاط فعال جهانی</button>
+          <button class="secondary" id="testCleanBtn">تست TCP از گره‌های ایران</button>
           <button id="sortCleanBtn">آزمون + مرتب‌سازی خروجی</button>
         </div>
-        <p class="small-note" style="margin-top:12px;">این آزمون TCP را از گره‌های فعال جهانی Check-Host می‌گیرد؛ آدرس و پورت هدف برای آن سرویس ارسال می‌شود. نتایج نمایندهٔ همهٔ اپراتورها یا مسیر دقیق گوشی شما نیستند و معادل ICMP Ping هم نیستند. برای همگام‌سازی خودکار روزانه، در Cloudflare برای Worker یک Cron Trigger مانند <code>0 4 * * *</code> (ساعت ۰۴:۰۰ UTC) اضافه کنید.</p>
+        <p class="small-note" style="margin-top:12px;">این آزمون TCP را فقط از گره‌های ایرانِ Check-Host می‌گیرد (گره‌های خارجی نادیده گرفته می‌شوند)؛ آدرس و پورت هدف برای آن سرویس ارسال می‌شود. نتایج نمایندهٔ همهٔ اپراتورها یا مسیر دقیق گوشی شما نیستند و معادل ICMP Ping هم نیستند. برای همگام‌سازی خودکار روزانه، در Cloudflare برای Worker یک Cron Trigger مانند <code>0 4 * * *</code> (ساعت ۰۴:۰۰ UTC) اضافه کنید.</p>
         <div id="previewChanges" class="hidden" style="margin-top:16px; padding:12px 14px; background:rgba(15,21,53,0.85); border:1px solid var(--border); border-radius:14px;">
            <h3 style="margin:0 0 6px;font-size:13.5px;font-weight:700;">پیش‌نمایش تغییرات:</h3>
            <p class="small-note" id="previewText" style="margin:0;"></p>
         </div>
-        <h3 style="margin-top:24px;font-size:16px;">نتایج آزمون TCP از گره‌های فعال جهانی</h3>
+        <h3 style="margin-top:24px;font-size:16px;">نتایج آزمون TCP از گره‌های ایران</h3>
         <div class="table-wrap">
           <table id="cleanIpTable">
             <thead><tr><th>آدرس</th><th>پورت</th><th>میانگین تأخیر نقاط</th><th>اتصال موفق</th><th>گزارش</th></tr></thead>
@@ -4168,13 +4389,9 @@ function fillForm(s) {
   $('dashEndpointCount').textContent = String(endpointsCount);
   $('dashUserCount').textContent = String(usersCount);
 
-  if ($('auUsersMetric')) $('auUsersMetric').textContent = String(usersCount);
-  if ($('auPortsMetric')) $('auPortsMetric').textContent = String(portsCount);
-  if ($('auIpsMetric')) $('auIpsMetric').textContent = String(cleanCount);
 
   renderUsers();
   renderDashboardConfigs(s);
-  if ($('auConfigsMetric')) $('auConfigsMetric').textContent = $('dashConfigCount').textContent;
   if (s.links) { $('linkXray').textContent = s.links.xray; $('linkXrayJson').textContent = s.links.xrayJson; $('linkSingbox').textContent = s.links.singbox; }
   renderDirectUris(s.links && Array.isArray(s.links.uris) ? s.links.uris : []);
 }
@@ -4239,9 +4456,11 @@ function countAvailableDashboardConfigs(s) {
 function externalResultCell(host, port) {
   const result = externalPingResults[portKey(host, port)];
   const td = document.createElement('td');
+  const queueLabel = externalQueueLabel(host, port);
+  if (queueLabel === 'در حال تست…' || (!result && queueLabel)) { td.textContent = queueLabel; td.style.color = 'var(--muted)'; return td; }
   if (!result) { td.textContent = 'هنوز تست نشده'; td.style.color = 'var(--muted)'; return td; }
   if (result.status === 'ok') {
-    td.textContent = String(result.latency) + ' ms · ' + result.successes + '/' + result.nodes + ' نقطه';
+    td.textContent = String(result.latency) + ' ms · ' + result.successes + '/' + result.nodes + ' گره ایران';
     td.title = 'کمینه ' + result.minLatency + ' ms، بیشینه ' + result.maxLatency + ' ms\n' + (result.nodeResults || []).map(n => n.city + ': ' + (n.status === 'ok' ? n.latency + ' ms' : (n.error || (n.status === 'pending' ? 'در انتظار' : 'ناموفق')))).join('\n');
     td.style.color = 'var(--good)';
   } else if (result.status === 'pending') {
@@ -4389,14 +4608,15 @@ $('syncCleanBtn').onclick = async () => {
 };
 
 async function testAndSortCleanIPs() {
+  if (externalTestRunActive) return showStatus('یک آزمون در حال اجراست؛ تا پایان آن صبر کنید یا با دکمهٔ تست آن را متوقف کنید.');
   if (!(await saveAllSettings())) return;
   const hosts = String($('cleanIPs').value || '').split(/[\r\n,]+/).map(line => line.trim().split('#')[0].trim()).filter(Boolean);
   const uniqueHosts = [...new Set(hosts)];
   if (!uniqueHosts.length) return showStatus('ابتدا Clean IP وارد یا از GitHub همگام‌سازی کنید.', true);
   const port = Number(globalSettings.tlsPort || 443);
   const targets = uniqueHosts.map(host => ({ host, port }));
-  if (uniqueHosts.length > 1) showStatus('برای رعایت سقف درخواست Check-Host، در هر نوبت یک IP بررسی می‌شود؛ با اجرای دوباره، IP بعدی انتخاب خواهد شد.');
-  await runExternalTests(targets, true, 1);
+  if (uniqueHosts.length > 1) showStatus(uniqueHosts.length + ' IP به‌صورت ترتیبی و با فاصلهٔ چند ثانیه تست می‌شوند تا به سقف نرخ Check-Host نخوریم؛ نتایج زنده در جدول به‌روز می‌شود.');
+  await runExternalTests(targets, true);
 
   const lines = String($('cleanIPs').value || '').split(/[\r\n,]+/).map(line => line.trim()).filter(Boolean);
   const originalIndex = new Map(lines.map((line, index) => [line.split('#')[0].trim().toLowerCase(), index]));
@@ -4751,187 +4971,302 @@ function makeScannerHtml(targets, port, plainPort, domain) {
     "fX0KPC9zdHlsZT48L2hlYWQ+PGJvZHk+PG1haW4gY2xhc3M9IndyYXAiPgo8aGVhZGVyIGNsYXNzPSJoZXJvIj48ZGl2PjxoMT7Y",
     "p9iz2qnZhtixIENsZWFuIElQPC9oMT48cD7Yotiy2YXZiNmGIFRDUCDYp9iyINqv2LHZh+KAjNmH2KfbjCDYqNuM2LHZiNmG24zY",
     "myDZgdmH2LHYs9iqIElQ2YfYpyDZh9mG2q/Yp9mFINiv2KfZhtmE2YjYryDYp9iyINm+2YbZhCDYr9ixINin24zZhiDZgdin24zZ",
-    "hCDYsNiu24zYsdmHINi02K/ZhyDYp9iz2KouPC9wPjwvZGl2PjxzcGFuIGNsYXNzPSJ0YWciPlRDUCBQUk9CRSDCtyBSVEw8L3Nw",
-    "YW4+PC9oZWFkZXI+CjxkaXYgY2xhc3M9Indhcm5pbmciPjxiPtmG2qnYqtmHINmF2YfZhTo8L2I+INmF2LHZiNix2q/YsSDYp9is",
-    "2KfYstmHINin2KrYtdin2YQgVENQINiu2KfZhSDbjNinINiq2YbYuNuM2YUgSG9zdC9TTkkg2K/ZhNiu2YjYp9mHINix2Kcg2YbZ",
-    "hduM4oCM2K/Zh9ivLiDYqNix2KfbjCDYrNmE2Yjar9uM2LHbjCDYp9iyINmG2KrYp9uM2Kwg2KjbjOKAjNmF2LnZhtuM2Iwg2Kfb",
-    "jNmGINmG2LPYrtmHINin2LIg2LPYsdmI24zYsyBDaGVjay1Ib3N0INin2LPYqtmB2KfYr9mHINmF24zigIzaqdmG2K8uINit2KfZ",
-    "hNiqIMKr2KfbjNix2KfZhsK7INii2LLZhdin24zYtCDYsdinINin2LIg2q/YsdmH4oCM2YfYp9uMINmF2YjYrNmI2K8g2KLZhiDZ",
-    "hdmG2LfZgtmHINin2YbYrNin2YUg2YXbjOKAjNiv2YfYr9iMINmG2Ycg2K/ZgtuM2YLYp9mLINin2LIg2KfbjNmG2KrYsdmG2Kog",
-    "2KfZvtix2KfYqtmI2LEg2LTZhdinLiDZhtiq24zYrNmHIFRDUCDZhdmI2YHZgiDbjNi52YbbjCDZvtmI2LHYqiDYp9iyINii2YYg",
-    "2q/YsdmHINmC2KfYqNmEINin2KrYtdin2YQg2KjZiNiv2YfYmyDYqNmH4oCM2KrZhtmH2KfbjNuMINiz2KfZhNmFINio2YjYr9mG",
-    "IFZMRVNTL1dlYlNvY2tldCDbjNinIFRMUyDYsdinINiq2LbZhduM2YYg2YbZhduM4oCM2qnZhtivLjwvZGl2Pgo8ZGl2IGlkPSJz",
-    "ZXJ2aWNlRXJyb3IiIGNsYXNzPSJlcnJvcmJveCI+PC9kaXY+CjxzZWN0aW9uIGNsYXNzPSJzdGF0cyI+PGRpdiBjbGFzcz0ic3Rh",
-    "dCI+PHNwYW4+2qnZhCBJUNmH2Kc8L3NwYW4+PHN0cm9uZyBpZD0idG90YWwiPjA8L3N0cm9uZz48L2Rpdj48ZGl2IGNsYXNzPSJz",
-    "dGF0Ij48c3Bhbj7YqNix2LHYs9uM4oCM2LTYr9mHPC9zcGFuPjxzdHJvbmcgaWQ9ImNoZWNrZWQiPjA8L3N0cm9uZz48L2Rpdj48",
-    "ZGl2IGNsYXNzPSJzdGF0Ij48c3Bhbj7Yrdiv2KfZgtmEINuM2qkg2KfYqti12KfZhCDZhdmI2YHZgjwvc3Bhbj48c3Ryb25nIGlk",
-    "PSJvayI+MDwvc3Ryb25nPjwvZGl2PjxkaXYgY2xhc3M9InN0YXQiPjxzcGFuPtmG2KfZhdi02K7YtSAvINiu2LfYp9uMINiz2LHZ",
-    "iNuM2LM8L3NwYW4+PHN0cm9uZyBpZD0idW5rbm93biI+MDwvc3Ryb25nPjwvZGl2Pjwvc2VjdGlvbj4KPHNlY3Rpb24gY2xhc3M9",
-    "ImdyaWQiPjxkaXY+PGRpdiBjbGFzcz0iY2FyZCI+PGgyPtmB2YfYsdiz2KogSVA8L2gyPjx0ZXh0YXJlYSBpZD0iaXBMaXN0IiBz",
-    "cGVsbGNoZWNrPSJmYWxzZSI+PC90ZXh0YXJlYT48ZGl2IGNsYXNzPSJjb250cm9scyI+PGRpdj48bGFiZWwgY2xhc3M9Im5vdGUi",
-    "IGZvcj0icmVnaW9uIj7ZhdmG2LfZgtmHINqv2LHZh+KAjNmH2KfbjCDYotiy2YXZiNmGPC9sYWJlbD48c2VsZWN0IGlkPSJyZWdp",
-    "b24iPjxvcHRpb24gdmFsdWU9IklSIiBzZWxlY3RlZD7Yp9uM2LHYp9mGICjar9ix2YfigIzZh9in24wg2YXZiNis2YjYryk8L29w",
-    "dGlvbj48b3B0aW9uIHZhbHVlPSJXT1JMRCI+2KzZh9in2YbbjDwvb3B0aW9uPjxvcHRpb24gdmFsdWU9IkVVIj7Yp9ix2YjZvtin",
-    "PC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iTkEiPtii2YXYsduM2qnYp9uMINi02YXYp9mE24w8L29wdGlvbj48L3NlbGVjdD48L2Rp",
-    "dj48ZGl2PjxsYWJlbCBjbGFzcz0ibm90ZSIgZm9yPSJwb3J0Ij7ZvtmI2LHYqiBUQ1A8L2xhYmVsPjxpbnB1dCBpZD0icG9ydCIg",
-    "dHlwZT0ibnVtYmVyIiBtaW49IjEiIG1heD0iNjU1MzUiIHZhbHVlPSI0NDMiPjwvZGl2PjwvZGl2PjxwIGNsYXNzPSJub3RlIj7Y",
-    "qNix2KfbjCDYqNix2LHYs9uMINm+2YjYsdiqINi624zYsSBUTFMg2YXZgtiv2KfYsSA4MCDbjNinIDgwODAg2LHYpyDZiNin2LHY",
-    "ryDaqdmG24zYr9ibINin24zZhiDYqtiz2Kog2YHZgti3INin2KrYtdin2YQgVENQINix2Kcg2YXbjOKAjNiz2YbYrNivLjwvcD48",
-    "ZGl2IGNsYXNzPSJjb250cm9scyI+PGJ1dHRvbiBpZD0ic3RhcnQiPti02LHZiNi5INii2LLZhdmI2YY8L2J1dHRvbj48YnV0dG9u",
-    "IGNsYXNzPSJzZWNvbmRhcnkiIGlkPSJzdG9wIiBkaXNhYmxlZD7YqtmI2YLZgSDZvtizINin2LIg2KLYstmF2YjZhuKAjNmH2Kfb",
-    "jCDYrNin2LHbjDwvYnV0dG9uPjwvZGl2PjxidXR0b24gY2xhc3M9InNlY29uZGFyeSIgaWQ9ImRvd25sb2FkIj7Yr9in2YbZhNmI",
-    "2K8g2YbYqtin24zYrCBDU1Y8L2J1dHRvbj48L2Rpdj48ZGl2IGNsYXNzPSJjYXJkIj48aDI+2q/Ystin2LHYtCDYp9is2LHYpzwv",
-    "aDI+PGRpdiBjbGFzcz0ibG9nIiBpZD0ibG9nIj7ZgdmH2LHYs9iqINio2KfYsdqv2LDYp9ix24wg2LTYr9ibINii2YXYp9iv2Ycg",
-    "2KLYstmF2YjZhi48L2Rpdj48L2Rpdj48L2Rpdj4KPGRpdj48ZGl2IGNsYXNzPSJjYXJkIj48aDI+2YbYqtin24zYrCBJUNmH2Kc8",
-    "L2gyPjxkaXYgY2xhc3M9InByb2dyZXNzIj48ZGl2IGlkPSJiYXIiPjwvZGl2PjwvZGl2PjxkaXYgY2xhc3M9InRhYmxlLXdyYXAi",
-    "Pjx0YWJsZT48dGhlYWQ+PHRyPjx0aD5JUCAvINio2LHahtiz2Kg8L3RoPjx0aD7ZvtmI2LHYqjwvdGg+PHRoPtmF24zYp9mG2q/b",
-    "jNmGPC90aD48dGg+2YXZiNmB2YIgLyDar9ix2YfigIzZh9inPC90aD48dGg+2YjYtti524zYqjwvdGg+PC90cj48L3RoZWFkPjx0",
-    "Ym9keSBpZD0icm93cyI+PC90Ym9keT48L3RhYmxlPjwvZGl2PjxwIGNsYXNzPSJub3RlIj7Yrti32KfbjCBBUEnYjCDZhdit2K/Z",
-    "iNiv24zYqiDZhtix2K4g24zYpyDZhtio2YjYryDar9ix2Ycg2YXZhti32YLZh+KAjNin24wg2KfYsiDYrtix2KfYqNuMIElQINis",
-    "2K/YpyDZhtmF2KfbjNi0INiv2KfYr9mHINmF24zigIzYtNmI2K8uINin2q/YsSDYs9ix2YjbjNizIEhUVFAgNDAzLzQyOSDYqNiv",
-    "2YfYr9iMINmG2KrYp9uM2KwgSVDZh9inINix2Kcg2YbZhduM4oCM2KrZiNin2YYg2KfYsiDYp9uM2YYg2KfYrNix2Kcg2YbYqtuM",
-    "2KzZh+KAjNqv24zYsduMINqp2LHYry48L3A+PC9kaXY+PGRpdiBjbGFzcz0iY2FyZCI+PGgyPtmF2LnZhtuMINmG2KrbjNis2Yfi",
-    "gIzZh9inPC9oMj48cCBjbGFzcz0ibm90ZSI+PGI+2YLYp9io2YQg2KfYqti12KfZhDo8L2I+INit2K/Yp9mC2YQg24zaqSDar9ix",
-    "2Ycg2LPYsdmI24zYsyDYqtmI2KfZhtiz2KrZhyBUQ1AgaGFuZHNoYWtlINio2LHZgtix2KfYsSDaqdmG2K8uPC9wPjxwIGNsYXNz",
-    "PSJub3RlIj48Yj7Zhtin2YXZiNmB2YI6PC9iPiDar9ix2YfigIzZh9in24wg2q/Ystin2LHYtOKAjNiv2YfZhtiv2Ycg2YbYqtmI",
-    "2KfZhtiz2KrZh+KAjNin2YbYryBUQ1Ag2YjYtdmEINi02YjZhtiv2Jsg2KfbjNmGINmG2KrbjNis2Ycg2YXYrti12YjYtSDZh9mF",
-    "2KfZhiDar9ix2YfigIzZh9in2LPYqi48L3A+PHAgY2xhc3M9Im5vdGUiPjxiPtmG2KfZhdi02K7YtTo8L2I+INqv2LLYp9ix2LQg",
-    "2qnYp9mF2YQg2YbbjNiz2Kog24zYpyDar9ix2YfigIzYp9uMINmG2KrbjNis2Ycg2YbYr9in2K/ZhyDYp9iz2KouPC9wPjwvZGl2",
-    "PjwvZGl2Pjwvc2VjdGlvbj4KPGZvb3RlciBjbGFzcz0iZm9vdCI+2KfYs9qp2YbYsSBIVE1MINmF2LPYqtmC2YQgwrcg2KjYr9mI",
-    "2YYg2YbbjNin2LIg2KjZhyBQb3dlclNoZWxsIMK3INiz2LHZiNuM2LMg2KjbjNix2YjZhtuMOiBDaGVjay1Ib3N0LmNjPC9mb290",
-    "ZXI+PC9tYWluPjxzY3JpcHQ+CmNvbnN0IEVNQkVEREVEX1RBUkdFVFMgPSBfX1RBUkdFVFNfXzsKY29uc3QgRU1CRURERURfRE9N",
-    "QUlOID0gX19ET01BSU5fXzsKY29uc3QgRU1CRURERURfVExTX1BPUlQgPSBfX1RMU19QT1JUX187CmNvbnN0IEVNQkVEREVEX1BM",
-    "QUlOX1BPUlQgPSBfX1BMQUlOX1BPUlRfXzsKY29uc3QgQVBJX0JBU0UgPSAiaHR0cHM6Ly9hcGkuY2hlY2staG9zdC5jYyI7CmNv",
-    "bnN0ICQ9aWQ9PmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKGlkKTtsZXQgcnVubmluZz1mYWxzZSxzdG9wUmVxdWVzdGVkPWZhbHNl",
-    "LGl0ZW1zPVtdLHJlY29yZHM9W10sc3VjY2Vzcz0wLHVua25vd249MCxjb21wbGV0ZWQ9MCxuZXh0RGlzcGF0Y2hBdD0wO2NvbnN0",
-    "IGFjdGl2ZUNvbnRyb2xsZXJzPW5ldyBTZXQoKTsKZnVuY3Rpb24gc2xlZXAobXMpe3JldHVybiBuZXcgUHJvbWlzZShyZXNvbHZl",
-    "PT5zZXRUaW1lb3V0KHJlc29sdmUsbXMpKTt9CmZ1bmN0aW9uIHdyaXRlTG9nKHRleHQpe2NvbnN0IHA9ZG9jdW1lbnQuY3JlYXRl",
-    "RWxlbWVudCgiZGl2Iik7cC50ZXh0Q29udGVudD0iWyIrbmV3IERhdGUoKS50b0xvY2FsZVRpbWVTdHJpbmcoKSsiXSAiK3RleHQ7",
-    "JCgibG9nIikuYXBwZW5kQ2hpbGQocCk7JCgibG9nIikuc2Nyb2xsVG9wPSQoImxvZyIpLnNjcm9sbEhlaWdodDt9CmZ1bmN0aW9u",
-    "IHNob3dTZXJ2aWNlRXJyb3IodGV4dCl7Y29uc3QgZWw9JCgic2VydmljZUVycm9yIik7ZWwudGV4dENvbnRlbnQ9dGV4dDtlbC5z",
-    "dHlsZS5kaXNwbGF5PXRleHQ/ImJsb2NrIjoibm9uZSI7fQpmdW5jdGlvbiBub3JtYWxpemVUYXJnZXRzKCl7Y29uc3Qgc2Vlbj1u",
-    "ZXcgU2V0KCk7cmV0dXJuICQoImlwTGlzdCIpLnZhbHVlLnNwbGl0KC9bXHJcbiw7XSsvKS5tYXAoeD0+eC50cmltKCkpLmZpbHRl",
-    "cihCb29sZWFuKS5tYXAobGluZT0+e2NvbnN0IHBhcnRzPWxpbmUuc3BsaXQoIiMiKTtyZXR1cm4ge2lwOnBhcnRzWzBdLnRyaW0o",
-    "KSxsYWJlbDpwYXJ0cy5zbGljZSgxKS5qb2luKCIjIikudHJpbSgpfTt9KS5maWx0ZXIoeD0+L15cZHsxLDN9KD86XC5cZHsxLDN9",
-    "KXszfSQvLnRlc3QoeC5pcCkmJnguaXAuc3BsaXQoIi4iKS5ldmVyeShuPT5OdW1iZXIobik+PTAmJk51bWJlcihuKTw9MjU1KSYm",
-    "IXNlZW4uaGFzKHguaXApJiZzZWVuLmFkZCh4LmlwKSk7fQpmdW5jdGlvbiBkcmF3KCl7JCgidG90YWwiKS50ZXh0Q29udGVudD1T",
-    "dHJpbmcoaXRlbXMubGVuZ3RoKTskKCJjaGVja2VkIikudGV4dENvbnRlbnQ9U3RyaW5nKGNvbXBsZXRlZCk7JCgib2siKS50ZXh0",
-    "Q29udGVudD1TdHJpbmcoc3VjY2Vzcyk7JCgidW5rbm93biIpLnRleHRDb250ZW50PVN0cmluZyh1bmtub3duKTskKCJiYXIiKS5z",
-    "dHlsZS53aWR0aD0oaXRlbXMubGVuZ3RoP01hdGgucm91bmQoY29tcGxldGVkL2l0ZW1zLmxlbmd0aCoxMDApOjApKyIlIjtjb25z",
-    "dCBib2R5PSQoInJvd3MiKTtib2R5LnJlcGxhY2VDaGlsZHJlbigpO3JlY29yZHMuZm9yRWFjaChyPT57Y29uc3QgdHI9ZG9jdW1l",
-    "bnQuY3JlYXRlRWxlbWVudCgidHIiKTtbci5pcCsoci5sYWJlbD8iIMK3ICIrci5sYWJlbDoiIiksU3RyaW5nKHIucG9ydCksci5s",
-    "YXRlbmN5PT09bnVsbD8i4oCUIjpyLmxhdGVuY3krIiBtcyIsci5zdWNjZXNzZXMrIiAvICIrci5ub2RlcyxyLnN0YXR1c1RleHRd",
-    "LmZvckVhY2goKHYsaSk9Pntjb25zdCB0ZD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJ0ZCIpO3RkLnRleHRDb250ZW50PXY7aWYo",
-    "aT09PTQpdGQuY2xhc3NOYW1lPXIuc3RhdHVzPT09Im9rIj8ic3RhdHVzLW9rIjooci5zdGF0dXM9PT0iZXJyb3IiPyJzdGF0dXMt",
-    "ZXJyb3IiOiJzdGF0dXMtdW5rbm93biIpO3RyLmFwcGVuZENoaWxkKHRkKTt9KTtib2R5LmFwcGVuZENoaWxkKHRyKTt9KTt9CmFz",
-    "eW5jIGZ1bmN0aW9uIGZldGNoSnNvbih1cmwsaW5pdD17fSx0aW1lb3V0PTgwMDApe2NvbnN0IGNvbnRyb2xsZXI9bmV3IEFib3J0",
-    "Q29udHJvbGxlcigpO2FjdGl2ZUNvbnRyb2xsZXJzLmFkZChjb250cm9sbGVyKTtjb25zdCB0aW1lcj1zZXRUaW1lb3V0KCgpPT5j",
-    "b250cm9sbGVyLmFib3J0KCksdGltZW91dCk7dHJ5e2NvbnN0IHJlc3BvbnNlPWF3YWl0IGZldGNoKHVybCx7Li4uaW5pdCxzaWdu",
-    "YWw6Y29udHJvbGxlci5zaWduYWwsaGVhZGVyczp7QWNjZXB0OiJhcHBsaWNhdGlvbi9qc29uIiwuLi4oaW5pdC5oZWFkZXJzfHx7",
-    "fSl9fSk7Y29uc3QgYm9keT1hd2FpdCByZXNwb25zZS50ZXh0KCk7bGV0IGRhdGE9bnVsbDt0cnl7ZGF0YT1ib2R5P0pTT04ucGFy",
-    "c2UoYm9keSk6bnVsbDt9Y2F0Y2h7fXJldHVybiB7cmVzcG9uc2UsZGF0YSxib2R5OmJvZHkuc2xpY2UoMCwyNDApfTt9ZmluYWxs",
-    "eXtjbGVhclRpbWVvdXQodGltZXIpO2FjdGl2ZUNvbnRyb2xsZXJzLmRlbGV0ZShjb250cm9sbGVyKTt9fQpmdW5jdGlvbiBlcnJv",
-    "ckZyb21BcGkocmVzLHBoYXNlKXtjb25zdCBzdGF0dXM9cmVzJiZyZXMucmVzcG9uc2U/cmVzLnJlc3BvbnNlLnN0YXR1czowO2lm",
-    "KHN0YXR1cz09PTQwMylyZXR1cm4gItiz2LHZiNuM2LMgQ2hlY2stSG9zdCDYr9ix2K7ZiNin2LPYqiDYsdinINix2K8g2qnYsdiv",
-    "IChIVFRQIDQwMykuINmH24zahiBJUCDYr9ixINin24zZhiDYp9is2LHYpyDYs9in2YTZhSDbjNinINiu2LHYp9ioINin2LHYstuM",
-    "2KfYqNuMINmG2LTYr9mHINin2LPYqi4iO2lmKHN0YXR1cz09PTQyOSlyZXR1cm4gItmF2K3Yr9mI2K/bjNiqINiv2LHYrtmI2KfY",
-    "s9iqINiz2LHZiNuM2LMgQ2hlY2stSG9zdCAoSFRUUCA0MjkpLiDahtmG2K8g2K/ZgtuM2YLZhyDZhdqp2Ksg2qnZhtuM2K8g2Ygg",
-    "2KrYudiv2KfYryBJUNmH2KfbjCDZh9ixINin2KzYsdinINix2Kcg2qnZhdiq2LEg2qnZhtuM2K8uIjtpZihzdGF0dXM9PT0wKXJl",
-    "dHVybiAi2YXYsdmI2LHar9ixINmG2KrZiNin2YbYs9iqINio2YcgQVBJINiz2LHZiNuM2LMg2KjYsdiz2K/YmyDYp9it2KrZhdin",
-    "2YQg2KfYrtiq2YTYp9mEINi02KjaqdmH2IwgRE5TINuM2Kcg2YXYrdiv2YjYr9uM2KogQ09SUyDZiNis2YjYryDYr9in2LHYry4i",
-    "O3JldHVybiAi2LPYsdmI24zYsyBDaGVjay1Ib3N0INiv2LEg2YXYsdit2YTZhyAiK3BoYXNlKyIg2b7Yp9iz2K4g2YLYp9io2YQg",
-    "2KfYs9iq2YHYp9iv2Ycg2YbYr9in2K8gKEhUVFAgIitzdGF0dXMrIikuICIrU3RyaW5nKHJlcy5ib2R5fHwiIikuc2xpY2UoMCwx",
-    "NDApO30KZnVuY3Rpb24gZ2V0Q2hlY2tzKG5vZGUpe2lmKEFycmF5LmlzQXJyYXkobm9kZSYmbm9kZS5jaGVja3MpKXJldHVybiBu",
-    "b2RlLmNoZWNrcztpZihub2RlJiZub2RlLmNoZWNrcyYmdHlwZW9mIG5vZGUuY2hlY2tzPT09Im9iamVjdCIpcmV0dXJuIFtub2Rl",
-    "LmNoZWNrc107cmV0dXJuIFtdO30KYXN5bmMgZnVuY3Rpb24gd2FpdERpc3BhdGNoU2xvdCgpe2NvbnN0IG5vdz1EYXRlLm5vdygp",
-    "O2NvbnN0IGRlbGF5PU1hdGgubWF4KDAsbmV4dERpc3BhdGNoQXQtbm93KTtuZXh0RGlzcGF0Y2hBdD1NYXRoLm1heChub3csbmV4",
-    "dERpc3BhdGNoQXQpKzEyNTA7aWYoZGVsYXkpYXdhaXQgc2xlZXAoZGVsYXkpO30KYXN5bmMgZnVuY3Rpb24gdGVzdE9uZSh0YXJn",
-    "ZXQscG9ydCxyZWdpb24pe2NvbnN0IHJlc3VsdD17aXA6dGFyZ2V0LmlwLGxhYmVsOnRhcmdldC5sYWJlbCxwb3J0LGxhdGVuY3k6",
-    "bnVsbCxzdWNjZXNzZXM6MCxub2RlczowLHN0YXR1czoidW5rbm93biIsc3RhdHVzVGV4dDoi2YbYp9mF2LTYrti1IMK3INqv2LLY",
-    "p9ix2LQg2YfZhtmI2LIg2K/YsduM2KfZgdiqINmG2LTYr9mHIn07dHJ5e2F3YWl0IHdhaXREaXNwYXRjaFNsb3QoKTtpZihzdG9w",
-    "UmVxdWVzdGVkKXtyZXN1bHQuc3RhdHVzVGV4dD0i2YXYqtmI2YLZgSDYtNivINm+24zYtCDYp9iyINi02LHZiNi5INiv2LHYrtmI",
-    "2KfYs9iqIjtyZXR1cm4gcmVzdWx0O31jb25zdCBib2R5PXt0YXJnZXQ6dGFyZ2V0LmlwLHBvcnQsdGltZW91dDo1MDAwfTtpZihy",
-    "ZWdpb24hPT0iV09STEQiKWJvZHkucmVnaW9uPVtyZWdpb25dO2NvbnN0IHN0YXJ0ZWQ9YXdhaXQgZmV0Y2hKc29uKEFQSV9CQVNF",
-    "KyIvdGNwIix7bWV0aG9kOiJQT1NUIixoZWFkZXJzOnsiQ29udGVudC1UeXBlIjoiYXBwbGljYXRpb24vanNvbiJ9LGJvZHk6SlNP",
-    "Ti5zdHJpbmdpZnkoYm9keSl9LDEwMDAwKTtpZighc3RhcnRlZC5yZXNwb25zZS5va3x8IXN0YXJ0ZWQuZGF0YXx8c3RhcnRlZC5k",
-    "YXRhLnN1Y2Nlc3MhPT10cnVlfHwhc3RhcnRlZC5kYXRhLnV1aWQpe2NvbnN0IG1lc3NhZ2U9ZXJyb3JGcm9tQXBpKHN0YXJ0ZWQs",
-    "Itin2LHYs9in2YQiKTtyZXN1bHQuc3RhdHVzPXN0YXJ0ZWQucmVzcG9uc2Uuc3RhdHVzPT09NDAzfHxzdGFydGVkLnJlc3BvbnNl",
-    "LnN0YXR1cz09PTQyOT8iZXJyb3IiOiJ1bmtub3duIjtyZXN1bHQuc3RhdHVzVGV4dD1tZXNzYWdlO3Jlc3VsdC5zZXJ2aWNlRXJy",
-    "b3I9bWVzc2FnZTtyZXR1cm4gcmVzdWx0O31jb25zdCBpZD1TdHJpbmcoc3RhcnRlZC5kYXRhLnV1aWQpO2xldCByZXBvcnQ9bnVs",
-    "bDtmb3IobGV0IGk9MDtpPDk7aSsrKXtpZihzdG9wUmVxdWVzdGVkKWJyZWFrO2F3YWl0IHNsZWVwKGk9PT0wPzkwMDoxMjAwKTts",
-    "ZXQgcG9sbDt0cnl7cG9sbD1hd2FpdCBmZXRjaEpzb24oQVBJX0JBU0UrIi9yZXBvcnQvIitlbmNvZGVVUklDb21wb25lbnQoaWQp",
-    "LHt9LDUwMDApO31jYXRjaChlKXtjb250aW51ZTt9aWYocG9sbC5yZXNwb25zZS5zdGF0dXM9PT00MDN8fHBvbGwucmVzcG9uc2Uu",
-    "c3RhdHVzPT09NDI5KXtjb25zdCBtZXNzYWdlPWVycm9yRnJvbUFwaShwb2xsLCLYr9ix24zYp9mB2Kog2q/Ystin2LHYtCIpO3Jl",
-    "c3VsdC5zdGF0dXM9ImVycm9yIjtyZXN1bHQuc3RhdHVzVGV4dD1tZXNzYWdlO3Jlc3VsdC5zZXJ2aWNlRXJyb3I9bWVzc2FnZTty",
-    "ZXR1cm4gcmVzdWx0O31pZighcG9sbC5yZXNwb25zZS5va3x8IXBvbGwuZGF0YXx8IXBvbGwuZGF0YS5zdWNjZXNzKWNvbnRpbnVl",
-    "O3JlcG9ydD1wb2xsLmRhdGE7Y29uc3QgbWFwPXJlcG9ydC5kYXRhJiZ0eXBlb2YgcmVwb3J0LmRhdGE9PT0ib2JqZWN0Ij9yZXBv",
-    "cnQuZGF0YTp7fTtjb25zdCBub2Rlcz1PYmplY3QudmFsdWVzKG1hcCk7aWYobm9kZXMubGVuZ3RoJiZub2Rlcy5zb21lKG5vZGU9",
-    "PmdldENoZWNrcyhub2RlKS5sZW5ndGg+MCkpe2NvbnN0IHBlbmRpbmc9bm9kZXMuc29tZShub2RlPT5nZXRDaGVja3Mobm9kZSku",
-    "bGVuZ3RoPT09MCk7aWYoIXBlbmRpbmcpYnJlYWs7fX0KaWYoIXJlcG9ydCl7cmVzdWx0LnN0YXR1c1RleHQ9ItmG2KfZhdi02K7Y",
-    "tSDCtyDar9iy2KfYsdi0INin2LIg2LPYsdmI24zYsyDYr9ix24zYp9mB2Kog2YbYtNivIjtyZXR1cm4gcmVzdWx0O31jb25zdCBt",
-    "YXA9cmVwb3J0LmRhdGEmJnR5cGVvZiByZXBvcnQuZGF0YT09PSJvYmplY3QiP3JlcG9ydC5kYXRhOnt9O2NvbnN0IGVudHJpZXM9",
-    "T2JqZWN0LmVudHJpZXMobWFwKTtjb25zdCB0aW1lcz1bXTtsZXQgZmFpbGVkPTAscGVuZGluZz0wO2Zvcihjb25zdCBwYWlyIG9m",
-    "IGVudHJpZXMpe2NvbnN0IG5vZGU9cGFpclsxXSxjaGVja3M9Z2V0Q2hlY2tzKG5vZGUpO2lmKCFjaGVja3MubGVuZ3RoKXtwZW5k",
-    "aW5nKys7Y29udGludWU7fWNvbnN0IGNoZWNrPWNoZWNrc1swXXx8e307aWYoTnVtYmVyKGNoZWNrLnN0YXR1cyk9PT0xKXtjb25z",
-    "dCB2YWx1ZT1OdW1iZXIoY2hlY2suY29ubmVjdGlvbnRpbWUpO2lmKE51bWJlci5pc0Zpbml0ZSh2YWx1ZSkmJnZhbHVlPj0wKXRp",
-    "bWVzLnB1c2goTWF0aC5yb3VuZCh2YWx1ZSkpO31lbHNlIGlmKGNoZWNrLnN0YXR1cz09PW51bGx8fGNoZWNrLnN0YXR1cz09PXVu",
-    "ZGVmaW5lZHx8Y2hlY2suc3RhdHVzPT09IiIpcGVuZGluZysrO2Vsc2UgZmFpbGVkKys7fXJlc3VsdC5ub2Rlcz1lbnRyaWVzLmxl",
-    "bmd0aDtyZXN1bHQuc3VjY2Vzc2VzPXRpbWVzLmxlbmd0aDtyZXN1bHQubGF0ZW5jeT10aW1lcy5sZW5ndGg/TWF0aC5yb3VuZCh0",
-    "aW1lcy5yZWR1Y2UoKGEsYik9PmErYiwwKS90aW1lcy5sZW5ndGgpOm51bGw7aWYodGltZXMubGVuZ3RoKXtyZXN1bHQuc3RhdHVz",
-    "PSJvayI7cmVzdWx0LnN0YXR1c1RleHQ9IlRDUCDZgtin2KjZhCDYp9iq2LXYp9mEINin2LIgIit0aW1lcy5sZW5ndGgrIiDar9ix",
-    "2YciKyhwZW5kaW5nPyIgwrcgIitwZW5kaW5nKyIg2K/YsSDYp9mG2KrYuNin2LEiOiIiKTt9ZWxzZSBpZihlbnRyaWVzLmxlbmd0",
-    "aD4wJiZwZW5kaW5nPT09MCl7cmVzdWx0LnN0YXR1cz0iZXJyb3IiO3Jlc3VsdC5zdGF0dXNUZXh0PSJUQ1Ag2KfYsiDar9ix2Yfi",
-    "gIzZh9in24wg2q/Ystin2LHYtOKAjNiv2YfZhtiv2Ycg2YbYp9mF2YjZgdmCINio2YjYryAoIitmYWlsZWQrIiDYrti32KcpIjt9",
-    "ZWxzZXtyZXN1bHQuc3RhdHVzPSJ1bmtub3duIjtyZXN1bHQuc3RhdHVzVGV4dD0i2YbYp9mF2LTYrti1IMK3INqv2LLYp9ix2LQg",
-    "2YbYp9mC2LUg24zYpyDYqNiv2YjZhiDar9ix2Ycg2YHYudin2YQiO31yZXN1bHQucmVwb3J0VXJsPXR5cGVvZiBzdGFydGVkLmRh",
-    "dGEucmVwb3J0VVJMPT09InN0cmluZyI/c3RhcnRlZC5kYXRhLnJlcG9ydFVSTDpudWxsO3JldHVybiByZXN1bHQ7fWNhdGNoKGUp",
-    "e2NvbnN0IG1lc3NhZ2U9ZSYmZS5uYW1lPT09IkFib3J0RXJyb3IiPyLZhdmH2YTYqiDYp9ix2KrYqNin2Lcg2KjYpyDYs9ix2Yjb",
-    "jNizINii2LLZhdmI2YYg2KrZhdin2YUg2LTYry4iOiLYr9iz2KrYsdiz24wg2KjZhyDYs9ix2YjbjNizINii2LLZhdmI2YYg2YXZ",
-    "hdqp2YYg2YbYtNivOiAiK1N0cmluZyhlJiZlLm1lc3NhZ2V8fGUpLnNsaWNlKDAsMTQwKTtyZXN1bHQuc3RhdHVzPSJ1bmtub3du",
-    "IjtyZXN1bHQuc3RhdHVzVGV4dD1tZXNzYWdlO3Jlc3VsdC5zZXJ2aWNlRXJyb3I9bWVzc2FnZTtyZXR1cm4gcmVzdWx0O319CmFz",
-    "eW5jIGZ1bmN0aW9uIHN0YXJ0U2Nhbigpe2lmKHJ1bm5pbmcpcmV0dXJuO2l0ZW1zPW5vcm1hbGl6ZVRhcmdldHMoKTtpZighaXRl",
-    "bXMubGVuZ3RoKXthbGVydCgiSVAg2YXYudiq2KjYsSDZiNin2LHYryDaqdmG24zYr9ibINmC2KfZhNioINmH2LEg2K7YtyBJUCDZ",
-    "iCDYr9ixINi12YjYsdiqINmG24zYp9iyICPYqNix2obYs9ioINin2LPYqi4iKTtyZXR1cm47fWNvbnN0IHBvcnQ9TnVtYmVyKCQo",
-    "InBvcnQiKS52YWx1ZSkscmVnaW9uPSQoInJlZ2lvbiIpLnZhbHVlO2lmKCFOdW1iZXIuaXNJbnRlZ2VyKHBvcnQpfHxwb3J0PDF8",
-    "fHBvcnQ+NjU1MzUpe2FsZXJ0KCLZvtmI2LHYqiDZhtin2YXYudiq2KjYsSDYp9iz2KouIik7cmV0dXJuO31pZihpdGVtcy5sZW5n",
-    "dGg+MTAwKXthbGVydCgi2K3Yr9in2qnYq9ixINux27DbsCBJUCDYr9ixINmH2LEg2KfYrNix2Kcg2YXYrNin2LIg2KfYs9iqLiIp",
-    "O3JldHVybjt9cnVubmluZz10cnVlO3N0b3BSZXF1ZXN0ZWQ9ZmFsc2U7cmVjb3Jkcz1bXTtzdWNjZXNzPTA7dW5rbm93bj0wO2Nv",
-    "bXBsZXRlZD0wO25leHREaXNwYXRjaEF0PTA7c2hvd1NlcnZpY2VFcnJvcigiIik7JCgic3RhcnQiKS5kaXNhYmxlZD10cnVlOyQo",
-    "InN0b3AiKS5kaXNhYmxlZD1mYWxzZTskKCJsb2ciKS5yZXBsYWNlQ2hpbGRyZW4oKTtkcmF3KCk7d3JpdGVMb2coItii2LLZhdmI",
-    "2YYgVENQINin2LIg2LPYsdmI24zYsyDYqNuM2LHZiNmG24zYmyByZWdpb249IityZWdpb24rIiwgcG9ydD0iK3BvcnQrIiwgdGFy",
-    "Z2V0cz0iK2l0ZW1zLmxlbmd0aCk7bGV0IGluZGV4PTA7Y29uc3QgY29uY3VycmVuY3k9Mjthc3luYyBmdW5jdGlvbiB3b3JrZXIo",
-    "KXt3aGlsZShydW5uaW5nJiYhc3RvcFJlcXVlc3RlZCYmaW5kZXg8aXRlbXMubGVuZ3RoKXtjb25zdCB0YXJnZXQ9aXRlbXNbaW5k",
-    "ZXgrK107d3JpdGVMb2coItin2LHYs9in2YQg2KLYstmF2YjZhiAiK3RhcmdldC5pcCsiOiIrcG9ydCk7Y29uc3QgcmVzdWx0PWF3",
-    "YWl0IHRlc3RPbmUodGFyZ2V0LHBvcnQscmVnaW9uKTtyZWNvcmRzLnB1c2gocmVzdWx0KTtjb21wbGV0ZWQrKztpZihyZXN1bHQu",
-    "c3RhdHVzPT09Im9rIilzdWNjZXNzKys7ZWxzZSB1bmtub3duKys7aWYocmVzdWx0LnNlcnZpY2VFcnJvcil7c2hvd1NlcnZpY2VF",
-    "cnJvcihyZXN1bHQuc2VydmljZUVycm9yKTt3cml0ZUxvZyhyZXN1bHQuc2VydmljZUVycm9yKTt9ZHJhdygpO319YXdhaXQgUHJv",
-    "bWlzZS5hbGwoQXJyYXkuZnJvbSh7bGVuZ3RoOk1hdGgubWluKGNvbmN1cnJlbmN5LGl0ZW1zLmxlbmd0aCl9LCgpPT53b3JrZXIo",
-    "KSkpO3J1bm5pbmc9ZmFsc2U7JCgic3RhcnQiKS5kaXNhYmxlZD1mYWxzZTskKCJzdG9wIikuZGlzYWJsZWQ9dHJ1ZTt3cml0ZUxv",
-    "Zygi2KrZhdin2YUg2LTYr9ibIFRDUCDZgtin2KjZhCDYp9iq2LXYp9mEINin2LIg2q/YsdmH4oCM2YfYpzogIitzdWNjZXNzKyLY",
-    "jCDYrti32Kcv2YbYp9mF2LTYrti1OiAiK3Vua25vd24rIi4g2KfbjNmGINmG2KrbjNis2Ycg2YXYs9uM2LEg2K/ZgtuM2YIg2KfZ",
-    "vtix2KfYqtmI2LEg2qnYp9ix2KjYsSDYsdinINiq2LbZhduM2YYg2YbZhduM4oCM2qnZhtivLiIpO30KJCgic3RhcnQiKS5vbmNs",
-    "aWNrPXN0YXJ0U2NhbjskKCJzdG9wIikub25jbGljaz0oKT0+e3N0b3BSZXF1ZXN0ZWQ9dHJ1ZTtmb3IoY29uc3QgYyBvZiBhY3Rp",
-    "dmVDb250cm9sbGVycyljLmFib3J0KCk7JCgic3RvcCIpLmRpc2FibGVkPXRydWU7d3JpdGVMb2coItiq2YjZgtmBINiv2LHYrtmI",
-    "2KfYs9iqINi02K/YmyDYr9ix2K7ZiNin2LPYquKAjNmH2KfbjCDYp9ix2LPYp9mE4oCM2LTYr9mHINmF2YXaqdmGINin2LPYqiDY",
-    "r9ixINiz2LHZiNuM2LMg2KjbjNix2YjZhtuMINiq2Kcg2b7Yp9uM2KfZhiDYudmF2LEg2q/Ystin2LHYtCDYqNin2YLbjCDYqNmF",
-    "2KfZhtmG2K8uIik7fTsKJCgiZG93bmxvYWQiKS5vbmNsaWNrPSgpPT57Y29uc3QgY3N2PVsiaXAsbGFiZWwscG9ydCxzdGF0dXMs",
-    "c3VjY2Vzc2VzLG5vZGVzLGxhdGVuY3lfbXMsc3RhdHVzX3RleHQscmVwb3J0X3VybCIsLi4ucmVjb3Jkcy5tYXAocj0+W3IuaXAs",
-    "ci5sYWJlbHx8IiIsci5wb3J0LHIuc3RhdHVzLHIuc3VjY2Vzc2VzLHIubm9kZXMsci5sYXRlbmN5PT09bnVsbD8iIjpyLmxhdGVu",
-    "Y3ksci5zdGF0dXNUZXh0LHIucmVwb3J0VXJsfHwiIl0ubWFwKHY9PiJcIiIrU3RyaW5nKHYpLnJlcGxhY2UoL1wiL2csIlwiXCIi",
-    "KSsiXCIiKS5qb2luKCIsIikpXS5qb2luKCJcclxuIik7Y29uc3QgYmxvYj1uZXcgQmxvYihbIlx1ZmVmZiIrY3N2XSx7dHlwZToi",
-    "dGV4dC9jc3Y7Y2hhcnNldD11dGYtOCJ9KTtjb25zdCB1cmw9VVJMLmNyZWF0ZU9iamVjdFVSTChibG9iKTtjb25zdCBhPWRvY3Vt",
-    "ZW50LmNyZWF0ZUVsZW1lbnQoImEiKTthLmhyZWY9dXJsO2EuZG93bmxvYWQ9ImNsZWFuLWlwLXRjcC1yZXN1bHRzLmNzdiI7YS5j",
-    "bGljaygpO3NldFRpbWVvdXQoKCk9PlVSTC5yZXZva2VPYmplY3RVUkwodXJsKSwxMDAwKTt9OwokKCJpcExpc3QiKS52YWx1ZT1F",
-    "TUJFRERFRF9UQVJHRVRTLm1hcCh4PT54LmlwKyh4LmxhYmVsPyIjIit4LmxhYmVsOiIiKSkuam9pbigiXG4iKTskKCJwb3J0Iiku",
-    "dmFsdWU9RU1CRURERURfVExTX1BPUlQ7d3JpdGVMb2coItmB2YfYsdiz2Kog2LDYrtuM2LHZh+KAjNi02K/ZhyDYp9iyINm+2YbZ",
-    "hCDYqNin2LHar9iw2KfYsduMINi02K86ICIrRU1CRURERURfVEFSR0VUUy5sZW5ndGgrIiBJUC4g2KjYsdin24wgSVDZh9in24wg",
-    "2KzYr9uM2K/YjCDZgdin24zZhCDZgtio2YTbjCDYsdinINm+2KfaqSDZiCDZhdis2K/Yr9in2Ysg2KfYsiDZvtmG2YQg2K/Yp9mG",
-    "2YTZiNivINqp2YbbjNivLiIpO2RyYXcoKTsKPC9zY3JpcHQ+PC9ib2R5PjwvaHRtbD4=",
+    "hCDYsNiu24zYsdmHINi02K/ZhyDYp9iz2KouPC9wPjwvZGl2PjxzcGFuIGNsYXNzPSJ0YWciPlRDUCBQUk9CRSDCtyBJUkFOPC9z",
+    "cGFuPjwvaGVhZGVyPgo8ZGl2IGNsYXNzPSJ3YXJuaW5nIj48Yj7Zhtqp2KrZhyDZhdmH2YU6PC9iPiDZhdix2YjYsdqv2LEg2KfY",
+    "rNin2LLZhyDYp9iq2LXYp9mEIFRDUCDYrtin2YUg24zYpyDYqtmG2LjbjNmFIEhvc3QvU05JINiv2YTYrtmI2KfZhyDYsdinINmG",
+    "2YXbjOKAjNiv2YfYry4g2KjYsdin24wg2KzZhNmI2q/bjNix24wg2KfYsiDZhtiq2KfbjNisINio24zigIzZhdi52YbbjNiMINin",
+    "24zZhiDZhtiz2K7ZhyDYp9iyINiz2LHZiNuM2LMgQ2hlY2stSG9zdCDYp9iz2KrZgdin2K/ZhyDZhduM4oCM2qnZhtivLiDYrdin",
+    "2YTYqiDCq9in24zYsdin2YbCuyDYotiy2YXYp9uM2LQg2LHYpyDYp9iyINqv2LHZh+KAjNmH2KfbjCDZhdmI2KzZiNivINii2YYg",
+    "2YXZhti32YLZhyDYp9mG2KzYp9mFINmF24zigIzYr9mH2K/YjCDZhtmHINiv2YLbjNmC2KfZiyDYp9iyINin24zZhtiq2LHZhtiq",
+    "INin2b7Ysdin2KrZiNixINi02YXYpy4g2YbYqtuM2KzZhyBUQ1Ag2YXZiNmB2YIg24zYudmG24wg2b7ZiNix2Kog2KfYsiDYotmG",
+    "INqv2LHZhyDZgtin2KjZhCDYp9iq2LXYp9mEINio2YjYr9mH2Jsg2KjZh+KAjNiq2YbZh9in24zbjCDYs9in2YTZhSDYqNmI2K/Z",
+    "hiBWTEVTUy9XZWJTb2NrZXQg24zYpyBUTFMg2LHYpyDYqti22YXbjNmGINmG2YXbjOKAjNqp2YbYry48L2Rpdj4KPGRldGFpbHMg",
+    "aWQ9ImNvcnNHdWlkZSIgY2xhc3M9Indhcm5pbmciPjxzdW1tYXJ5PjxiPtix2KfZh9mG2YXYp9uMINiu2LfYp9uMIENPUlMgLyDC",
+    "q9mF2LPYr9mI2K8g2LTYr8K7ICjYp9is2LHYp9uMINmB2KfbjNmEINmE2Yjaqdin2YQpPC9iPjwvc3VtbWFyeT4KPHA+2Kfar9ix",
+    "INin24zZhiDZgdin24zZhCDYsdinINio2Kcg2K/ZiNio2KfYsSDaqdmE24zaqSAo2KLYr9ix2LMgZmlsZTovLykg2KjYp9iyINqp",
+    "2LHYr9mH4oCM2KfbjNiv2Iwg2YXYsdmI2LHar9ixINmF2YXaqdmGINin2LPYqiDYr9ix2K7ZiNin2LPYqiDZhdiz2KrZgtuM2YUg",
+    "2KjZhyBhcGkuY2hlY2staG9zdC5jYyDYsdinINmF2LPYr9mI2K8g2qnZhtivLiDbjNqp24wg2KfYsiDYsdmI2LTigIzZh9in24wg",
+    "2LLbjNixINix2Kcg2KfZhtis2KfZhSDYr9mH24zYrzo8L3A+CjxvbD4KPGxpPjxiPtmI2KjigIzYs9ix2YjYsSDZhNmI2qnYp9mE",
+    "OjwvYj4g2K/YsSDZvtmI2LTZh9mUINmH2YXbjNmGINmB2KfbjNmEINiv2LPYqtmI2LEgPGNvZGUgZGlyPSJsdHIiPnB5dGhvbjMg",
+    "LW0gaHR0cC5zZXJ2ZXIgODAwMDwvY29kZT4gKNuM2KcgPGNvZGUgZGlyPSJsdHIiPm5weCBzZXJ2ZTwvY29kZT4pINix2Kcg2KfY",
+    "rNix2Kcg2qnZhtuM2K8g2YggPGNvZGUgZGlyPSJsdHIiPmh0dHA6Ly9sb2NhbGhvc3Q6ODAwMC/Zhtin2YUt2YHYp9uM2YQuaHRt",
+    "bDwvY29kZT4g2LHYpyDYqNin2LIg2qnZhtuM2K8uPC9saT4KPGxpPjxiPtin2LHYs9in2YQg2KfYsiDYt9ix24zZgiBXb3JrZXI6",
+    "PC9iPiDaqdivINiy24zYsSDYsdinINiv2LEg24zaqSBDbG91ZGZsYXJlIFdvcmtlciDYrNiv24zYryBEZXBsb3kg2qnZhtuM2K8g",
+    "2Ygg2KLYr9ix2LMg2KLZhiDYsdinINiv2LEg2qnYp9iv2LEgwqvYotiv2LHYsyBBUEkg24zYpyDZvtix2Yjaqdiz24zCuyDYqNin",
+    "2YTYpyDZiNin2LHYryDaqdmG24zYry4g2KfbjNmGIFdvcmtlciDZgdmC2Lcg2YXYs9uM2LHZh9in24wgdGNw2IwgdXNhZ2Ug2Ygg",
+    "cmVwb3J0INix2Kcg2LnYqNmI2LEg2YXbjOKAjNiv2YfYr9ibINqp2YTbjNivIEFQSSDYr9ixINii2YYg2YLYsdin2LEg2YbYr9mH",
+    "24zYr9iMINqG2YjZhiDZh9ixINqp2LPbjCDaqdmHINii2K/Ysdiz2LQg2LHYpyDYqNiv2KfZhtivINmF24zigIzYqtmI2KfZhtiv",
+    "INin2LIg2KLZhiDYp9iz2KrZgdin2K/ZhyDaqdmG2K8uPC9saT4KPGxpPjxiPtm+2YbZhDo8L2I+INiv2qnZhdmH2ZQgwqvYqtiz",
+    "2KogVENQINin2LIg2q/YsdmH4oCM2YfYp9uMINin24zYsdin2YbCuyDYr9in2K7ZhCDZvtmG2YQg2KfYsiDYs9mF2KogV29ya2Vy",
+    "INm+2YbZhCDYqtiz2Kog2YXbjOKAjNqp2YbYryDZiCBDT1JTINmG2K/Yp9ix2K8uPC9saT4KPC9vbD4KPHByZSBjbGFzcz0ibG9n",
+    "IiBzdHlsZT0iaGVpZ2h0OmF1dG87bWF4LWhlaWdodDoyODBweDt3aGl0ZS1zcGFjZTpwcmUiPmV4cG9ydCBkZWZhdWx0IHsKICBh",
+    "c3luYyBmZXRjaChyZXEpIHsKICAgIGNvbnN0IGNvcnMgPSB7CiAgICAgICJBY2Nlc3MtQ29udHJvbC1BbGxvdy1PcmlnaW4iOiAi",
+    "KiIsCiAgICAgICJBY2Nlc3MtQ29udHJvbC1BbGxvdy1NZXRob2RzIjogIkdFVCxQT1NULE9QVElPTlMiLAogICAgICAiQWNjZXNz",
+    "LUNvbnRyb2wtQWxsb3ctSGVhZGVycyI6ICJDb250ZW50LVR5cGUiCiAgICB9OwogICAgaWYgKHJlcS5tZXRob2QgPT09ICJPUFRJ",
+    "T05TIikgcmV0dXJuIG5ldyBSZXNwb25zZShudWxsLCB7IGhlYWRlcnM6IGNvcnMgfSk7CiAgICBjb25zdCB1cmwgPSBuZXcgVVJM",
+    "KHJlcS51cmwpOwogICAgY29uc3QgYWxsb3dlZCA9IHVybC5wYXRobmFtZSA9PT0gIi90Y3AiIHx8IHVybC5wYXRobmFtZSA9PT0g",
+    "Ii91c2FnZSIgfHwgdXJsLnBhdGhuYW1lLnN0YXJ0c1dpdGgoIi9yZXBvcnQvIik7CiAgICBpZiAoIWFsbG93ZWQpIHJldHVybiBu",
+    "ZXcgUmVzcG9uc2UoIk5vdCBmb3VuZCIsIHsgc3RhdHVzOiA0MDQsIGhlYWRlcnM6IGNvcnMgfSk7CiAgICBjb25zdCB1cHN0cmVh",
+    "bSA9IGF3YWl0IGZldGNoKCJodHRwczovL2FwaS5jaGVjay1ob3N0LmNjIiArIHVybC5wYXRobmFtZSArIHVybC5zZWFyY2gsIHsK",
+    "ICAgICAgbWV0aG9kOiByZXEubWV0aG9kLAogICAgICBoZWFkZXJzOiB7ICJDb250ZW50LVR5cGUiOiAiYXBwbGljYXRpb24vanNv",
+    "biIgfSwKICAgICAgYm9keTogcmVxLm1ldGhvZCA9PT0gIlBPU1QiID8gcmVxLmJvZHkgOiB1bmRlZmluZWQKICAgIH0pOwogICAg",
+    "cmV0dXJuIG5ldyBSZXNwb25zZSh1cHN0cmVhbS5ib2R5LCB7CiAgICAgIHN0YXR1czogdXBzdHJlYW0uc3RhdHVzLAogICAgICBo",
+    "ZWFkZXJzOiB7IC4uLmNvcnMsICJDb250ZW50LVR5cGUiOiAiYXBwbGljYXRpb24vanNvbiIgfQogICAgfSk7CiAgfQp9OzwvcHJl",
+    "PjwvZGV0YWlscz4KPGRpdiBpZD0ic2VydmljZUVycm9yIiBjbGFzcz0iZXJyb3Jib3giPjwvZGl2Pgo8c2VjdGlvbiBjbGFzcz0i",
+    "c3RhdHMiPjxkaXYgY2xhc3M9InN0YXQiPjxzcGFuPtqp2YQgSVDZh9inPC9zcGFuPjxzdHJvbmcgaWQ9InRvdGFsIj4wPC9zdHJv",
+    "bmc+PC9kaXY+PGRpdiBjbGFzcz0ic3RhdCI+PHNwYW4+2KjYsdix2LPbjOKAjNi02K/Zhzwvc3Bhbj48c3Ryb25nIGlkPSJjaGVj",
+    "a2VkIj4wPC9zdHJvbmc+PC9kaXY+PGRpdiBjbGFzcz0ic3RhdCI+PHNwYW4+2K3Yr9in2YLZhCDbjNqpINin2KrYtdin2YQg2YXZ",
+    "iNmB2YI8L3NwYW4+PHN0cm9uZyBpZD0ib2siPjA8L3N0cm9uZz48L2Rpdj48ZGl2IGNsYXNzPSJzdGF0Ij48c3Bhbj7Zhtin2YXY",
+    "tNiu2LUgLyDYrti32KfbjCDYs9ix2YjbjNizPC9zcGFuPjxzdHJvbmcgaWQ9InVua25vd24iPjA8L3N0cm9uZz48L2Rpdj48L3Nl",
+    "Y3Rpb24+CjxzZWN0aW9uIGNsYXNzPSJncmlkIj48ZGl2PjxkaXYgY2xhc3M9ImNhcmQiPjxoMj7ZgdmH2LHYs9iqIElQPC9oMj48",
+    "dGV4dGFyZWEgaWQ9ImlwTGlzdCIgc3BlbGxjaGVjaz0iZmFsc2UiPjwvdGV4dGFyZWE+PGRpdiBjbGFzcz0iY29udHJvbHMiPjxk",
+    "aXY+PGxhYmVsIGNsYXNzPSJub3RlIiBmb3I9InJlZ2lvbiI+2q/YsdmH4oCM2YfYp9uMINii2LLZhdmI2YYgKNir2KfYqNiqOiDY",
+    "p9uM2LHYp9mGIMK3IGlyMSDYqtinIGlyNik8L2xhYmVsPjxzZWxlY3QgaWQ9InJlZ2lvbiIgZGlzYWJsZWQ+PG9wdGlvbiB2YWx1",
+    "ZT0iSVIiIHNlbGVjdGVkPtin24zYsdin2YYgKNmB2YLYtyDar9ix2YfigIzZh9in24wg2KfbjNix2KfZhtuMKTwvb3B0aW9uPjwv",
+    "c2VsZWN0PjwvZGl2PjxkaXY+PGxhYmVsIGNsYXNzPSJub3RlIiBmb3I9InBvcnQiPtm+2YjYsdiqIFRDUDwvbGFiZWw+PGlucHV0",
+    "IGlkPSJwb3J0IiB0eXBlPSJudW1iZXIiIG1pbj0iMSIgbWF4PSI2NTUzNSIgdmFsdWU9IjQ0MyI+PC9kaXY+PC9kaXY+PGRpdj48",
+    "bGFiZWwgY2xhc3M9Im5vdGUiIGZvcj0iYXBpQmFzZSI+2KLYr9ix2LMgQVBJINuM2Kcg2b7YsdmI2qnYs9uMICjYp9iu2KrbjNin",
+    "2LHbjNibINm+24zYtOKAjNmB2LHYtjogaHR0cHM6Ly9hcGkuY2hlY2staG9zdC5jYyk8L2xhYmVsPjxpbnB1dCBpZD0iYXBpQmFz",
+    "ZSIgdHlwZT0idXJsIiBkaXI9Imx0ciIgcGxhY2Vob2xkZXI9Imh0dHBzOi8vYXBpLmNoZWNrLWhvc3QuY2MiIGF1dG9jb21wbGV0",
+    "ZT0ib2ZmIj48L2Rpdj48cCBjbGFzcz0ibm90ZSI+2KjYsdin24wg2KjYsdix2LPbjCDZvtmI2LHYqiDYutuM2LEgVExTINmF2YLY",
+    "r9in2LEgODAg24zYpyA4MDgwINix2Kcg2YjYp9ix2K8g2qnZhtuM2K/YmyDYp9uM2YYg2KrYs9iqINmB2YLYtyDYp9iq2LXYp9mE",
+    "IFRDUCDYsdinINmF24zigIzYs9mG2KzYry48L3A+PGRpdiBjbGFzcz0iY29udHJvbHMiPjxidXR0b24gaWQ9InN0YXJ0Ij7YtNix",
+    "2YjYuSDYotiy2YXZiNmGPC9idXR0b24+PGJ1dHRvbiBjbGFzcz0ic2Vjb25kYXJ5IiBpZD0ic3RvcCIgZGlzYWJsZWQ+2KrZiNmC",
+    "2YEg2b7YsyDYp9iyINii2LLZhdmI2YbigIzZh9in24wg2KzYp9ix24w8L2J1dHRvbj48L2Rpdj48YnV0dG9uIGNsYXNzPSJzZWNv",
+    "bmRhcnkiIGlkPSJkb3dubG9hZCI+2K/Yp9mG2YTZiNivINmG2KrYp9uM2KwgQ1NWPC9idXR0b24+PC9kaXY+PGRpdiBjbGFzcz0i",
+    "Y2FyZCI+PGgyPtqv2LLYp9ix2LQg2KfYrNix2Kc8L2gyPjxkaXYgY2xhc3M9ImxvZyIgaWQ9ImxvZyI+2YHZh9ix2LPYqiDYqNin",
+    "2LHar9iw2KfYsduMINi02K/YmyDYotmF2KfYr9mHINii2LLZhdmI2YYuPC9kaXY+PC9kaXY+PC9kaXY+CjxkaXY+PGRpdiBjbGFz",
+    "cz0iY2FyZCI+PGgyPtmG2KrYp9uM2KwgSVDZh9inPC9oMj48ZGl2IGNsYXNzPSJwcm9ncmVzcyI+PGRpdiBpZD0iYmFyIj48L2Rp",
+    "dj48L2Rpdj48ZGl2IGNsYXNzPSJ0YWJsZS13cmFwIj48dGFibGU+PHRoZWFkPjx0cj48dGg+SVAgLyDYqNix2obYs9ioPC90aD48",
+    "dGg+2b7ZiNix2Ko8L3RoPjx0aD7ZhduM2KfZhtqv24zZhjwvdGg+PHRoPtmF2YjZgdmCIC8g2q/YsdmH4oCM2YfYpzwvdGg+PHRo",
+    "PtmI2LbYuduM2Ko8L3RoPjwvdHI+PC90aGVhZD48dGJvZHkgaWQ9InJvd3MiPjwvdGJvZHk+PC90YWJsZT48L2Rpdj48cCBjbGFz",
+    "cz0ibm90ZSI+2K7Yt9in24wgQVBJ2Iwg2YXYrdiv2YjYr9uM2Kog2YbYsdiuINuM2Kcg2YbYqNmI2K8g2q/YsdmHINmF2YbYt9mC",
+    "2YfigIzYp9uMINin2LIg2K7Ysdin2KjbjCBJUCDYrNiv2Kcg2YbZhdin24zYtCDYr9in2K/ZhyDZhduM4oCM2LTZiNivLiDYp9qv",
+    "2LEg2LPYsdmI24zYsyBIVFRQIDQwMy80Mjkg2KjYr9mH2K/YjCDZhtiq2KfbjNisIElQ2YfYpyDYsdinINmG2YXbjOKAjNiq2YjY",
+    "p9mGINin2LIg2KfbjNmGINin2KzYsdinINmG2KrbjNis2YfigIzar9uM2LHbjCDaqdix2K8uPC9wPjwvZGl2PjxkaXYgY2xhc3M9",
+    "ImNhcmQiPjxoMj7Zhdi52YbbjCDZhtiq24zYrNmH4oCM2YfYpzwvaDI+PHAgY2xhc3M9Im5vdGUiPjxiPtmC2KfYqNmEINin2KrY",
+    "tdin2YQ6PC9iPiDYrdiv2KfZgtmEINuM2qkg2q/YsdmHINiz2LHZiNuM2LMg2KrZiNin2YbYs9iq2YcgVENQIGhhbmRzaGFrZSDY",
+    "qNix2YLYsdin2LEg2qnZhtivLjwvcD48cCBjbGFzcz0ibm90ZSI+PGI+2YbYp9mF2YjZgdmCOjwvYj4g2q/YsdmH4oCM2YfYp9uM",
+    "INqv2LLYp9ix2LTigIzYr9mH2YbYr9mHINmG2KrZiNin2YbYs9iq2YfigIzYp9mG2K8gVENQINmI2LXZhCDYtNmI2YbYr9ibINin",
+    "24zZhiDZhtiq24zYrNmHINmF2K7YtdmI2LUg2YfZhdin2YYg2q/YsdmH4oCM2YfYp9iz2KouPC9wPjxwIGNsYXNzPSJub3RlIj48",
+    "Yj7Zhtin2YXYtNiu2LU6PC9iPiDar9iy2KfYsdi0INqp2KfZhdmEINmG24zYs9iqINuM2Kcg2q/YsdmH4oCM2KfbjCDZhtiq24zY",
+    "rNmHINmG2K/Yp9iv2Ycg2KfYs9iqLjwvcD48L2Rpdj48L2Rpdj48L3NlY3Rpb24+Cjxmb290ZXIgY2xhc3M9ImZvb3QiPtin2LPa",
+    "qdmG2LEgSFRNTCDZhdiz2KrZgtmEIMK3INio2K/ZiNmGINmG24zYp9iyINio2YcgUG93ZXJTaGVsbCDCtyDYs9ix2YjbjNizINio",
+    "24zYsdmI2YbbjDogQ2hlY2stSG9zdC5jYzwvZm9vdGVyPjwvbWFpbj48c2NyaXB0Pgpjb25zdCBFTUJFRERFRF9UQVJHRVRTID0g",
+    "X19UQVJHRVRTX187CmNvbnN0IEVNQkVEREVEX0RPTUFJTiA9IF9fRE9NQUlOX187CmNvbnN0IEVNQkVEREVEX1RMU19QT1JUID0g",
+    "X19UTFNfUE9SVF9fOwpjb25zdCBFTUJFRERFRF9QTEFJTl9QT1JUID0gX19QTEFJTl9QT1JUX187CmNvbnN0IERFRkFVTFRfQVBJ",
+    "X0JBU0UgPSAiaHR0cHM6Ly9hcGkuY2hlY2staG9zdC5jYyI7CmxldCBBUElfQkFTRSA9IERFRkFVTFRfQVBJX0JBU0U7CmNvbnN0",
+    "IElSQU5fTk9ERVMgPSBbImlyMS5ub2RlLmNoZWNrLWhvc3QubmV0IiwiaXIyLm5vZGUuY2hlY2staG9zdC5uZXQiLCJpcjMubm9k",
+    "ZS5jaGVjay1ob3N0Lm5ldCIsImlyNC5ub2RlLmNoZWNrLWhvc3QubmV0IiwiaXI1Lm5vZGUuY2hlY2staG9zdC5uZXQiLCJpcjYu",
+    "bm9kZS5jaGVjay1ob3N0Lm5ldCJdOwpjb25zdCAkPWlkPT5kb2N1bWVudC5nZXRFbGVtZW50QnlJZChpZCk7bGV0IHJ1bm5pbmc9",
+    "ZmFsc2Usc3RvcFJlcXVlc3RlZD1mYWxzZSxpdGVtcz1bXSxyZWNvcmRzPVtdLHN1Y2Nlc3M9MCx1bmtub3duPTAsY29tcGxldGVk",
+    "PTAsbmV4dERpc3BhdGNoQXQ9MDtjb25zdCBhY3RpdmVDb250cm9sbGVycz1uZXcgU2V0KCk7CmZ1bmN0aW9uIHNsZWVwKG1zKXty",
+    "ZXR1cm4gbmV3IFByb21pc2UocmVzb2x2ZT0+c2V0VGltZW91dChyZXNvbHZlLG1zKSk7fQpmdW5jdGlvbiB3cml0ZUxvZyh0ZXh0",
+    "KXtjb25zdCBwPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpO3AudGV4dENvbnRlbnQ9IlsiK25ldyBEYXRlKCkudG9Mb2Nh",
+    "bGVUaW1lU3RyaW5nKCkrIl0gIit0ZXh0OyQoImxvZyIpLmFwcGVuZENoaWxkKHApOyQoImxvZyIpLnNjcm9sbFRvcD0kKCJsb2ci",
+    "KS5zY3JvbGxIZWlnaHQ7fQpmdW5jdGlvbiBzaG93U2VydmljZUVycm9yKHRleHQpe2NvbnN0IGVsPSQoInNlcnZpY2VFcnJvciIp",
+    "O2VsLnRleHRDb250ZW50PXRleHQ7ZWwuc3R5bGUuZGlzcGxheT10ZXh0PyJibG9jayI6Im5vbmUiO30KZnVuY3Rpb24gbm9ybWFs",
+    "aXplVGFyZ2V0cygpe2NvbnN0IHNlZW49bmV3IFNldCgpO3JldHVybiAkKCJpcExpc3QiKS52YWx1ZS5zcGxpdCgvW1xyXG4sO10r",
+    "LykubWFwKHg9PngudHJpbSgpKS5maWx0ZXIoQm9vbGVhbikubWFwKGxpbmU9Pntjb25zdCBwYXJ0cz1saW5lLnNwbGl0KCIjIik7",
+    "cmV0dXJuIHtpcDpwYXJ0c1swXS50cmltKCksbGFiZWw6cGFydHMuc2xpY2UoMSkuam9pbigiIyIpLnRyaW0oKX07fSkuZmlsdGVy",
+    "KHg9Pi9eXGR7MSwzfSg/OlwuXGR7MSwzfSl7M30kLy50ZXN0KHguaXApJiZ4LmlwLnNwbGl0KCIuIikuZXZlcnkobj0+TnVtYmVy",
+    "KG4pPj0wJiZOdW1iZXIobik8PTI1NSkmJiFzZWVuLmhhcyh4LmlwKSYmc2Vlbi5hZGQoeC5pcCkpO30KZnVuY3Rpb24gZHJhdygp",
+    "eyQoInRvdGFsIikudGV4dENvbnRlbnQ9U3RyaW5nKGl0ZW1zLmxlbmd0aCk7JCgiY2hlY2tlZCIpLnRleHRDb250ZW50PVN0cmlu",
+    "Zyhjb21wbGV0ZWQpOyQoIm9rIikudGV4dENvbnRlbnQ9U3RyaW5nKHN1Y2Nlc3MpOyQoInVua25vd24iKS50ZXh0Q29udGVudD1T",
+    "dHJpbmcodW5rbm93bik7JCgiYmFyIikuc3R5bGUud2lkdGg9KGl0ZW1zLmxlbmd0aD9NYXRoLnJvdW5kKGNvbXBsZXRlZC9pdGVt",
+    "cy5sZW5ndGgqMTAwKTowKSsiJSI7Y29uc3QgYm9keT0kKCJyb3dzIik7Ym9keS5yZXBsYWNlQ2hpbGRyZW4oKTtyZWNvcmRzLmZv",
+    "ckVhY2gocj0+e2NvbnN0IHRyPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoInRyIik7W3IuaXArKHIubGFiZWw/IiDCtyAiK3IubGFi",
+    "ZWw6IiIpLFN0cmluZyhyLnBvcnQpLHIubGF0ZW5jeT09PW51bGw/IuKAlCI6ci5sYXRlbmN5KyIgbXMiLHIuc3VjY2Vzc2VzKyIg",
+    "LyAiK3Iubm9kZXMsci5zdGF0dXNUZXh0XS5mb3JFYWNoKCh2LGkpPT57Y29uc3QgdGQ9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgi",
+    "dGQiKTt0ZC50ZXh0Q29udGVudD12O2lmKGk9PT00KXRkLmNsYXNzTmFtZT1yLnN0YXR1cz09PSJvayI/InN0YXR1cy1vayI6KHIu",
+    "c3RhdHVzPT09ImVycm9yIj8ic3RhdHVzLWVycm9yIjoic3RhdHVzLXVua25vd24iKTt0ci5hcHBlbmRDaGlsZCh0ZCk7fSk7Ym9k",
+    "eS5hcHBlbmRDaGlsZCh0cik7fSk7fQphc3luYyBmdW5jdGlvbiBmZXRjaEpzb24odXJsLGluaXQ9e30sdGltZW91dD04MDAwKXtj",
+    "b25zdCBjb250cm9sbGVyPW5ldyBBYm9ydENvbnRyb2xsZXIoKTthY3RpdmVDb250cm9sbGVycy5hZGQoY29udHJvbGxlcik7Y29u",
+    "c3QgdGltZXI9c2V0VGltZW91dCgoKT0+Y29udHJvbGxlci5hYm9ydCgpLHRpbWVvdXQpO3RyeXtjb25zdCByZXNwb25zZT1hd2Fp",
+    "dCBmZXRjaCh1cmwsey4uLmluaXQsc2lnbmFsOmNvbnRyb2xsZXIuc2lnbmFsLGhlYWRlcnM6e0FjY2VwdDoiYXBwbGljYXRpb24v",
+    "anNvbiIsLi4uKGluaXQuaGVhZGVyc3x8e30pfX0pO2NvbnN0IGJvZHk9YXdhaXQgcmVzcG9uc2UudGV4dCgpO2xldCBkYXRhPW51",
+    "bGw7dHJ5e2RhdGE9Ym9keT9KU09OLnBhcnNlKGJvZHkpOm51bGw7fWNhdGNoe31yZXR1cm4ge3Jlc3BvbnNlLGRhdGEsYm9keTpi",
+    "b2R5LnNsaWNlKDAsMjQwKX07fWZpbmFsbHl7Y2xlYXJUaW1lb3V0KHRpbWVyKTthY3RpdmVDb250cm9sbGVycy5kZWxldGUoY29u",
+    "dHJvbGxlcik7fX0KZnVuY3Rpb24gZXJyb3JGcm9tQXBpKHJlcyxwaGFzZSl7Y29uc3Qgc3RhdHVzPXJlcyYmcmVzLnJlc3BvbnNl",
+    "P3Jlcy5yZXNwb25zZS5zdGF0dXM6MDtpZihzdGF0dXM9PT00MDMpcmV0dXJuICLYs9ix2YjbjNizIENoZWNrLUhvc3Qg2K/Ysdiu",
+    "2YjYp9iz2Kog2LHYpyDYsdivINqp2LHYryAoSFRUUCA0MDMpLiDZh9uM2oYgSVAg2K/YsSDYp9uM2YYg2KfYrNix2Kcg2LPYp9mE",
+    "2YUg24zYpyDYrtix2KfYqCDYp9ix2LLbjNin2KjbjCDZhti02K/ZhyDYp9iz2KouIjtpZihzdGF0dXM9PT00MjkpcmV0dXJuICLZ",
+    "hdit2K/ZiNiv24zYqiDYr9ix2K7ZiNin2LPYqiDYs9ix2YjbjNizIENoZWNrLUhvc3QgKEhUVFAgNDI5KS4g2obZhtivINiv2YLb",
+    "jNmC2Ycg2YXaqdirINqp2YbbjNivINmIINiq2LnYr9in2K8gSVDZh9in24wg2YfYsSDYp9is2LHYpyDYsdinINqp2YXYqtixINqp",
+    "2YbbjNivLiI7aWYoc3RhdHVzPT09MClyZXR1cm4gItmF2LHZiNix2q/YsSDZhtiq2YjYp9mG2LPYqiDYqNmHIEFQSSDYs9ix2Yjb",
+    "jNizINio2LHYs9iv2Jsg2KfYrdiq2YXYp9mEINin2K7YqtmE2KfZhCDYtNio2qnZh9iMIEROUyDbjNinINmF2K3Yr9mI2K/bjNiq",
+    "IENPUlMg2YjYrNmI2K8g2K/Yp9ix2K8uIjtyZXR1cm4gItiz2LHZiNuM2LMgQ2hlY2stSG9zdCDYr9ixINmF2LHYrdmE2YcgIitw",
+    "aGFzZSsiINm+2KfYs9iuINmC2KfYqNmEINin2LPYqtmB2KfYr9mHINmG2K/Yp9ivIChIVFRQICIrc3RhdHVzKyIpLiAiK1N0cmlu",
+    "ZyhyZXMuYm9keXx8IiIpLnNsaWNlKDAsMTQwKTt9CmZ1bmN0aW9uIGlzSXJhbk5vZGUobmFtZSxub2RlKXtjb25zdCBrZXk9U3Ry",
+    "aW5nKG5hbWV8fCIiKS50cmltKCkudG9Mb3dlckNhc2UoKTtjb25zdCBjb2RlPVN0cmluZygobm9kZSYmKG5vZGUuY291bnRyeUNv",
+    "ZGV8fG5vZGUuY291bnRyeV9jb2RlfHxub2RlLmNjfHxub2RlLnJlZ2lvbikpfHwiIikudHJpbSgpLnRvTG93ZXJDYXNlKCk7Y29u",
+    "c3QgY291bnRyeT1TdHJpbmcoKG5vZGUmJm5vZGUuY291bnRyeSl8fCIiKS50cmltKCkudG9Mb3dlckNhc2UoKTtyZXR1cm4gY29k",
+    "ZT09PSJpciJ8fC9eaXJcZCooPzpbLlwtXzpdfCQpLy50ZXN0KGtleSl8fGNvdW50cnk9PT0iaXIifHxjb3VudHJ5PT09ImlyYW4i",
+    "fHxjb3VudHJ5LmluZGV4T2YoImlyYW4iKT09PTA7fQpjb25zdCBDT1JTX0hJTlQ9ItmF2LHZiNix2q/YsSDYr9ix2K7ZiNin2LPY",
+    "qiDYqNmHIEFQSSDYsdinINmF2LPYr9mI2K8g2qnYsdivINuM2Kcg2KjZhyDYotmGINmG2LHYs9uM2K8gKNmF2LnZhdmI2YTYp9mL",
+    "IENPUlPYmyDYr9ixINmB2KfbjNmEIGZpbGU6Ly8g2YXYqNiv2KMgwqtudWxswrsg2KfYs9iqKS4g2YfbjNqGIElQINin2LHYstuM",
+    "2KfYqNuMINmG2LTYryDZiCDYotiy2YXZiNmGINmF2KrZiNmC2YEg2LTYry4g2LHYp9mH4oCM2K3ZhCDbsTog2YHYp9uM2YQg2LHY",
+    "pyDYqNinINmI2KjigIzYs9ix2YjYsSDZhNmI2qnYp9mEINio2KfYsiDaqdmG24zYrzog2K/YsSDZvtmI2LTZh9mUINmB2KfbjNmE",
+    "IMKrcHl0aG9uMyAtbSBodHRwLnNlcnZlciA4MDAwwrsg2LHYpyDYp9is2LHYpyDaqdmG24zYryDZiCBodHRwOi8vbG9jYWxob3N0",
+    "OjgwMDAv2YbYp9mFLdmB2KfbjNmELmh0bWwg2LHYpyDYqNin2LIg2qnZhtuM2K8uINix2KfZh+KAjNit2YQg27I6INuM2qkgQ2xv",
+    "dWRmbGFyZSBXb3JrZXIg2LPYp9iv2Ycg2KjZh+KAjNi52YbZiNin2YYg2b7YsdmI2qnYs9uMINio2LPYp9iy24zYryAo2qnYryDY",
+    "otmGINiv2LEg2KjYrti0IMKr2LHYp9mH2YbZhdin24wgQ09SU8K7INmH2YXbjNmGINi12YHYrdmHINin2LPYqikg2Ygg2KLYr9ix",
+    "2LPYtCDYsdinINiv2LEg2qnYp9iv2LEgwqvYotiv2LHYsyBBUEkg24zYpyDZvtix2Yjaqdiz24zCuyDZiNin2LHYryDaqdmG24zY",
+    "ry4g2LHYp9mH4oCM2K3ZhCDbszog2KfYsiDYr9qp2YXZh9mUIMKr2KrYs9iqIFRDUCDYp9iyINqv2LHZh+KAjNmH2KfbjCDYp9uM",
+    "2LHYp9mGwrsg2K/Yp9iu2YQg2b7ZhtmEINin2LPYqtmB2KfYr9mHINqp2YbbjNivLiI7CmZ1bmN0aW9uIGdldENoZWNrcyhub2Rl",
+    "KXsKICBpZihBcnJheS5pc0FycmF5KG5vZGUpKXsKICAgIGlmKG5vZGUubGVuZ3RoJiYhQXJyYXkuaXNBcnJheShub2RlWzBdKSYm",
+    "dHlwZW9mIG5vZGVbMF0hPT0ib2JqZWN0IilyZXR1cm4gW25vZGVdOwogICAgcmV0dXJuIG5vZGU7CiAgfQogIGlmKG5vZGUmJkFy",
+    "cmF5LmlzQXJyYXkobm9kZS5jaGVja3MpKXJldHVybiBub2RlLmNoZWNrczsKICBpZihub2RlJiZub2RlLmNoZWNrcyYmdHlwZW9m",
+    "IG5vZGUuY2hlY2tzPT09Im9iamVjdCIpcmV0dXJuIFtub2RlLmNoZWNrc107CiAgcmV0dXJuIFtdOwp9CmZ1bmN0aW9uIHRvTXMo",
+    "dmFsdWUsdW5pdCl7CiAgaWYodmFsdWU9PT1udWxsfHx2YWx1ZT09PXVuZGVmaW5lZHx8dmFsdWU9PT0iIilyZXR1cm4gbnVsbDsK",
+    "ICBjb25zdCBuPU51bWJlcih2YWx1ZSk7CiAgaWYoIU51bWJlci5pc0Zpbml0ZShuKXx8bjwwKXJldHVybiBudWxsOwogIGNvbnN0",
+    "IGlzU2Vjb25kcz11bml0PT09InMiP248MTA6KG48MTAmJiFOdW1iZXIuaXNJbnRlZ2VyKG4pKTsKICBjb25zdCBtcz1pc1NlY29u",
+    "ZHM/bioxMDAwOm47CiAgcmV0dXJuIG4+MD9NYXRoLm1heCgxLE1hdGgucm91bmQobXMpKTowOwp9CmZ1bmN0aW9uIHBhcnNlQ2hl",
+    "Y2soY2hlY2spewogIGxldCByYXcsbGF0PW51bGwsdW5pdD0iYXV0byIsbXNnPSIiOwogIGlmKEFycmF5LmlzQXJyYXkoY2hlY2sp",
+    "KXtyYXc9Y2hlY2tbMF07bGF0PWNoZWNrWzFdO3VuaXQ9InMiO21zZz1jaGVja1syXTt9CiAgZWxzZSBpZihjaGVjayYmdHlwZW9m",
+    "IGNoZWNrPT09Im9iamVjdCIpewogICAgcmF3PWNoZWNrLnN0YXR1cyE9PXVuZGVmaW5lZD9jaGVjay5zdGF0dXM6Y2hlY2suY29k",
+    "ZTsKICAgIGNvbnN0IGN0PWNoZWNrLmNvbm5lY3Rpb250aW1lIT09dW5kZWZpbmVkP2NoZWNrLmNvbm5lY3Rpb250aW1lOihjaGVj",
+    "ay5jb25uZWN0aW9uX3RpbWUhPT11bmRlZmluZWQ/Y2hlY2suY29ubmVjdGlvbl90aW1lOmNoZWNrLmxhdGVuY3kpOwogICAgaWYo",
+    "Y3QhPT11bmRlZmluZWQmJmN0IT09bnVsbCl7bGF0PWN0O30KICAgIGVsc2UgaWYoY2hlY2sudGltZSE9PXVuZGVmaW5lZCYmY2hl",
+    "Y2sudGltZSE9PW51bGwpe2xhdD1jaGVjay50aW1lO3VuaXQ9InMiO30KICAgIG1zZz1jaGVjay5lcnJvcnRleHR8fGNoZWNrLmVy",
+    "cm9yfHxjaGVjay5tZXNzYWdlfHwiIjsKICAgIGlmKHJhdz09PXVuZGVmaW5lZHx8cmF3PT09bnVsbHx8U3RyaW5nKHJhdykudHJp",
+    "bSgpPT09IiIpewogICAgICBpZihjaGVjay5lcnJvcnx8Y2hlY2suZXJyb3J0ZXh0KXJhdz0wOwogICAgICBlbHNlIGlmKGxhdCE9",
+    "PW51bGwmJk51bWJlci5pc0Zpbml0ZShOdW1iZXIobGF0KSkpcmF3PTE7CiAgICB9CiAgfWVsc2UgcmF3PWNoZWNrOwogIGNvbnN0",
+    "IHRleHQ9U3RyaW5nKHJhdz09PW51bGx8fHJhdz09PXVuZGVmaW5lZD8iIjpyYXcpLnRyaW0oKS50b0xvd2VyQ2FzZSgpOwogIGNv",
+    "bnN0IGNvZGU9dGV4dD09PSIiP05hTjpOdW1iZXIodGV4dCk7CiAgaWYoY29kZT09PTF8fFsib2siLCJzdWNjZXNzIiwiY29ubmVj",
+    "dGVkIiwib3BlbiIsInRydWUiXS5pbmRleE9mKHRleHQpIT09LTEpcmV0dXJuIHtzdGF0ZToib2siLGxhdGVuY3k6dG9NcyhsYXQs",
+    "dW5pdCksZXJyb3I6IiJ9OwogIGlmKGNvZGU9PT0wfHxbImVycm9yIiwiZmFpbGVkIiwiY2xvc2VkIiwidGltZW91dCIsImZhbHNl",
+    "Il0uaW5kZXhPZih0ZXh0KSE9PS0xKXJldHVybiB7c3RhdGU6ImVycm9yIixsYXRlbmN5Om51bGwsZXJyb3I6U3RyaW5nKG1zZ3x8",
+    "IiIpLnNsaWNlKDAsMTYwKX07CiAgcmV0dXJuIHtzdGF0ZToicGVuZGluZyIsbGF0ZW5jeTpudWxsLGVycm9yOiIifTsKfQphc3lu",
+    "YyBmdW5jdGlvbiB3YWl0RGlzcGF0Y2hTbG90KCl7Y29uc3Qgbm93PURhdGUubm93KCk7Y29uc3QgZGVsYXk9TWF0aC5tYXgoMCxu",
+    "ZXh0RGlzcGF0Y2hBdC1ub3cpO25leHREaXNwYXRjaEF0PU1hdGgubWF4KG5vdyxuZXh0RGlzcGF0Y2hBdCkrMTI1MDtpZihkZWxh",
+    "eSlhd2FpdCBzbGVlcChkZWxheSk7fQphc3luYyBmdW5jdGlvbiBzdGFydENoZWNrKHRhcmdldCxwb3J0KXsKICBjb25zdCBiYXNl",
+    "PXt0YXJnZXQ6dGFyZ2V0LmlwLHBvcnQ6cG9ydCx0aW1lb3V0OjUwMDB9OwogIGNvbnN0IGJvZGllcz1bT2JqZWN0LmFzc2lnbih7",
+    "fSxiYXNlLHtub2RlOklSQU5fTk9ERVN9KSxPYmplY3QuYXNzaWduKHt9LGJhc2UpXTsKICBsZXQgc3RhcnRlZD1udWxsOwogIGZv",
+    "cihjb25zdCBib2R5IG9mIGJvZGllcyl7CiAgICBzdGFydGVkPWF3YWl0IGZldGNoSnNvbihBUElfQkFTRSsiL3RjcCIse21ldGhv",
+    "ZDoiUE9TVCIsaGVhZGVyczp7IkNvbnRlbnQtVHlwZSI6ImFwcGxpY2F0aW9uL2pzb24ifSxib2R5OkpTT04uc3RyaW5naWZ5KGJv",
+    "ZHkpfSwxMDAwMCk7CiAgICBjb25zdCBzdD1zdGFydGVkLnJlc3BvbnNlLnN0YXR1czsKICAgIGlmKHN0YXJ0ZWQucmVzcG9uc2Uu",
+    "b2t8fChzdCE9PTQwMCYmc3QhPT00MjIpKWJyZWFrOwogIH0KICByZXR1cm4gc3RhcnRlZDsKfQphc3luYyBmdW5jdGlvbiBwcmVm",
+    "bGlnaHQoKXsKICB0cnl7Y29uc3Qgcj1hd2FpdCBmZXRjaEpzb24oQVBJX0JBU0UrIi91c2FnZSIse30sODAwMCk7cmV0dXJuIHtv",
+    "azp0cnVlLHN0YXR1czpyLnJlc3BvbnNlLnN0YXR1c307fQogIGNhdGNoKGUpe3JldHVybiB7b2s6ZmFsc2UsYWJvcnRlZDohIShl",
+    "JiZlLm5hbWU9PT0iQWJvcnRFcnJvciIpLG1lc3NhZ2U6U3RyaW5nKGUmJmUubWVzc2FnZXx8ZSkuc2xpY2UoMCwxNDApfTt9Cn0K",
+    "ZnVuY3Rpb24gcmVzb2x2ZUFwaUJhc2UoKXsKICBjb25zdCByYXc9KCQoImFwaUJhc2UiKS52YWx1ZXx8IiIpLnRyaW0oKTsKICBp",
+    "ZighcmF3KXJldHVybiBERUZBVUxUX0FQSV9CQVNFOwogIHRyeXtjb25zdCB1PW5ldyBVUkwocmF3KTtpZih1LnByb3RvY29sIT09",
+    "Imh0dHBzOiImJnUucHJvdG9jb2whPT0iaHR0cDoiKXJldHVybiBudWxsO3JldHVybiB1Lm9yaWdpbit1LnBhdGhuYW1lLnJlcGxh",
+    "Y2UoL1wvKyQvLCIiKTt9CiAgY2F0Y2goZSl7cmV0dXJuIG51bGw7fQp9CmFzeW5jIGZ1bmN0aW9uIHRlc3RPbmUodGFyZ2V0LHBv",
+    "cnQpewogIGNvbnN0IHJlc3VsdD17aXA6dGFyZ2V0LmlwLGxhYmVsOnRhcmdldC5sYWJlbCxwb3J0OnBvcnQsbGF0ZW5jeTpudWxs",
+    "LHN1Y2Nlc3NlczowLG5vZGVzOjAsc3RhdHVzOiJ1bmtub3duIixzdGF0dXNUZXh0OiLZhtin2YXYtNiu2LUgwrcg2q/Ystin2LHY",
+    "tCDZh9mG2YjYsiDYr9ix24zYp9mB2Kog2YbYtNiv2YcifTsKICB0cnl7CiAgICBhd2FpdCB3YWl0RGlzcGF0Y2hTbG90KCk7CiAg",
+    "ICBpZihzdG9wUmVxdWVzdGVkKXtyZXN1bHQuc3RhdHVzVGV4dD0i2YXYqtmI2YLZgSDYtNivINm+24zYtCDYp9iyINi02LHZiNi5",
+    "INiv2LHYrtmI2KfYs9iqIjtyZXR1cm4gcmVzdWx0O30KICAgIGNvbnN0IHN0YXJ0ZWQ9YXdhaXQgc3RhcnRDaGVjayh0YXJnZXQs",
+    "cG9ydCk7CiAgICBpZighc3RhcnRlZC5yZXNwb25zZS5va3x8IXN0YXJ0ZWQuZGF0YXx8c3RhcnRlZC5kYXRhLnN1Y2Nlc3MhPT10",
+    "cnVlfHwhc3RhcnRlZC5kYXRhLnV1aWQpewogICAgICBjb25zdCBtZXNzYWdlPWVycm9yRnJvbUFwaShzdGFydGVkLCLYp9ix2LPY",
+    "p9mEIik7CiAgICAgIHJlc3VsdC5zdGF0dXM9c3RhcnRlZC5yZXNwb25zZS5zdGF0dXM9PT00MDN8fHN0YXJ0ZWQucmVzcG9uc2Uu",
+    "c3RhdHVzPT09NDI5PyJlcnJvciI6InVua25vd24iOwogICAgICByZXN1bHQuc3RhdHVzVGV4dD1tZXNzYWdlO3Jlc3VsdC5zZXJ2",
+    "aWNlRXJyb3I9bWVzc2FnZTtyZXR1cm4gcmVzdWx0OwogICAgfQogICAgY29uc3QgaWQ9U3RyaW5nKHN0YXJ0ZWQuZGF0YS51dWlk",
+    "KTsKICAgIGxldCByZXBvcnQ9bnVsbDsKICAgIGZvcihsZXQgaT0wO2k8OTtpKyspewogICAgICBpZihzdG9wUmVxdWVzdGVkKWJy",
+    "ZWFrOwogICAgICBhd2FpdCBzbGVlcChpPT09MD85MDA6MTIwMCk7CiAgICAgIGxldCBwb2xsOwogICAgICB0cnl7cG9sbD1hd2Fp",
+    "dCBmZXRjaEpzb24oQVBJX0JBU0UrIi9yZXBvcnQvIitlbmNvZGVVUklDb21wb25lbnQoaWQpLHt9LDUwMDApO31jYXRjaChlKXtj",
+    "b250aW51ZTt9CiAgICAgIGlmKHBvbGwucmVzcG9uc2Uuc3RhdHVzPT09NDAzfHxwb2xsLnJlc3BvbnNlLnN0YXR1cz09PTQyOSl7",
+    "CiAgICAgICAgY29uc3QgbWVzc2FnZT1lcnJvckZyb21BcGkocG9sbCwi2K/YsduM2KfZgdiqINqv2LLYp9ix2LQiKTsKICAgICAg",
+    "ICByZXN1bHQuc3RhdHVzPSJlcnJvciI7cmVzdWx0LnN0YXR1c1RleHQ9bWVzc2FnZTtyZXN1bHQuc2VydmljZUVycm9yPW1lc3Nh",
+    "Z2U7cmV0dXJuIHJlc3VsdDsKICAgICAgfQogICAgICBpZighcG9sbC5yZXNwb25zZS5va3x8IXBvbGwuZGF0YXx8IXBvbGwuZGF0",
+    "YS5zdWNjZXNzKWNvbnRpbnVlOwogICAgICByZXBvcnQ9cG9sbC5kYXRhOwogICAgICBjb25zdCBtYXA9cmVwb3J0LmRhdGEmJnR5",
+    "cGVvZiByZXBvcnQuZGF0YT09PSJvYmplY3QiP3JlcG9ydC5kYXRhOnt9OwogICAgICBjb25zdCBpcmFuTm9kZXM9T2JqZWN0LmVu",
+    "dHJpZXMobWFwKS5maWx0ZXIocD0+aXNJcmFuTm9kZShwWzBdLHBbMV0pKS5tYXAocD0+cFsxXSk7CiAgICAgIGlmKGlyYW5Ob2Rl",
+    "cy5sZW5ndGgmJmlyYW5Ob2Rlcy5ldmVyeShub2RlPT5nZXRDaGVja3Mobm9kZSkubGVuZ3RoPjApKWJyZWFrOwogICAgfQogICAg",
+    "aWYoIXJlcG9ydCl7cmVzdWx0LnN0YXR1c1RleHQ9ItmG2KfZhdi02K7YtSDCtyDar9iy2KfYsdi0INin2LIg2LPYsdmI24zYsyDY",
+    "r9ix24zYp9mB2Kog2YbYtNivIjtyZXR1cm4gcmVzdWx0O30KICAgIGNvbnN0IG1hcD1yZXBvcnQuZGF0YSYmdHlwZW9mIHJlcG9y",
+    "dC5kYXRhPT09Im9iamVjdCI/cmVwb3J0LmRhdGE6e307CiAgICBjb25zdCBlbnRyaWVzPU9iamVjdC5lbnRyaWVzKG1hcCkuZmls",
+    "dGVyKHA9PmlzSXJhbk5vZGUocFswXSxwWzFdKSk7CiAgICBjb25zdCB0aW1lcz1bXTtsZXQgb2tOb2Rlcz0wLGZhaWxlZD0wLHBl",
+    "bmRpbmc9MDsKICAgIGZvcihjb25zdCBwYWlyIG9mIGVudHJpZXMpewogICAgICBjb25zdCBjaGVja3M9Z2V0Q2hlY2tzKHBhaXJb",
+    "MV0pOwogICAgICBpZighY2hlY2tzLmxlbmd0aCl7cGVuZGluZysrO2NvbnRpbnVlO30KICAgICAgY29uc3QgYz1wYXJzZUNoZWNr",
+    "KGNoZWNrc1swXSk7CiAgICAgIGlmKGMuc3RhdGU9PT0ib2siKXtva05vZGVzKys7aWYoYy5sYXRlbmN5IT09bnVsbCl0aW1lcy5w",
+    "dXNoKGMubGF0ZW5jeSk7fQogICAgICBlbHNlIGlmKGMuc3RhdGU9PT0icGVuZGluZyIpcGVuZGluZysrOwogICAgICBlbHNlIGZh",
+    "aWxlZCsrOwogICAgfQogICAgcmVzdWx0Lm5vZGVzPWVudHJpZXMubGVuZ3RoOwogICAgcmVzdWx0LnN1Y2Nlc3Nlcz1va05vZGVz",
+    "OwogICAgcmVzdWx0LmxhdGVuY3k9dGltZXMubGVuZ3RoP01hdGgucm91bmQodGltZXMucmVkdWNlKChhLGIpPT5hK2IsMCkvdGlt",
+    "ZXMubGVuZ3RoKTpudWxsOwogICAgaWYob2tOb2Rlcz4wKXsKICAgICAgcmVzdWx0LnN0YXR1cz0ib2siOwogICAgICByZXN1bHQu",
+    "c3RhdHVzVGV4dD0iVENQINmC2KfYqNmEINin2KrYtdin2YQg2KfYsiAiK29rTm9kZXMrIiDar9ix2Ycg2KfbjNix2KfZhtuMIiso",
+    "cGVuZGluZz8iIMK3ICIrcGVuZGluZysiINiv2LEg2KfZhtiq2LjYp9ixIjoiIik7CiAgICB9ZWxzZSBpZihlbnRyaWVzLmxlbmd0",
+    "aD4wJiZwZW5kaW5nPT09MCl7CiAgICAgIHJlc3VsdC5zdGF0dXM9ImVycm9yIjsKICAgICAgcmVzdWx0LnN0YXR1c1RleHQ9IlRD",
+    "UCDYp9iyINmH2YXZh9mUINqv2LHZh+KAjNmH2KfbjCDYp9uM2LHYp9mG24wg2q/Ystin2LHYtOKAjNiv2YfZhtiv2Ycg2YbYp9mF",
+    "2YjZgdmCINio2YjYryAoIitmYWlsZWQrIiDYrti32KcpIjsKICAgIH1lbHNlewogICAgICByZXN1bHQuc3RhdHVzPSJ1bmtub3du",
+    "IjsKICAgICAgcmVzdWx0LnN0YXR1c1RleHQ9ZW50cmllcy5sZW5ndGg9PT0wPyLYudiv2YUg2K3YttmI2LEg2q/YsdmHINmB2LnY",
+    "p9mEINiv2LEg2KfbjNix2KfZhiDCtyDZhtiq24zYrNmH4oCM2KfbjCDYp9iyINiv2KfYrtmEINin24zYsdin2YYg2K/YsduM2KfZ",
+    "gdiqINmG2LTYryAo2q/YsdmH4oCM2YfYp9uMINiu2KfYsdis24wg2YbYp9iv24zYr9mHINqv2LHZgdiq2Ycg2LTYr9mG2K8pIjoi",
+    "2YbYp9mF2LTYrti1IMK3INqv2LLYp9ix2LQg2q/YsdmH4oCM2YfYp9uMINin24zYsdin2YbbjCDZhtin2YLYtSDYp9iz2KoiOwog",
+    "ICAgfQogICAgcmVzdWx0LnJlcG9ydFVybD10eXBlb2Ygc3RhcnRlZC5kYXRhLnJlcG9ydFVSTD09PSJzdHJpbmciP3N0YXJ0ZWQu",
+    "ZGF0YS5yZXBvcnRVUkw6bnVsbDsKICAgIHJldHVybiByZXN1bHQ7CiAgfWNhdGNoKGUpewogICAgY29uc3QgYWJvcnRlZD1lJiZl",
+    "Lm5hbWU9PT0iQWJvcnRFcnJvciI7CiAgICBjb25zdCBibG9ja2VkPSFhYm9ydGVkJiYoZSBpbnN0YW5jZW9mIFR5cGVFcnJvcnx8",
+    "L0ZhaWxlZCB0byBmZXRjaHxOZXR3b3JrRXJyb3J8TG9hZCBmYWlsZWR8Q09SUy9pLnRlc3QoU3RyaW5nKGUmJmUubWVzc2FnZXx8",
+    "ZSkpKTsKICAgIGNvbnN0IG1lc3NhZ2U9YWJvcnRlZD8i2YXZh9mE2Kog2KfYsdiq2KjYp9i3INio2Kcg2LPYsdmI24zYsyDYotiy",
+    "2YXZiNmGINiq2YXYp9mFINi02K8gKNuM2Kcg2K/Ysdiu2YjYp9iz2Kog2YTYutmIINi02K8pLiI6KGJsb2NrZWQ/Q09SU19ISU5U",
+    "OiLYr9iz2KrYsdiz24wg2KjZhyDYs9ix2YjbjNizINii2LLZhdmI2YYg2YXZhdqp2YYg2YbYtNivOiAiK1N0cmluZyhlJiZlLm1l",
+    "c3NhZ2V8fGUpLnNsaWNlKDAsMTQwKSk7CiAgICByZXN1bHQuc3RhdHVzPSJ1bmtub3duIjsKICAgIHJlc3VsdC5zdGF0dXNUZXh0",
+    "PWJsb2NrZWQ/ItmF2LPYr9mI2K8g2LTYryDCtyBDT1JTL9i02KjaqdmHIjptZXNzYWdlOwogICAgcmVzdWx0LnNlcnZpY2VFcnJv",
+    "cj1tZXNzYWdlOwogICAgaWYoYmxvY2tlZClyZXN1bHQuY29yc0Jsb2NrZWQ9dHJ1ZTsKICAgIHJldHVybiByZXN1bHQ7CiAgfQp9",
+    "CmZ1bmN0aW9uIGVuZFNjYW4oKXtydW5uaW5nPWZhbHNlOyQoInN0YXJ0IikuZGlzYWJsZWQ9ZmFsc2U7JCgic3RvcCIpLmRpc2Fi",
+    "bGVkPXRydWU7fQphc3luYyBmdW5jdGlvbiBzdGFydFNjYW4oKXsKICBpZihydW5uaW5nKXJldHVybjsKICBpdGVtcz1ub3JtYWxp",
+    "emVUYXJnZXRzKCk7CiAgaWYoIWl0ZW1zLmxlbmd0aCl7YWxlcnQoIklQINmF2LnYqtio2LEg2YjYp9ix2K8g2qnZhtuM2K/YmyDZ",
+    "gtin2YTYqCDZh9ixINiu2LcgSVAg2Ygg2K/YsSDYtdmI2LHYqiDZhtuM2KfYsiAj2KjYsdqG2LPYqCDYp9iz2KouIik7cmV0dXJu",
+    "O30KICBjb25zdCBwb3J0PU51bWJlcigkKCJwb3J0IikudmFsdWUpOwogIGlmKCFOdW1iZXIuaXNJbnRlZ2VyKHBvcnQpfHxwb3J0",
+    "PDF8fHBvcnQ+NjU1MzUpe2FsZXJ0KCLZvtmI2LHYqiDZhtin2YXYudiq2KjYsSDYp9iz2KouIik7cmV0dXJuO30KICBpZihpdGVt",
+    "cy5sZW5ndGg+MTAwKXthbGVydCgi2K3Yr9in2qnYq9ixINux27DbsCBJUCDYr9ixINmH2LEg2KfYrNix2Kcg2YXYrNin2LIg2KfY",
+    "s9iqLiIpO3JldHVybjt9CiAgY29uc3QgYmFzZT1yZXNvbHZlQXBpQmFzZSgpOwogIGlmKCFiYXNlKXthbGVydCgi2KLYr9ix2LMg",
+    "QVBJINuM2Kcg2b7YsdmI2qnYs9uMINmG2KfZhdi52KrYqNixINin2LPYqtibINio2KfbjNivINio2KcgaHR0cDovLyDbjNinIGh0",
+    "dHBzOi8vINi02LHZiNi5INi02YjYry4iKTtyZXR1cm47fQogIEFQSV9CQVNFPWJhc2U7CiAgcnVubmluZz10cnVlO3N0b3BSZXF1",
+    "ZXN0ZWQ9ZmFsc2U7cmVjb3Jkcz1bXTtzdWNjZXNzPTA7dW5rbm93bj0wO2NvbXBsZXRlZD0wO25leHREaXNwYXRjaEF0PTA7CiAg",
+    "c2hvd1NlcnZpY2VFcnJvcigiIik7JCgic3RhcnQiKS5kaXNhYmxlZD10cnVlOyQoInN0b3AiKS5kaXNhYmxlZD1mYWxzZTskKCJs",
+    "b2ciKS5yZXBsYWNlQ2hpbGRyZW4oKTtkcmF3KCk7CiAgd3JpdGVMb2coItio2LHYsdiz24wg2K/Ys9iq2LHYs9uMINmF2LHZiNix",
+    "2q/YsSDYqNmHIEFQSTogIitBUElfQkFTRSk7CiAgY29uc3QgcGY9YXdhaXQgcHJlZmxpZ2h0KCk7CiAgaWYoc3RvcFJlcXVlc3Rl",
+    "ZCl7ZW5kU2NhbigpO3dyaXRlTG9nKCLYotiy2YXZiNmGINm+24zYtCDYp9iyINi02LHZiNi5INmF2KrZiNmC2YEg2LTYry4iKTty",
+    "ZXR1cm47fQogIGlmKCFwZi5vayl7CiAgICBjb25zdCB0ZXh0PXBmLmFib3J0ZWQ/ItmF2YfZhNiqINin2LHYqtio2KfYtyDYqNin",
+    "IEFQSSDYqtmF2KfZhSDYtNiv2Jsg2KfYqti12KfZhCDYp9uM2YbYqtix2YbYqiDbjNinINii2K/YsdizIEFQSS/Zvtix2Yjaqdiz",
+    "24wg2LHYpyDYqNix2LHYs9uMINqp2YbbjNivLiI6Q09SU19ISU5UOwogICAgc2hvd1NlcnZpY2VFcnJvcih0ZXh0KTt3cml0ZUxv",
+    "ZyhwZi5hYm9ydGVkP3RleHQ6Itiv2LPYqtix2LPbjCDYqNmHIEFQSSDZhdiz2K/ZiNivINin2LPYqiAoQ09SUy/YtNio2qnZhyku",
+    "INix2KfZh9mG2YXYp9uMINio2KfZhNin24wg2LXZgdit2Ycg2LHYpyDYqNio24zZhtuM2K8uIik7CiAgICBpZighcGYuYWJvcnRl",
+    "ZCkkKCJjb3JzR3VpZGUiKS5vcGVuPXRydWU7CiAgICBlbmRTY2FuKCk7cmV0dXJuOwogIH0KICB3cml0ZUxvZygi2KLYstmF2YjZ",
+    "hiBUQ1Ag2KfYsiDar9ix2YfigIzZh9in24wg2KfbjNix2KfZhtuMIChpcjEg2KrYpyBpcjYp2IwgcG9ydD0iK3BvcnQrItiMIHRh",
+    "cmdldHM9IitpdGVtcy5sZW5ndGgpOwogIGxldCBpbmRleD0wO2NvbnN0IGNvbmN1cnJlbmN5PTI7CiAgYXN5bmMgZnVuY3Rpb24g",
+    "d29ya2VyKCl7CiAgICB3aGlsZShydW5uaW5nJiYhc3RvcFJlcXVlc3RlZCYmaW5kZXg8aXRlbXMubGVuZ3RoKXsKICAgICAgY29u",
+    "c3QgdGFyZ2V0PWl0ZW1zW2luZGV4KytdOwogICAgICB3cml0ZUxvZygi2KfYsdiz2KfZhCDYotiy2YXZiNmGICIrdGFyZ2V0Lmlw",
+    "KyI6Iitwb3J0KTsKICAgICAgY29uc3QgcmVzdWx0PWF3YWl0IHRlc3RPbmUodGFyZ2V0LHBvcnQpOwogICAgICByZWNvcmRzLnB1",
+    "c2gocmVzdWx0KTtjb21wbGV0ZWQrKzsKICAgICAgaWYocmVzdWx0LnN0YXR1cz09PSJvayIpc3VjY2VzcysrO2Vsc2UgdW5rbm93",
+    "bisrOwogICAgICBpZihyZXN1bHQuc2VydmljZUVycm9yKXtzaG93U2VydmljZUVycm9yKHJlc3VsdC5zZXJ2aWNlRXJyb3IpO3dy",
+    "aXRlTG9nKHJlc3VsdC5zZXJ2aWNlRXJyb3IpO30KICAgICAgaWYocmVzdWx0LmNvcnNCbG9ja2VkKXtzdG9wUmVxdWVzdGVkPXRy",
+    "dWU7Zm9yKGNvbnN0IGMgb2YgYWN0aXZlQ29udHJvbGxlcnMpYy5hYm9ydCgpOyQoImNvcnNHdWlkZSIpLm9wZW49dHJ1ZTt9CiAg",
+    "ICAgIGRyYXcoKTsKICAgIH0KICB9CiAgYXdhaXQgUHJvbWlzZS5hbGwoQXJyYXkuZnJvbSh7bGVuZ3RoOk1hdGgubWluKGNvbmN1",
+    "cnJlbmN5LGl0ZW1zLmxlbmd0aCl9LCgpPT53b3JrZXIoKSkpOwogIGVuZFNjYW4oKTsKICB3cml0ZUxvZygi2KrZhdin2YUg2LTY",
+    "r9ibIFRDUCDZgtin2KjZhCDYp9iq2LXYp9mEINin2LIg2q/YsdmH4oCM2YfYp9uMINin24zYsdin2YY6ICIrc3VjY2Vzcysi2Iwg",
+    "2K7Yt9inL9mG2KfZhdi02K7YtTogIit1bmtub3duKyIuINin24zZhiDZhtiq24zYrNmHINmF2LPbjNixINiv2YLbjNmCINin2b7Y",
+    "sdin2KrZiNixINqp2KfYsdio2LEg2LHYpyDYqti22YXbjNmGINmG2YXbjOKAjNqp2YbYry4iKTsKfQokKCJzdGFydCIpLm9uY2xp",
+    "Y2s9c3RhcnRTY2FuOyQoInN0b3AiKS5vbmNsaWNrPSgpPT57c3RvcFJlcXVlc3RlZD10cnVlO2Zvcihjb25zdCBjIG9mIGFjdGl2",
+    "ZUNvbnRyb2xsZXJzKWMuYWJvcnQoKTskKCJzdG9wIikuZGlzYWJsZWQ9dHJ1ZTt3cml0ZUxvZygi2KrZiNmC2YEg2K/Ysdiu2YjY",
+    "p9iz2Kog2LTYr9ibINiv2LHYrtmI2KfYs9iq4oCM2YfYp9uMINin2LHYs9in2YTigIzYtNiv2Ycg2YXZhdqp2YYg2KfYs9iqINiv",
+    "2LEg2LPYsdmI24zYsyDYqNuM2LHZiNmG24wg2KrYpyDZvtin24zYp9mGINi52YXYsSDar9iy2KfYsdi0INio2KfZgtuMINio2YXY",
+    "p9mG2YbYry4iKTt9OwokKCJkb3dubG9hZCIpLm9uY2xpY2s9KCk9Pntjb25zdCBjc3Y9WyJpcCxsYWJlbCxwb3J0LHN0YXR1cyxz",
+    "dWNjZXNzZXMsbm9kZXMsbGF0ZW5jeV9tcyxzdGF0dXNfdGV4dCxyZXBvcnRfdXJsIiwuLi5yZWNvcmRzLm1hcChyPT5bci5pcCxy",
+    "LmxhYmVsfHwiIixyLnBvcnQsci5zdGF0dXMsci5zdWNjZXNzZXMsci5ub2RlcyxyLmxhdGVuY3k9PT1udWxsPyIiOnIubGF0ZW5j",
+    "eSxyLnN0YXR1c1RleHQsci5yZXBvcnRVcmx8fCIiXS5tYXAodj0+IlwiIitTdHJpbmcodikucmVwbGFjZSgvXCIvZywiXCJcIiIp",
+    "KyJcIiIpLmpvaW4oIiwiKSldLmpvaW4oIlxyXG4iKTtjb25zdCBibG9iPW5ldyBCbG9iKFsiXHVmZWZmIitjc3ZdLHt0eXBlOiJ0",
+    "ZXh0L2NzdjtjaGFyc2V0PXV0Zi04In0pO2NvbnN0IHVybD1VUkwuY3JlYXRlT2JqZWN0VVJMKGJsb2IpO2NvbnN0IGE9ZG9jdW1l",
+    "bnQuY3JlYXRlRWxlbWVudCgiYSIpO2EuaHJlZj11cmw7YS5kb3dubG9hZD0iY2xlYW4taXAtdGNwLXJlc3VsdHMuY3N2IjthLmNs",
+    "aWNrKCk7c2V0VGltZW91dCgoKT0+VVJMLnJldm9rZU9iamVjdFVSTCh1cmwpLDEwMDApO307CiQoImlwTGlzdCIpLnZhbHVlPUVN",
+    "QkVEREVEX1RBUkdFVFMubWFwKHg9PnguaXArKHgubGFiZWw/IiMiK3gubGFiZWw6IiIpKS5qb2luKCJcbiIpOyQoInBvcnQiKS52",
+    "YWx1ZT1FTUJFRERFRF9UTFNfUE9SVDt3cml0ZUxvZygi2YHZh9ix2LPYqiDYsNiu24zYsdmH4oCM2LTYr9mHINin2LIg2b7ZhtmE",
+    "INio2KfYsdqv2LDYp9ix24wg2LTYrzogIitFTUJFRERFRF9UQVJHRVRTLmxlbmd0aCsiIElQLiDYqNix2KfbjCBJUNmH2KfbjCDY",
+    "rNiv24zYr9iMINmB2KfbjNmEINmC2KjZhNuMINix2Kcg2b7Yp9qpINmIINmF2KzYr9iv2KfZiyDYp9iyINm+2YbZhCDYr9in2YbZ",
+    "hNmI2K8g2qnZhtuM2K8uIik7aWYobG9jYXRpb24ucHJvdG9jb2w9PT0iZmlsZToiKXskKCJjb3JzR3VpZGUiKS5vcGVuPXRydWU7",
+    "d3JpdGVMb2coItiq2YjYrNmHOiDYp9uM2YYg2YHYp9uM2YQg2KfYsiBmaWxlOi8vINio2KfYsiDYtNiv2Ycg2KfYs9iq2Jsg2Kfa",
+    "r9ixINmF2LHZiNix2q/YsSDYr9ix2K7ZiNin2LPYqiDYqNmHIEFQSSDYsdinINio2YfigIzYr9mE24zZhCBDT1JTINmF2LPYr9mI",
+    "2K8g2qnZhtiv2Iwg2LHYp9mH2YbZhdin24wg2KjYp9mE2KfbjCDYtdmB2K3ZhyAo2YjYqOKAjNiz2LHZiNixINmE2Yjaqdin2YQg",
+    "24zYpyDZvtix2Yjaqdiz24wgV29ya2VyKSDYsdinINiv2YbYqNin2YQg2qnZhtuM2K8uIik7fWRyYXcoKTsKPC9zY3JpcHQ+PC9i",
+    "b2R5PjwvaHRtbD4=",
   ].join("");
-  const html = new TextDecoder().decode(Uint8Array.from(atob(templateBase64), ch => ch.charCodeAt(0)));;
+  const html = new TextDecoder().decode(Uint8Array.from(atob(templateBase64), ch => ch.charCodeAt(0)));
   return html
-    .replace('__TARGETS__', safeJson(targets))
-    .replace('__DOMAIN__', safeJson(domain || ''))
+    .replace('__TARGETS__', () => safeJson(targets))
+    .replace('__DOMAIN__', () => safeJson(domain || ''))
     .replace('__TLS_PORT__', String(Number(port) || 443))
     .replace('__PLAIN_PORT__', String(Number(plainPort) || 80));
 }
@@ -5005,14 +5340,17 @@ function renderExternalTestTable(targets) {
   if (!targets.length) { const tr=document.createElement('tr'), td=document.createElement('td'); td.colSpan=5; td.textContent='هیچ هدفی برای تست پیدا نشد.'; tr.appendChild(td); tbody.appendChild(tr); return; }
   targets.forEach(t => {
     const result=externalPingResults[portKey(t.host,t.port)];
+    const queueLabel=externalQueueLabel(t.host,t.port);
+    const showQueue=queueLabel==='در حال تست…' || (!result && !!queueLabel);
     const tr=document.createElement('tr');
     const addr=document.createElement('td'); addr.textContent=t.host; tr.appendChild(addr);
     const port=document.createElement('td'); port.textContent=String(t.port); tr.appendChild(port);
     const latency=document.createElement('td');
-    latency.textContent=result?.latency != null ? String(result.latency) + ' ms' : result?.status === 'pending' ? 'در انتظار...' : result?.status ? '—' : 'هنوز تست نشده';
+    latency.textContent=showQueue ? queueLabel : result?.latency != null ? String(result.latency) + ' ms' : result?.status === 'pending' ? 'در انتظار...' : result?.status ? '—' : 'هنوز تست نشده';
     latency.title=[result?.error, ...(result?.nodeResults || []).map(n=>n.city + ': ' + (n.status==='ok' ? n.latency + ' ms' : (n.error || (n.status==='pending' ? 'در انتظار' : 'ناموفق'))))].filter(Boolean).join('\n'); tr.appendChild(latency);
     const status=document.createElement('td');
-    if (!result) status.textContent='هنوز تست نشده';
+    if (showQueue) { status.textContent=queueLabel; status.style.color='var(--muted)'; }
+    else if (!result) status.textContent='هنوز تست نشده';
     else if (result.status==='ok') { status.textContent='موفق ' + result.successes + '/' + result.nodes; status.style.color='var(--good)'; }
     else if (result.status==='pending') { status.textContent='در انتظار گزارش'; status.style.color='#b45309'; status.title=result.error || ''; }
     else { status.textContent=result.status==='rate_limited'?'محدودیت سرویس':'ناموفق'; status.title=result.error || ''; status.style.color='var(--bad)'; }
@@ -5025,7 +5363,19 @@ function renderExternalTestTable(targets) {
 }
 
 let externalTestRunActive = false;
-let externalTestCursor = 0;
+let externalTestStopRequested = false;
+let externalTestCurrentKey = '';
+let externalTestQueueKeys = new Set();
+// Gap between two sequential targets. Check-Host's anonymous quota is about six
+// calls per ten seconds; one target needs a POST plus a few report polls.
+const EXTERNAL_TEST_GAP_MS = 2500;
+
+function externalQueueLabel(host, port) {
+  if (!externalTestRunActive) return '';
+  const key = portKey(host, port);
+  if (key === externalTestCurrentKey) return 'در حال تست…';
+  return externalTestQueueKeys.has(key) ? 'در صف' : '';
+}
 
 function externalDelay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -5084,59 +5434,62 @@ async function requestExternalBatchWithRetry(batch) {
 
 async function runExternalTests(requestedTargets = null, showCleanTable = true, capOverride = null) {
   if (externalTestRunActive) {
-    showStatus('یک آزمون در حال اجراست؛ لطفاً تا پایان همان آزمون صبر کنید.');
+    if (!requestedTargets) {
+      externalTestStopRequested = true;
+      showStatus('توقف آزمون درخواست شد؛ پس از پایان هدف جاری متوقف می‌شود.');
+    } else {
+      showStatus('یک آزمون در حال اجراست؛ تا پایان آن صبر کنید یا با دکمهٔ اصلی آزمون آن را متوقف کنید.');
+    }
     return;
   }
   externalTestRunActive = true;
+  externalTestStopRequested = false;
   const runButtons = [$('dashTestPingBtn'), $('testCleanBtn')].filter(Boolean);
-  runButtons.forEach(button => { button.disabled = true; button.dataset.originalText = button.textContent; button.textContent = 'در حال تست…'; });
+  const setRunLabel = text => runButtons.forEach(button => {
+    if (button.dataset.originalText === undefined) button.dataset.originalText = button.textContent;
+    button.textContent = text;
+  });
+  let selectedTargets = [];
   try {
     const targets = requestedTargets || collectExternalTargets();
     const unique = [...new Map(targets.map(t => [portKey(t.host, t.port), { host: t.host, port: Number(t.port) }])).values()];
     if (!unique.length) { showStatus('دامنه، Clean IP یا پورت قابل تست پیدا نشد.', true); return; }
 
-    // Keep the existing per-click safety cap; rows beyond it are explicitly reported.
-    // Anonymous Check-Host quota is six API calls per ten seconds. A single
-    // target per click keeps POST + report polling below that ceiling.
-    const maxTargetsPerRun = 1;
-    let selectedTargets;
-    if (requestedTargets) {
-      if (unique.length > 1) {
-        selectedTargets = [unique[externalTestCursor % unique.length]];
-        externalTestCursor = (externalTestCursor + 1) % unique.length;
-      } else selectedTargets = unique.slice(0, 1);
-    } else {
-      const count = Math.min(maxTargetsPerRun, unique.length);
-      selectedTargets = Array.from({ length: count }, (_, index) => unique[(externalTestCursor + index) % unique.length]);
-      externalTestCursor = unique.length ? (externalTestCursor + count) % unique.length : 0;
-    }
-    const skippedTargets = Math.max(0, unique.length - selectedTargets.length);
-    if (showCleanTable) {
-      $('cleanIpTableBody').replaceChildren();
-      const tr = document.createElement('tr'), td = document.createElement('td');
-      td.colSpan = 5;
-      td.textContent = 'در حال اجرای آزمون TCP بیرونی برای ' + selectedTargets.length + ' هدف…';
-      tr.appendChild(td); $('cleanIpTableBody').appendChild(tr);
-    }
+    // Every target is tested, one after another. capOverride is an optional
+    // explicit limit; by default there is no cap.
+    const cap = Number.isInteger(capOverride) && capOverride > 0 ? capOverride : Infinity;
+    selectedTargets = unique.slice(0, cap);
+    const skippedTargets = unique.length - selectedTargets.length;
+    externalTestQueueKeys = new Set(selectedTargets.map(t => portKey(t.host, t.port)));
+    if (showCleanTable) renderExternalTestTable(selectedTargets);
+    renderDashboardConfigs(globalSettings);
 
-    let completed = 0, failed = 0, pendingCount = 0, limitedCount = 0, stoppedForAuth = false;
+    let completed = 0, failed = 0, pendingCount = 0, limitedCount = 0;
+    let stoppedForAuth = false, quotaExhausted = false;
     const failureDetails = [];
-    const batchSize = 1;
-    for (let i = 0; i < selectedTargets.length; i += batchSize) {
-      const batch = selectedTargets.slice(i, i + batchSize);
+    for (let i = 0; i < selectedTargets.length; i++) {
+      if (externalTestStopRequested) break;
+      const target = selectedTargets[i];
+      const key = portKey(target.host, target.port);
+      externalTestCurrentKey = key;
+      setRunLabel('در حال تست… (' + (i + 1) + '/' + selectedTargets.length + ') — برای توقف کلیک کنید');
+      if (showCleanTable) renderExternalTestTable(selectedTargets);
+      renderDashboardConfigs(globalSettings);
+
+      const batch = [target];
       let results = [];
       try {
         const response = await requestExternalBatchWithRetry(batch);
         results = response.results || [];
       } catch (err) {
-        // Record this batch as failed but do not return: later batches still get their turn.
+        // Record this target as failed; later targets still get their turn.
         if ([401, 403].includes(err.status)) {
           showStatus('دسترسی به پنل منقضی یا رد شده است؛ دوباره وارد پنل شوید.', true);
           stoppedForAuth = true;
           break;
         }
-        results = batch.map(target => ({
-          host: target.host, port: target.port, status: 'error', latency: null, successes: 0, nodes: 0,
+        results = batch.map(t => ({
+          host: t.host, port: t.port, status: 'error', latency: null, successes: 0, nodes: 0,
           error: String(err?.message || err).slice(0, 180), reportUrl: null
         }));
       }
@@ -5144,47 +5497,64 @@ async function runExternalTests(requestedTargets = null, showCleanTable = true, 
       const stampedForUi = results.map(result => ({ ...result, checkedAt: Number(result.checkedAt) || Date.now() }));
       mergeTcpTestHistory(stampedForUi);
       const byKey = new Map(stampedForUi.map(result => [portKey(result.host, result.port), result]));
-      for (const target of batch) {
-        const key = portKey(target.host, target.port);
-        const result = byKey.get(key) || {
-          host: target.host, port: target.port, status: 'error', latency: null, successes: 0, nodes: 0,
-          error: 'برای این هدف پاسخی از سرویس تست دریافت نشد.', reportUrl: null
-        };
-        externalPingResults[key] = result;
-        completed++;
-        if (result.status !== 'ok') {
-          failed++;
-          if (result.status === 'pending') pendingCount++;
-          if (result.status === 'rate_limited') limitedCount++;
-          const nodeErrors = (result.nodeResults || []).filter(node => node.error).map(node => node.city + ': ' + node.error);
-          const detail = nodeErrors.length ? nodeErrors.join('; ') : (result.error || (result.status === 'pending' ? 'گزارش هنوز کامل نشده است.' : result.status));
-          failureDetails.push(String(result.host) + ':' + String(result.port) + ' — ' + detail);
-        }
+      const result = byKey.get(key) || {
+        host: target.host, port: target.port, status: 'error', latency: null, successes: 0, nodes: 0,
+        error: 'برای این هدف پاسخی از سرویس تست دریافت نشد.', reportUrl: null
+      };
+      externalPingResults[key] = result;
+      externalTestQueueKeys.delete(key);
+      completed++;
+      if (result.status !== 'ok') {
+        failed++;
+        if (result.status === 'pending') pendingCount++;
+        if (result.status === 'rate_limited') limitedCount++;
+        const nodeErrors = (result.nodeResults || []).filter(node => node.error).map(node => node.city + ': ' + node.error);
+        const detail = nodeErrors.length ? nodeErrors.join('; ') : (result.error || (result.status === 'pending' ? 'گزارش هنوز کامل نشده است.' : result.status));
+        failureDetails.push(String(result.host) + ':' + String(result.port) + ' — ' + detail);
       }
+
+      // Live update after every single target.
+      externalTestCurrentKey = '';
       updateTcpDashboardMetrics();
       renderDailyUsageCharts(globalSettings.users || []);
       renderDashboardConfigs(globalSettings);
       if (showCleanTable) renderExternalTestTable(selectedTargets);
-      // Gentle pacing between calls further reduces provider burst/rate-limit issues.
-      if (i + batchSize < selectedTargets.length) await externalDelay(5000);
+
+      // A minute/hour quota will not recover soon: stop instead of hammering the API.
+      if (result.status === 'rate_limited' && Number(result.retryAfterMs) > 15000) { quotaExhausted = true; break; }
+      if (i < selectedTargets.length - 1 && !externalTestStopRequested) {
+        const extra = result.status === 'rate_limited' ? Math.min(15000, Number(result.retryAfterMs) || 0) : 0;
+        await externalDelay(Math.max(EXTERNAL_TEST_GAP_MS, extra));
+      }
     }
 
     if (stoppedForAuth) return;
-    if (showCleanTable) renderExternalTestTable(selectedTargets);
-    const skippedNote = skippedTargets ? ' ' + skippedTargets + ' هدف برای رعایت محدودیت سرویس در نوبت بعدی می‌ماند؛ اجرای دوباره، گروه بعدی را بررسی می‌کند.' : '';
+    const notRun = selectedTargets.length - completed;
+    const stopNote = externalTestStopRequested
+      ? ' آزمون به درخواست شما متوقف شد؛ ' + notRun + ' هدف تست نشد.'
+      : quotaExhausted
+        ? ' سهمیهٔ سرویس Check-Host تمام شد؛ ' + notRun + ' هدف باقی‌مانده تست نشد و کمی بعد می‌توانید دوباره اجرا کنید.'
+        : '';
+    const skippedNote = skippedTargets ? ' ' + skippedTargets + ' هدف به‌دلیل سقف تعیین‌شده برای این اجرا بررسی نشد.' : '';
     if (failed) {
       const reasons = [];
       if (limitedCount) reasons.push(limitedCount + ' مورد محدودیت سرویس');
       if (pendingCount) reasons.push(pendingCount + ' مورد در انتظار گزارش');
       const reasonText = reasons.length ? ' (' + reasons.join('، ') + ')' : '';
       const diagnostic = failureDetails.length ? ' نمونه: ' + failureDetails[0].slice(0, 220) : '';
-      showStatus('آزمون تمام شد؛ ' + (completed - failed) + ' نتیجه موفق و ' + failed + ' نتیجه ناموفق/نامشخص بود.' + reasonText + diagnostic + skippedNote, true);
+      showStatus('آزمون تمام شد؛ ' + (completed - failed) + ' نتیجه موفق و ' + failed + ' نتیجه ناموفق/نامشخص بود.' + reasonText + diagnostic + stopNote + skippedNote, true);
+    } else if (completed) {
+      showStatus('آزمون بیرونی برای هر ' + completed + ' هدف نتیجه موفق داد.' + stopNote + skippedNote);
     } else {
-      showStatus('آزمون بیرونی برای هر ' + completed + ' هدف نتیجه موفق داد.' + skippedNote);
+      showStatus('هیچ هدفی تست نشد.' + stopNote);
     }
   } finally {
     externalTestRunActive = false;
-    runButtons.forEach(button => { button.disabled = false; button.textContent = button.dataset.originalText || button.textContent; delete button.dataset.originalText; });
+    externalTestStopRequested = false;
+    externalTestCurrentKey = '';
+    externalTestQueueKeys = new Set();
+    runButtons.forEach(button => { button.textContent = button.dataset.originalText || button.textContent; delete button.dataset.originalText; });
+    if (showCleanTable && selectedTargets.length) renderExternalTestTable(selectedTargets);
     updateTcpDashboardMetrics();
     renderDashboardConfigs(globalSettings);
   }
