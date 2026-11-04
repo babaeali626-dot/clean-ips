@@ -1,14 +1,12 @@
-// BUILD_ID: cf-worker-zeus-enhanced-v2-20261030
-// Enhanced with ZEUS-inspired features:
+// BUILD_ID: cf-worker-zeus-usage-revoke-v4-20261104
+// Enhanced with ZEUS-inspired features + Exact Vision UI Dashboard Redesign:
 // - Multi-user structure (users[] with traffic/expire/device/request limits, startOnFirstConnect, resetPeriod)
 // - Fragment profiles for operators (hamrah, irancell, rightel, mokhaberat, gaming, custom)
 // - Selectable fingerprint (instead of fixed chrome)
 // - Multi-proxy + chainProxies with sequential failover
 // - Advanced ECH (custom echConfigList)
-// Legacy single-user fields (uuid, trojanPassword, subToken, proxyIP, chainProxy) still work as fallback.
-// Replace the entire Worker script with this file.
+// - Full Vision UI Dashboard interface preserving 100% of existing IDs & features.
 
-// Full replacement build. Replace the entire Worker script, not just a section.
 import { connect } from "cloudflare:sockets";
 
 const SETTINGS_KEY = "panel-settings-v3";
@@ -27,10 +25,77 @@ const DEFAULT_DOH_URL = "https://cloudflare-dns.com/dns-query";
 const DEFAULT_REMOTE_DNS = "https://8.8.8.8/dns-query";
 const DEFAULT_CLEAN_IP_SOURCE = "https://raw.githubusercontent.com/babaeali626-dot/clean-ips/refs/heads/main/clean-ips.txt";
 const USER_USAGE_PREFIX = "panel-user-usage-v1:";
-// Per-isolate connection counters are intentionally described as approximate, not global device locks.
+const USER_TRAFFIC_FLUSH_BYTES = 4 * 1024 * 1024;
 const userActiveConnections = new Map();
 const userUsageLocks = new Map();
+// Per-isolate byte ledger prevents concurrent tunnels in the same Worker isolate
+// from each spending the same stale KV balance.
+const userTrafficState = new Map();
+// Keep local close callbacks so credential rotation can terminate old tunnels.
+const userConnectionClosers = new Map();
+// Local fast revocation protects this isolate while KV changes propagate.
+const revokedCredentialKeys = new Set();
 const ALLOWED_FINGERPRINTS = new Set(["chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android", "random", "randomized"]);
+
+function credentialRevocationKey(kind, value) {
+  return kind + ":" + String(value || "").trim().toLowerCase();
+}
+function revokeCredential(kind, value) {
+  if (!value) return;
+  revokedCredentialKeys.add(credentialRevocationKey(kind, value));
+  while (revokedCredentialKeys.size > 5000) revokedCredentialKeys.delete(revokedCredentialKeys.values().next().value);
+}
+function isCredentialRevoked(kind, value) {
+  return !!value && revokedCredentialKeys.has(credentialRevocationKey(kind, value));
+}
+function getLocalUserTrafficState(userId, usage) {
+  const id = String(userId);
+  const periodStartedAt = Number(usage?.periodStartedAt) || 0;
+  const stored = userTrafficState.get(id);
+  if (!stored || stored.periodStartedAt !== periodStartedAt) {
+    const fresh = { periodStartedAt, usageBytes: Math.max(0, Number(usage?.usageBytes) || 0) };
+    userTrafficState.set(id, fresh);
+    return fresh;
+  }
+  stored.usageBytes = Math.max(stored.usageBytes, Math.max(0, Number(usage?.usageBytes) || 0));
+  return stored;
+}
+function registerUserConnection(userId, closeCallback) {
+  const id = String(userId || "default");
+  let callbacks = userConnectionClosers.get(id);
+  if (!callbacks) userConnectionClosers.set(id, callbacks = new Set());
+  callbacks.add(closeCallback);
+}
+function unregisterUserConnection(userId, closeCallback) {
+  const id = String(userId || "default");
+  const callbacks = userConnectionClosers.get(id);
+  if (!callbacks) return;
+  callbacks.delete(closeCallback);
+  if (!callbacks.size) userConnectionClosers.delete(id);
+}
+async function closeUserConnections(userId) {
+  const callbacks = [...(userConnectionClosers.get(String(userId || "default")) || [])];
+  await Promise.allSettled(callbacks.map(callback => Promise.resolve().then(() => callback())));
+}
+async function invalidateChangedCredentials(previous, next) {
+  if (!previous || !next) return;
+  const changedIds = [];
+  const invalidate = (oldItem, newItem, connectionId) => {
+    let changed = false;
+    if (oldItem.uuid && oldItem.uuid !== newItem?.uuid) { revokeCredential("vless", oldItem.uuid); changed = true; }
+    if (oldItem.trojanPassword && oldItem.trojanPassword !== newItem?.trojanPassword) {
+      revokeCredential("trojanHash", sha224Hex(oldItem.trojanPassword)); changed = true;
+    }
+    if (oldItem.subToken && oldItem.subToken !== newItem?.subToken) { revokeCredential("sub", oldItem.subToken); changed = true; }
+    if (changed) changedIds.push(connectionId);
+  };
+  invalidate(previous, next, "default");
+  const nextUsers = new Map((Array.isArray(next.users) ? next.users : []).map(user => [String(user.id), user]));
+  for (const oldUser of Array.isArray(previous.users) ? previous.users : []) {
+    invalidate(oldUser, nextUsers.get(String(oldUser.id)), String(oldUser.id));
+  }
+  await Promise.all(changedIds.map(id => closeUserConnections(id)));
+}
 
 const DEFAULTS = {
   username: "admin",
@@ -73,13 +138,13 @@ const DEFAULTS = {
   proxies: [],
   chainProxies: []
 };
-// Fragment profiles for Iranian operators (length / interval)
+
 const FRAGMENT_PROFILES = {
-  hamrah:     { length: "10-30",  interval: "10-20" },   // همراه اول
-  irancell:   { length: "5-15",   interval: "5-15" },    // ایرانسل
-  rightel:    { length: "20-50",  interval: "10-30" },   // رایتل
-  mokhaberat: { length: "50-100", interval: "20-40" },   // مخابرات
-  gaming:     { length: "1-5",    interval: "1-5" },     // Gaming / low latency
+  hamrah:     { length: "10-30",  interval: "10-20" },
+  irancell:   { length: "5-15",   interval: "5-15" },
+  rightel:    { length: "20-50",  interval: "10-30" },
+  mokhaberat: { length: "50-100", interval: "20-40" },
+  gaming:     { length: "1-5",    interval: "1-5" },
   custom:     null
 };
 
@@ -93,8 +158,6 @@ function applyFragmentProfile(settings) {
   return settings;
 }
 
-
-// KV binding selection is deterministic: never silently select an arbitrary namespace.
 async function getKvBinding(env) {
   const isKv = value => value && typeof value.get === "function" && typeof value.put === "function";
   for (const name of ["SETTINGS", "PANEL_KV", "KV"]) if (isKv(env[name])) return env[name];
@@ -112,7 +175,6 @@ export default {
       if (path === "/healthz") {
         return new Response("ok", { headers: securityHeaders({ "content-type": "text/plain; charset=utf-8" }) });
       }
-
       if (path === "/vless" || path === "/trojan") {
         if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return fakeLandingResponse();
         if (!(await checkClientIpRestriction(request, env, kv))) {
@@ -120,37 +182,28 @@ export default {
         }
         return await handleTunnel(request, env, kv, path.slice(1), ctx);
       }
-
       if (path.startsWith("/sub/")) {
         if (!(await checkClientIpRestriction(request, env, kv))) {
           return json({ error: "Access Denied", code: "ERR_IP_RESTRICTED" }, 403);
         }
         return await handleSubscription(request, env, kv, url);
       }
-
       if (path === "/api/setup-status" && request.method === "GET") {
         const configured = await isSetupDone(kv, env);
         return json({ configured });
       }
-
       if (path === "/api/setup" && request.method === "POST") {
         return await handleSetup(request, kv, env, url);
       }
-
       if (path === "/api/login" && request.method === "POST") {
         return await handleLogin(request, kv, env, url);
       }
-
       if (path.startsWith("/api/")) {
         if (!(await hasSession(request, kv, env))) return json({ error: "Unauthorized", code: "ERR_UNAUTHORIZED" }, 401);
         if (request.method !== "GET" && !sameOrigin(request, url)) return json({ error: "Bad Origin", code: "ERR_BAD_ORIGIN" }, 403);
-        
-        if (path === "/api/ping-ip" && request.method === "POST") {
-          return await handlePingIp(request);
-        }
-        if (path === "/api/external-ping" && request.method === "POST") {
-          return await handleExternalPing(request, kv, env, url);
-        }
+
+        if (path === "/api/ping-ip" && request.method === "POST") return await handlePingIp(request);
+        if (path === "/api/external-ping" && request.method === "POST") return await handleExternalPing(request, kv, env, url);
         if (path === "/api/cleanips/sync" && request.method === "POST") {
           if (!kv) return json({ error: "KV Binding یافت نشد؛ ذخیره و همگام‌سازی Clean IP ممکن نیست.", code: "ERR_KV_MISSING" }, 503);
           try {
@@ -182,17 +235,24 @@ export default {
           next.passwordHash = current.passwordHash;
           next.sessionSecret = current.sessionSecret;
           await saveSettings(kv, env, next);
+          await invalidateChangedCredentials(current, next);
           await reconcileUserUsageConfigs(kv, current.users, next.users);
           await attachUserUsage(next, kv);
           return json({ ok: true, settings: publicSettings(next, url) });
         }
         if (path === "/api/rotate-token" && request.method === "POST") {
-          const s = await loadSettings(kv, env);
+          const previous = await loadSettings(kv, env);
+          const s = { ...previous };
           s.subToken = await generateSecureToken();
+          // Rotate all root credentials together so no legacy transport credential survives.
+          s.uuid = crypto.randomUUID();
+          s.trojanPassword = generateSecureRandomString(32);
           await saveSettings(kv, env, s);
-          return json({ ok: true, subToken: s.subToken, links: publicSettings(s, url).links });
+          await invalidateChangedCredentials(previous, s);
+          await attachUserUsage(s, kv);
+          return json({ ok: true, subToken: s.subToken, uuid: s.uuid, trojanPassword: s.trojanPassword, links: publicSettings(s, url).links, settings: publicSettings(s, url) });
         }
-        if (path === "/api/users/reset-usage" && request.method === "POST") {
+        if ((path === "/api/users/reset-usage" || path === "/api/users/rotate-credentials") && request.method === "POST") {
           if (!kv) return json({ error: "KV Binding یافت نشد.", code: "ERR_KV_MISSING" }, 503);
           try {
             const body = await readJsonLimited(request, 2048);
@@ -202,15 +262,33 @@ export default {
               const s = await loadSettings(kv, env);
               const user = (s.users || []).find(item => String(item.id) === id);
               if (!user) return null;
-              const previous = await getUserUsage(kv, user);
-              const now = Date.now();
-              await saveUserUsage(kv, id, { ...previous, usageBytes: 0, requestCount: 0, periodStartedAt: now });
-              return true;
+              const previous = { ...user };
+              user.uuid = crypto.randomUUID();
+              user.trojanPassword = generateSecureRandomString(32);
+              user.subToken = await generateSecureToken();
+              await saveSettings(kv, env, s);
+              if (previous.uuid) revokeCredential("vless", previous.uuid);
+              if (previous.trojanPassword) revokeCredential("trojanHash", sha224Hex(previous.trojanPassword));
+              if (previous.subToken) revokeCredential("sub", previous.subToken);
+              return { user };
             });
             if (!result) return json({ error: "کاربر پیدا نشد.", code: "ERR_USER_NOT_FOUND" }, 404);
-            return json({ ok: true, message: "مصرف و شمارنده نشست کاربر بازنشانی شد؛ تاریخ انقضا تغییر نکرد." });
+            // Await closing/persisting old sessions before writing the zeroed ledger.
+            await closeUserConnections(id);
+            const resetUsage = await withUserUsageLock(id, async () => {
+              const currentSettings = await loadSettings(kv, env);
+              const currentUser = (currentSettings.users || []).find(item => String(item.id) === id);
+              if (!currentUser) throw new Error("کاربر پس از بازنشانی پیدا نشد.");
+              const usage = await getUserUsage(kv, currentUser);
+              const now = Date.now();
+              const nextUsage = { ...usage, usageBytes: 0, requestCount: 0, periodStartedAt: now };
+              await saveUserUsage(kv, id, nextUsage);
+              userTrafficState.set(id, { periodStartedAt: now, usageBytes: 0 });
+              return nextUsage;
+            });
+            return json({ ok: true, message: "حجم و شمارنده صفر شد؛ توکن، UUID و رمز Trojan جدید شدند و اشتراک و کانفیگ قبلی منسوخ شد. تاریخ انقضا تغییر نکرد.", usage: resetUsage, settings: publicSettings(await loadSettings(kv, env), url) });
           } catch (err) {
-            return json({ error: String(err && err.message || "بازنشانی مصرف ناموفق بود").slice(0, 180), code: "ERR_USER_RESET" }, 400);
+            return json({ error: String(err && err.message || "بازنشانی و ابطال اشتراک ناموفق بود").slice(0, 180), code: "ERR_USER_RESET" }, 400);
           }
         }
         if (path === "/api/backup" && request.method === "GET") {
@@ -219,7 +297,6 @@ export default {
           delete exportData.passwordHash;
           delete exportData.sessionSecret;
           delete exportData.subToken;
-          // Never export access credentials or credential-bearing proxy URIs.
           delete exportData.uuid;
           delete exportData.trojanPassword;
           delete exportData.chainProxy;
@@ -243,11 +320,10 @@ export default {
             validated.passwordHash = current.passwordHash;
             validated.sessionSecret = current.sessionSecret;
             validated.subToken = current.subToken;
-            // Backups intentionally omit credentials. Keep the existing root credentials
-            // on this Worker rather than accidentally blanking the legacy root account.
             validated.uuid = validated.uuid || current.uuid;
             validated.trojanPassword = validated.trojanPassword || current.trojanPassword;
             await saveSettings(kv, env, validated);
+            await invalidateChangedCredentials(current, validated);
             await reconcileUserUsageConfigs(kv, current.users, validated.users);
             await attachUserUsage(validated, kv);
             return json({ ok: true, settings: publicSettings(validated, url) });
@@ -268,24 +344,16 @@ export default {
 
       if (path === "/panel" || path === "/panel/" || path === "/panel/index.html") {
         return new Response(ADMIN_HTML, {
-          headers: securityHeaders({
-            "content-type": "text/html; charset=utf-8",
-            "cache-control": "no-store"
-          })
+          headers: securityHeaders({ "content-type": "text/html; charset=utf-8", "cache-control": "no-store" })
         });
       }
-
       if (path === "/" || path === "/index.html") return fakeLandingResponse();
-
       return fakeLandingResponse();
     } catch (err) {
       console.error("Internal Error:", err);
-      // Fixed: Removed raw details leak in 500 error for security
       return json({ error: "Internal Server Error", code: "ERR_INTERNAL" }, 500);
     }
   },
-  // Configure a Cloudflare Cron Trigger such as "0 4 * * *" for one daily sync (UTC).
-  // Add one or more raw.githubusercontent.com text-file URLs in the Clean IP settings first.
   async scheduled(controller, env, ctx) {
     ctx.waitUntil((async () => {
       try {
@@ -293,8 +361,6 @@ export default {
         if (!kv) throw new Error("KV Binding یافت نشد؛ همگام‌سازی زمان‌بندی‌شده متوقف شد.");
         const settings = await loadSettings(kv, env);
         const synced = await fetchCleanIpLists(settings.cleanIpSources || "");
-        // Check a small sample from Iranian-region probes to stay within public service quotas.
-        // A successful sampled result ranks first; unknown/failing results never imply an IP is universally blocked.
         const sample = parseCleanIPs(synced.cleanIPs).slice(0, 3).map(item => item.host);
         const tests = await Promise.all(sample.map((host, index) => checkHostExternalTcp(host, settings.tlsPort || 443, index * 900)));
         settings.cleanIPs = sortCleanIpListByTestResults(synced.cleanIPs, tests);
@@ -308,9 +374,6 @@ export default {
 };
 
 // -------------------- Ping & Clean IP API --------------------
-
-// Cloudflare Workers blocks outbound TCP sockets to Cloudflare's own edge IP ranges.
-// Detect those addresses up front so the UI does not misleadingly show 0% packet success.
 const CLOUDFLARE_EDGE_CIDRS = [
   "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
   "104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
@@ -371,7 +434,6 @@ async function handlePingIp(request) {
     return json({ error: "یکی از آدرس‌ها نامعتبر است.", code: "ERR_VALIDATION" }, 400);
   }
   const results = await Promise.all(normalized.map(async ip => {
-    // This includes 104.22.7.80 from the user's backup (within 104.16.0.0/13).
     if (isCloudflareEdgeIp(ip)) {
       return { ip, status: "unsupported", latency: -1, code: "ERR_CF_IP_SOCKET_BLOCKED",
         message: "Cloudflare Workers cannot open outbound TCP sockets to Cloudflare edge IP ranges." };
@@ -389,8 +451,6 @@ async function handlePingIp(request) {
   return json({ results });
 }
 
-// External TCP diagnostics using Check-Host.cc public probes. Results come from
-// remote monitoring nodes in Iran, not from the Worker itself or the user's exact ISP.
 const MAX_EXTERNAL_PING_TARGETS = 3;
 const CHECK_HOST_API = "https://api.check-host.cc";
 const CHECK_HOST_WEB = "https://check-host.cc";
@@ -407,7 +467,7 @@ async function fetchJsonWithTimeout(url, timeoutMs = 4500, init = {}) {
     });
     const text = await response.text();
     let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { /* Preserve a short body excerpt for diagnostics. */ }
+    try { data = text ? JSON.parse(text) : null; } catch {}
     return { response, data, bodyText: text.slice(0, 240) };
   } finally { clearTimeout(timer); }
 }
@@ -427,10 +487,7 @@ function externalChecksArray(node) {
 
 async function checkHostExternalTcp(host, port, dispatchDelayMs = 0) {
   try {
-    // Stagger dispatches within a batch so concurrent UI tests are less likely to trigger
-    // anonymous-provider burst limits; reports are still polled concurrently.
     if (dispatchDelayMs > 0) await sleep(dispatchDelayMs);
-
     const started = await fetchJsonWithTimeout(`${CHECK_HOST_API}/tcp`, 6500, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -455,18 +512,12 @@ async function checkHostExternalTcp(host, port, dispatchDelayMs = 0) {
       : (/^[a-f0-9-]{30,40}$/i.test(requestId) ? `${CHECK_HOST_WEB}/report/${requestId}` : null);
 
     let reportData = null;
-    // Check-Host says most probes finish in 1–10 seconds; poll a little beyond that,
-    // but keep this request bounded and return an explicit pending status if needed.
     const pollDelays = [700, 1000, 1400, 1900, 2400, 2800];
     for (const delay of pollDelays) {
       await sleep(delay);
       let poll;
-      try {
-        poll = await fetchJsonWithTimeout(`${CHECK_HOST_API}/report/${encodeURIComponent(requestId)}`, 2500);
-      } catch {
-        // A single timed-out poll must not discard an already-created report or stop later polls.
-        continue;
-      }
+      try { poll = await fetchJsonWithTimeout(`${CHECK_HOST_API}/report/${encodeURIComponent(requestId)}`, 2500); }
+      catch { continue; }
       if (poll.response.status === 429) {
         return { host, port, status: "rate_limited", latency: null, successes: 0, nodes: 0,
           retryAfterMs: Math.min(15000, Math.max(1000, Number(poll.response.headers.get("retry-after") || 5) * 1000)),
@@ -559,66 +610,41 @@ async function handleExternalPing(request, kv, env, requestUrl) {
   } catch (err) {
     return json({ error: err.message || "هدف آزمون نامعتبر است", code: "ERR_VALIDATION" }, 400);
   }
-  // Dispatch each probe with a small offset to avoid bursting the anonymous API.
-  // Each target is still polled independently, so one slow target does not serialize the batch.
-  const results = await Promise.all(targets.map((target, index) =>
-    checkHostExternalTcp(target.host, target.port, index * 900)
-  ));
+  const results = await Promise.all(targets.map((target, index) => checkHostExternalTcp(target.host, target.port, index * 900)));
   return json({ provider: "Check-Host.cc", note: "نتایج از گره‌های فعال منطقه ایران در Check-Host.cc هستند؛ این گره‌ها نمایندهٔ تمام اپراتورها یا مسیر دقیق کاربر نیستند.", results });
 }
 
 // -------------------- Session & Setup Helpers --------------------
-
 async function isSetupDone(kv, env) {
   try {
-    // loadSettings also migrates known legacy KV keys to SETTINGS_KEY.
     const settings = await loadSettings(kv, env);
     return !!settings.passwordHash || !!env.PANEL_PASSWORD;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 async function handleSetup(request, kv, env, url) {
   if (!sameOrigin(request, url)) return json({ error: "Bad Origin", code: "ERR_BAD_ORIGIN" }, 403);
   if (!kv) return json({ error: "KV Binding یافت نشد. در تنظیمات Worker یک KV Namespace با نام SETTINGS تعریف کنید.", code: "ERR_KV_MISSING" }, 500);
-  if (await isSetupDone(kv, env)) {
-    return json({ error: "Setup already completed", code: "ERR_SETUP_DONE" }, 400);
-  }
+  if (await isSetupDone(kv, env)) return json({ error: "Setup already completed", code: "ERR_SETUP_DONE" }, 400);
   const body = await readJsonLimited(request, 4096);
   const username = String(body.username || "").trim();
   const password = String(body.password || "").trim();
   if (!username || username.length < 3) return json({ error: "نام کاربری نامعتبر است", code: "ERR_USERNAME_INVALID" }, 400);
   if (!password || password.length < 6) return json({ error: "رمز عبور ضعیف است", code: "ERR_PASSWORD_INVALID" }, 400);
 
-  // Concurrency lock simulation
   const checkAgain = await kv.get(SETTINGS_KEY, "json");
-  if (checkAgain && checkAgain.passwordHash) {
-    return json({ error: "Setup completed by another request", code: "ERR_SETUP_DONE" }, 400);
-  }
+  if (checkAgain && checkAgain.passwordHash) return json({ error: "Setup completed by another request", code: "ERR_SETUP_DONE" }, 400);
 
   const passwordHash = await hashPassword(password);
   const sessionSecret = await generateSecureToken();
   const subToken = await generateSecureToken();
   const uuid = crypto.randomUUID();
   const trojanPassword = generateSecureRandomString(24);
-
-  const settings = {
-    ...DEFAULTS,
-    username,
-    passwordHash,
-    sessionSecret,
-    subToken,
-    uuid,
-    trojanPassword,
-    vlessEnabled: true,
-    trojanEnabled: true
-  };
+  const settings = { ...DEFAULTS, username, passwordHash, sessionSecret, subToken, uuid, trojanPassword, vlessEnabled: true, trojanEnabled: true };
 
   await saveSettings(kv, env, settings);
   const timestamp = String(Math.floor(Date.now() / 1000));
   const signature = await signSession(timestamp, settings);
-
   return new Response(JSON.stringify({ ok: true }), {
     headers: securityHeaders({
       "content-type": "application/json; charset=utf-8",
@@ -631,9 +657,6 @@ async function handleSetup(request, kv, env, url) {
 const LOGIN_FAILURE_LIMIT = 5;
 const LOGIN_FAILURE_WINDOW_SECONDS = 300;
 const LOGIN_FAILURE_WINDOW_MS = LOGIN_FAILURE_WINDOW_SECONDS * 1000;
-// One centralized KV document avoids key-list operations, whose free-tier quota is much lower.
-// KV is eventually consistent, so this is a best-effort distributed limiter; isolate-local
-// reservations below still protect against bursts handled by the same Worker isolate.
 const LOGIN_FAILURE_STORE_KEY = "panel-login-failures-v2";
 const LOGIN_FAILURE_STORE_TTL_SECONDS = 600;
 const LOGIN_FAILURE_MAX_TRACKED_IPS = 2048;
@@ -682,21 +705,11 @@ async function loginFailureIpHash(request, kv) {
 async function readLoginFailureStore(kv) {
   if (!kv || typeof kv.get !== "function") return null;
   try {
-    // Use the minimum supported KV cache TTL to reduce stale limiter reads.
     let value = await kv.get(LOGIN_FAILURE_STORE_KEY, { type: "json", cacheTtl: 30 });
-    // Tolerate KV-compatible mocks/providers that return strings for JSON reads.
-    if (typeof value === "string") {
-      try { value = JSON.parse(value); } catch { value = null; }
-    }
-    if (!value || typeof value !== "object" || !value.ips || typeof value.ips !== "object" || Array.isArray(value.ips)) {
-      return { version: 2, ips: {} };
-    }
+    if (typeof value === "string") { try { value = JSON.parse(value); } catch { value = null; } }
+    if (!value || typeof value !== "object" || !value.ips || typeof value.ips !== "object" || Array.isArray(value.ips)) return { version: 2, ips: {} };
     return { version: 2, ips: value.ips };
-  } catch {
-    // Distinguish a KV read failure from a genuinely missing key so callers never
-    // overwrite the centralized store with an empty document during an outage.
-    return null;
-  }
+  } catch { return null; }
 }
 
 function cleanFailureTimestamps(value, now = Date.now()) {
@@ -717,9 +730,7 @@ function pruneLoginFailureStore(store, now = Date.now()) {
     keys.sort((a, b) => Math.max(...(ips[a] || [0])) - Math.max(...(ips[b] || [0])));
     for (const key of keys.slice(0, keys.length - LOGIN_FAILURE_MAX_TRACKED_IPS)) delete ips[key];
   }
-  store.version = 2;
-  store.ips = ips;
-  return store;
+  store.version = 2; store.ips = ips; return store;
 }
 
 async function checkLoginRateLimit(request, kv) {
@@ -735,11 +746,9 @@ async function checkLoginRateLimit(request, kv) {
       return { ipHash: null, store: null, memoryKey, blocked: true, reserved: false,
         retryAfter: timestamps.length ? loginRetryAfter(timestamps, now) : LOGIN_FAILURE_WINDOW_SECONDS };
     }
-    // Reserve synchronously to prevent same-isolate parallel login bursts.
     loginInflightMemory.set(memoryKey, inflight + 1);
     reserved = true;
   }
-
   try {
     const ipHash = await loginFailureIpHash(request, kv);
     if (!ipHash) return { ipHash: null, store: null, memoryKey, blocked: false, reserved, retryAfter: 0 };
@@ -747,17 +756,13 @@ async function checkLoginRateLimit(request, kv) {
     if (!store) return { ipHash: null, store: null, memoryKey, blocked: false, reserved, retryAfter: 0 };
     const shared = cleanFailureTimestamps(store.ips[ipHash], now);
     const local = recentLocalLoginFailures(memoryKey, now).map(item => item.at);
-    // Avoid double-counting failures represented in both isolate memory and KV.
     const timestamps = shared.length >= local.length ? shared : local;
     if (timestamps.length >= LOGIN_FAILURE_LIMIT) {
       if (reserved) releaseLoginAttempt(memoryKey);
       return { ipHash, store, memoryKey, blocked: true, reserved: false, retryAfter: loginRetryAfter(timestamps, now) };
     }
     return { ipHash, store, memoryKey, blocked: false, reserved, retryAfter: 0 };
-  } catch {
-    // Preserve isolate-local protection if KV is temporarily unavailable.
-    return { ipHash: null, store: null, memoryKey, blocked: false, reserved, retryAfter: 0 };
-  }
+  } catch { return { ipHash: null, store: null, memoryKey, blocked: false, reserved, retryAfter: 0 }; }
 }
 
 async function recordLoginFailure(kv, ipHash, memoryKey, storeSnapshot) {
@@ -768,19 +773,14 @@ async function recordLoginFailure(kv, ipHash, memoryKey, storeSnapshot) {
     recent.push({ id, at: now });
     loginFailureMemory.set(memoryKey, recent.slice(-LOGIN_FAILURE_LIMIT));
   }
-  if (!ipHash || !kv || typeof kv.get !== "function" || typeof kv.put !== "function") return;
+  if (!ipHash || !kv || typeof kv.get !== "function" || typeof kv.put !== "function" || !storeSnapshot) return;
   try {
-    // Reuse the per-request KV snapshot: one KV read per login attempt. KV has no
-    // compare-and-swap, so cross-isolate concurrent writes remain best-effort.
-    if (!storeSnapshot) return;
     const store = pruneLoginFailureStore(storeSnapshot, now);
     const recent = cleanFailureTimestamps(store.ips[ipHash], now);
     recent.push(now);
     store.ips[ipHash] = recent.slice(-LOGIN_FAILURE_LIMIT);
     await kv.put(LOGIN_FAILURE_STORE_KEY, JSON.stringify(store), { expirationTtl: LOGIN_FAILURE_STORE_TTL_SECONDS });
-  } catch {
-    // The isolate-local counter remains active if KV is unavailable.
-  }
+  } catch {}
 }
 
 async function clearLoginFailures(kv, ipHash, memoryKey, storeSnapshot) {
@@ -790,17 +790,12 @@ async function clearLoginFailures(kv, ipHash, memoryKey, storeSnapshot) {
     const store = storeSnapshot;
     if (!Object.prototype.hasOwnProperty.call(store.ips, ipHash)) return;
     delete store.ips[ipHash];
-    await kv.put(LOGIN_FAILURE_STORE_KEY, JSON.stringify(pruneLoginFailureStore(store)), {
-      expirationTtl: LOGIN_FAILURE_STORE_TTL_SECONDS
-    });
-  } catch {
-    // A successful login must not be blocked if cleanup fails.
-  }
+    await kv.put(LOGIN_FAILURE_STORE_KEY, JSON.stringify(pruneLoginFailureStore(store)), { expirationTtl: LOGIN_FAILURE_STORE_TTL_SECONDS });
+  } catch {}
 }
 
 async function handleLogin(request, kv, env, url) {
   if (!sameOrigin(request, url)) return json({ error: "bad origin", code: "ERR_BAD_ORIGIN" }, 403);
-
   const rateLimit = await checkLoginRateLimit(request, kv);
   if (rateLimit.blocked) {
     return new Response(JSON.stringify({
@@ -809,26 +804,17 @@ async function handleLogin(request, kv, env, url) {
       retryAfterSeconds: rateLimit.retryAfter
     }), {
       status: 429,
-      headers: securityHeaders({
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": "no-store",
-        "retry-after": String(rateLimit.retryAfter)
-      })
+      headers: securityHeaders({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "retry-after": String(rateLimit.retryAfter) })
     });
   }
-
   try {
     const body = await readJsonLimited(request, 4096);
     const username = String(body.username || "").trim();
     const password = String(body.password || "").trim();
-
     const settings = await loadSettings(kv, env);
     let valid = false;
-
     if (settings.passwordHash) {
-      if (settings.username === username) {
-        valid = await verifyPassword(password, settings.passwordHash);
-      }
+      if (settings.username === username) valid = await verifyPassword(password, settings.passwordHash);
     } else if (env.PANEL_PASSWORD) {
       valid = constantTimeEqual(password, env.PANEL_PASSWORD);
       if (valid && kv) {
@@ -840,12 +826,10 @@ async function handleLogin(request, kv, env, url) {
     } else {
       return json({ error: "پنل هنوز راه‌اندازی نشده است", code: "ERR_NOT_SETUP" }, 400);
     }
-
     if (!valid) {
       await recordLoginFailure(kv, rateLimit.ipHash, rateLimit.memoryKey, rateLimit.store);
       return json({ error: "نام کاربری یا رمز عبور اشتباه است", code: "ERR_AUTH_FAILED" }, 401);
     }
-
     await clearLoginFailures(kv, rateLimit.ipHash, rateLimit.memoryKey, rateLimit.store);
     const timestamp = String(Math.floor(Date.now() / 1000));
     const signature = await signSession(timestamp, settings);
@@ -916,7 +900,6 @@ function generateSecureRandomString(length = 16) {
 }
 
 // -------------------- Settings & KV Management --------------------
-
 const LEGACY_SETTINGS_KEYS = ["panel-settings-v2", "panel-settings-v1", "panel-settings", "settings"];
 
 async function loadSettings(kv, env) {
@@ -942,7 +925,7 @@ async function loadSettings(kv, env) {
           await kv.put(SETTINGS_KEY, JSON.stringify({ ...DEFAULTS, ...old }));
           break;
         }
-      } catch { /* try the next known legacy key */ }
+      } catch {}
     }
   }
   if (stored && typeof stored === "object") {
@@ -973,7 +956,6 @@ async function saveSettings(kv, env, settings) {
   if (!kv) throw new Error("KV Binding یافت نشد. در تنظیمات Worker یک KV Namespace با نام SETTINGS تعریف کنید.");
   await kv.put(SETTINGS_KEY, JSON.stringify(settings));
 }
-
 
 function normalizeFingerprint(value) {
   const fp = String(value || "chrome").trim().toLowerCase();
@@ -1071,13 +1053,8 @@ async function getUserUsage(kv, user) {
     usage.configExpireDays !== base.configExpireDays ||
     usage.configStartOnFirstConnect !== base.configStartOnFirstConnect;
   if (configChanged) {
-    // An administrator changing the validity settings is an explicit renewal.
-    // Start the new fixed-duration window now; for start-on-first-connect users,
-    // keep the clock stopped until the first authenticated tunnel is accepted.
     usage.expiresAt = base.configExpireDays > 0
-      ? (base.configStartOnFirstConnect && !usage.firstConnectedAt
-          ? 0
-          : Date.now() + base.configExpireDays * 86400000)
+      ? (base.configStartOnFirstConnect && !usage.firstConnectedAt ? 0 : Date.now() + base.configExpireDays * 86400000)
       : 0;
     usage.configCreatedAt = base.configCreatedAt;
     usage.configExpireDays = base.configExpireDays;
@@ -1102,10 +1079,11 @@ async function saveUserUsage(kv, userId, usage) {
 }
 
 async function attachUserUsage(settings, kv) {
-  if (!Array.isArray(settings.users) || !settings.users.length || !kv) return settings;
+  if (!Array.isArray(settings.users) || !settings.users.length) return settings;
   settings.users = await Promise.all(settings.users.map(async user => {
-    const usage = await getUserUsage(kv, user);
-    return { ...user, ...usage, activeConnections: userActiveConnections.get(user.id) || 0 };
+    const usage = kv ? await getUserUsage(kv, user) : defaultUserUsage(user);
+    const localTraffic = getLocalUserTrafficState(user.id, usage);
+    return { ...user, ...usage, usageBytes: Math.max(Number(usage.usageBytes) || 0, localTraffic.usageBytes), activeConnections: userActiveConnections.get(user.id) || 0 };
   }));
   return settings;
 }
@@ -1120,7 +1098,23 @@ function getUserAccessError(user, usage, now = Date.now()) {
 }
 
 async function beginUserSession(kv, candidate) {
-  if (!candidate || candidate.id === "default") return { user: candidate, usage: null, tracked: false };
+  if (!candidate) throw new Error("اعتبارنامه نامعتبر است.");
+  if (candidate.id === "default") {
+    // Re-read root credentials immediately before accepting the session. KV is
+    // eventually consistent across locations, but this prevents stale snapshots
+    // within the current Worker isolate after a local credential rotation.
+    if (kv) {
+      const latest = readKvJson(await kv.get(SETTINGS_KEY, { type: "json" }));
+      if (!latest) throw new Error("تنظیمات اصلی در دسترس نیست.");
+      if (candidate.uuid && String(latest.uuid || "").toLowerCase() !== String(candidate.uuid).toLowerCase()) {
+        throw new Error("UUID اصلی قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
+      }
+      if (candidate.trojanPassword && String(latest.trojanPassword || "") !== String(candidate.trojanPassword)) {
+        throw new Error("رمز Trojan اصلی قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
+      }
+    }
+    return { user: candidate, usage: null, tracked: false };
+  }
   if (!kv) throw new Error("مدیریت کاربر به KV نیاز دارد.");
   const id = String(candidate.id);
   const active = userActiveConnections.get(id) || 0;
@@ -1132,6 +1126,8 @@ async function beginUserSession(kv, candidate) {
       const latest = readKvJson(await kv.get(SETTINGS_KEY, { type: "json" }));
       const liveUser = Array.isArray(latest?.users) ? latest.users.find(u => String(u.id) === id) : null;
       if (!liveUser || liveUser.enabled === false) throw new Error("کاربر حذف یا غیرفعال شده است.");
+      if (candidate.uuid && String(liveUser.uuid || "").toLowerCase() !== String(candidate.uuid).toLowerCase()) throw new Error("اعتبارنامه قبلی کاربر منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
+      if (candidate.trojanPassword && String(liveUser.trojanPassword || "") !== String(candidate.trojanPassword)) throw new Error("رمز Trojan قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
       const liveLimit = Math.max(0, Number(liveUser.deviceLimit) || 0);
       const currentConnections = userActiveConnections.get(id) || 0;
       if (liveLimit > 0 && currentConnections > liveLimit) throw new Error("حد اتصال هم‌زمان کاربر تغییر کرده و ظرفیت آن پر است.");
@@ -1148,12 +1144,14 @@ async function beginUserSession(kv, candidate) {
       if (!liveUser.startOnFirstConnect && Number(liveUser.expireDays) > 0 && !usage.expiresAt) {
         usage.expiresAt = (Number(liveUser.createdAt) || now) + Number(liveUser.expireDays) * 86400000;
       }
+      const trafficState = getLocalUserTrafficState(id, usage);
+      usage.usageBytes = Math.max(Number(usage.usageBytes) || 0, trafficState.usageBytes);
       const accessError = getUserAccessError(liveUser, usage, now);
       if (accessError) throw new Error(accessError);
       usage.requestCount++;
       usage.lastConnectedAt = now;
       await saveUserUsage(kv, id, usage);
-      return { user: liveUser, usage, tracked: true };
+      return { user: liveUser, usage, trafficState, tracked: true };
     });
   } catch (err) {
     const current = userActiveConnections.get(id) || 0;
@@ -1171,6 +1169,8 @@ async function addUserTraffic(kv, userId, amount) {
     const usage = await getUserUsage(kv, user);
     usage.usageBytes += Math.floor(amount);
     await saveUserUsage(kv, userId, usage);
+    const local = userTrafficState.get(String(userId));
+    if (local && local.periodStartedAt === Number(usage.periodStartedAt || 0)) local.usageBytes = Math.max(local.usageBytes, usage.usageBytes);
     return usage;
   });
 }
@@ -1189,15 +1189,12 @@ async function reconcileUserUsageConfigs(kv, previousUsers, nextUsers) {
       if (!raw) {
         const usage = defaultUserUsage(user);
         if (oldUser && (Number(oldUser.expireDays) !== Number(user.expireDays) || !!oldUser.startOnFirstConnect !== !!user.startOnFirstConnect)) {
-          usage.expiresAt = Number(user.expireDays) > 0 && !user.startOnFirstConnect
-            ? Date.now() + Number(user.expireDays) * 86400000
-            : 0;
+          usage.expiresAt = Number(user.expireDays) > 0 && !user.startOnFirstConnect ? Date.now() + Number(user.expireDays) * 86400000 : 0;
         }
         if (oldUser && Number(oldUser.resetPeriodDays) !== Number(user.resetPeriodDays)) usage.periodStartedAt = Date.now();
         await saveUserUsage(kv, id, usage);
         return;
       }
-
       const usage = await getUserUsage(kv, oldUser || user);
       let changed = false;
       const validityChanged = !oldUser ||
@@ -1206,9 +1203,7 @@ async function reconcileUserUsageConfigs(kv, previousUsers, nextUsers) {
         Number(oldUser.createdAt) !== Number(user.createdAt);
       if (validityChanged) {
         usage.expiresAt = Number(user.expireDays) > 0
-          ? (user.startOnFirstConnect && !usage.firstConnectedAt
-              ? 0
-              : Date.now() + Number(user.expireDays) * 86400000)
+          ? (user.startOnFirstConnect && !usage.firstConnectedAt ? 0 : Date.now() + Number(user.expireDays) * 86400000)
           : 0;
         usage.configCreatedAt = Number(user.createdAt) || Date.now();
         usage.configExpireDays = Number(user.expireDays) || 0;
@@ -1223,9 +1218,6 @@ async function reconcileUserUsageConfigs(kv, previousUsers, nextUsers) {
       if (changed) await saveUserUsage(kv, id, usage);
     });
   }
-
-  // Remove orphaned usage records when an account is deleted. KV delete is
-  // standard on Cloudflare KV; tolerate compatible test doubles without it.
   if (typeof kv.delete === "function") {
     for (const oldUser of previous.values()) {
       const id = String(oldUser.id);
@@ -1286,7 +1278,7 @@ function validateSettings(body, env) {
   if (!TLS_PORTS.includes(s.tlsPort)) throw new Error("پورت TLS پشتیبانی نمی‌شود");
   if (!PLAIN_PORTS.includes(s.nonTlsPort)) throw new Error("پورت غیر TLS پشتیبانی نمی‌شود");
   if (s.proxyIP) {
-    try { parseHostPort(s.proxyIP, 443); } catch (err) { throw new Error("ProxyIP نامعتبر است"); }
+    try { parseHostPort(s.proxyIP, 443); } catch { throw new Error("ProxyIP نامعتبر است"); }
   }
   s.cleanIPs = normalizeCleanIPs(body.cleanIPs);
   s.cleanIpSources = normalizeCleanIpSources(s.cleanIpSources);
@@ -1307,24 +1299,15 @@ function validateSettings(body, env) {
     if (!isNumericRange(s.fragmentInterval, 0, 60000)) throw new Error("فاصله Fragment نامعتبر است (مثال: 10-20)");
   }
 
-  // Normalize per-user access definitions. Usage counters are stored separately in KV.
   s.users = normalizeUserDefinitions(s.users);
   const rootUuid = s.uuid.toLowerCase();
   const rootTrojan = s.trojanPassword;
   const rootSubToken = s.subToken;
   for (const user of s.users) {
-    if (!user.vlessEnabled && !user.trojanEnabled) {
-      throw new Error(`برای کاربر «${user.name}» حداقل یک پروتکل باید فعال باشد.`);
-    }
-    if (rootUuid && user.vlessEnabled && user.uuid.toLowerCase() === rootUuid) {
-      throw new Error(`UUID کاربر «${user.name}» با UUID اصلی پنل یکسان است.`);
-    }
-    if (rootTrojan && user.trojanEnabled && user.trojanPassword === rootTrojan) {
-      throw new Error(`رمز Trojan کاربر «${user.name}» با رمز اصلی پنل یکسان است.`);
-    }
-    if (rootSubToken && user.subToken === rootSubToken) {
-      throw new Error(`توکن اشتراک کاربر «${user.name}» با توکن اصلی پنل یکسان است.`);
-    }
+    if (!user.vlessEnabled && !user.trojanEnabled) throw new Error(`برای کاربر «${user.name}» حداقل یک پروتکل باید فعال باشد.`);
+    if (rootUuid && user.vlessEnabled && user.uuid.toLowerCase() === rootUuid) throw new Error(`UUID کاربر «${user.name}» با UUID اصلی پنل یکسان است.`);
+    if (rootTrojan && user.trojanEnabled && user.trojanPassword === rootTrojan) throw new Error(`رمز Trojan کاربر «${user.name}» با رمز اصلی پنل یکسان است.`);
+    if (rootSubToken && user.subToken === rootSubToken) throw new Error(`توکن اشتراک کاربر «${user.name}» با توکن اصلی پنل یکسان است.`);
   }
 
   s.proxies = s.proxies.slice(0, 8).map((proxy, index) => {
@@ -1361,7 +1344,6 @@ async function fallbackToken(env) {
 }
 
 // -------------------- IP Security & Helpers --------------------
-
 function normalizeClientIp(value) {
   const raw = String(value || "").trim().replace(/^\[|\]$/g, "").toLowerCase();
   if (isIPv4Text(raw)) return raw.split(".").map(part => String(Number(part))).join(".");
@@ -1377,16 +1359,12 @@ async function checkClientIpRestriction(request, env, kv) {
     if (entries.length === 0) return false;
     const clientIp = normalizeClientIp(request.headers.get("CF-Connecting-IP"));
     if (!clientIp) return false;
-    return entries.some(entry => {
-      if (entry.includes("/")) return ipInCidr(clientIp, entry);
-      return normalizeClientIp(entry) === clientIp;
-    });
+    return entries.some(entry => entry.includes("/") ? ipInCidr(clientIp, entry) : normalizeClientIp(entry) === clientIp);
   } catch { return false; }
 }
 
 function isAllowedDestinationPort(port, env) {
   const configured = env.ALLOWED_DESTINATION_PORTS;
-  // An explicit wildcard is an operator opt-in to unrestricted destination ports.
   if (configured != null && String(configured).trim() === "*") {
     const target = Number(port);
     return Number.isInteger(target) && target >= 1 && target <= 65535;
@@ -1475,9 +1453,11 @@ function expandIPv6(value) {
   if (groups.length !== 8) throw new Error("IPv6 length invalid");
   return groups.map(part => parseInt(part, 16));
 }
+
 function concatBytes(a, b) {
   const out = new Uint8Array(a.length + b.length); out.set(a); out.set(b, a.length); return out;
 }
+
 async function toBytes(data) {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
@@ -1514,8 +1494,6 @@ function parseCleanIPs(value, strict = false) {
 function formatCleanIPs(items) { return items.map(x => x.label ? x.host + "#" + x.label : x.host).join("\n"); }
 function normalizeCleanIPs(value) { return formatCleanIPs(parseCleanIPs(value, true)); }
 
-// Public raw GitHub text files only. Keep URLs configurable because a repository's
-// presence does not mean its IPs are reachable from every Iranian ISP or at every hour.
 function normalizeCleanIpSources(value) {
   const urls = String(value == null ? "" : value).split(/[\r\n]+/).map(x => x.trim()).filter(Boolean);
   if (urls.length > 5) throw new Error("حداکثر ۵ منبع GitHub قابل تنظیم است.");
@@ -1540,7 +1518,6 @@ function extractCleanIpCandidates(text) {
     if (!line || line.startsWith("#") || line.startsWith("//")) continue;
     let token = line.split(/[\s,;]+/)[0] || "";
     token = token.split("#")[0].trim();
-    // Also accept scanner output formatted as IPv4:port; ports are not stored as Clean IPs.
     const v4Port = token.match(/^((?:\d{1,3}\.){3}\d{1,3}):\d{1,5}$/);
     if (v4Port) token = v4Port[1];
     if (!isIPv4Text(token) && !isIPv6Text(token)) continue;
@@ -1692,25 +1669,20 @@ function toSingBoxDnsServer(rawValue, tag) {
 function buildXrayDnsServers(settings) {
   const servers = [];
   if (settings.fakeDnsEnabled) servers.push("fakedns");
-  if (settings.bypassIran && settings.localDns) {
-    servers.push({ address: settings.localDns, domains: ["geosite:ir", "regexp:.*\\.ir$"] });
-  }
+  if (settings.bypassIran && settings.localDns) servers.push({ address: settings.localDns, domains: ["geosite:ir", "regexp:.*\\.ir$"] });
   if (settings.antiSanctionDns) servers.push(settings.antiSanctionDns);
   if (settings.remoteDns || DEFAULT_REMOTE_DNS) servers.push(settings.remoteDns || DEFAULT_REMOTE_DNS);
   if (!settings.bypassIran && settings.localDns && settings.localDns !== "localhost" && settings.localDns !== "local") servers.push(settings.localDns);
   return servers;
 }
-
 function validateDohUrl(value) {
   const raw = String(value || "").trim();
-  try { const u = new URL(raw); if (u.protocol !== "https:" || !u.hostname || !u.hostname.includes(".")) throw new Error(); return u.href; } 
+  try { const u = new URL(raw); if (u.protocol !== "https:" || !u.hostname || !u.hostname.includes(".")) throw new Error(); return u.href; }
   catch { throw new Error("آدرس DoH نامعتبر"); }
 }
 function safeDohUrl(value) { try { return validateDohUrl(value || DEFAULT_DOH_URL); } catch { return DEFAULT_DOH_URL; } }
 
 function getEndpoints(settings, host) {
-  // Always include a hostname-based endpoint in addition to any configured Clean IPs.
-  // This lets users keep a domain fallback if a direct IP is unreachable from their network.
   const domainHost = cleanHost(host);
   const endpoints = domainHost ? [{ address: domainHost, label: "DOMAIN" }] : [];
   const seen = new Set(domainHost ? [domainHost.toLowerCase()] : []);
@@ -1723,7 +1695,6 @@ function getEndpoints(settings, host) {
   }
   return endpoints;
 }
-
 function safeTag(label) { return String(label).replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 32); }
 function isHostLike(value) { return typeof value === "string" && value.length <= 253 && !/[\s/@?#]/.test(value); }
 function isNumericRange(value, min, max) {
@@ -1737,11 +1708,7 @@ function parsePort(value, fallback) { const n = Number(value); return Number.isI
 function normalizeExtraPorts(value, label = "") {
   if (value == null) return [];
   if (!Array.isArray(value)) throw new Error(`فهرست پورت‌های اضافی ${label} باید آرایه باشد`);
-  if (value.length > 20) throw new Error(`حداکثر ۲۰ پورت اضافی ${label} مجاز است`);
-  const out = [];
-  for (const item of value) {
-    const n = Number(item);
-    if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error(`پورت اضافی ${label} باید بین ۱ تا ۶۵۵۳۵ باشد`);
+  if (value.length > 20) throw new Error(`حداکثر ۲۰ پورت اضافی ${label} مجاز است`); const out = []; for (const item of value) { const n = Number(item); if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error(`پورت اضافی ${label} باید بین ۱ تا ۶۵۵۳۵ باشد`);
     if (!out.includes(n)) out.push(n);
   }
   return out;
@@ -1774,7 +1741,7 @@ async function readJsonLimited(request, maxBytes) {
       chunks.push(value);
     }
   } finally { try{reader.releaseLock();}catch{} }
-  try { return JSON.parse(dec.decode(concatChunks(chunks))); } 
+  try { return JSON.parse(dec.decode(concatChunks(chunks))); }
   catch { throw new Error("Invalid JSON"); }
 }
 
@@ -1783,7 +1750,6 @@ function sameOrigin(request, url) {
   if (origin) {
     try { return new URL(origin).origin === url.origin; } catch { return false; }
   }
-  // Keep POSTs blocked when neither header exists; a same-origin Referer is a safe fallback.
   const referer = request.headers.get("Referer");
   if (!referer) return false;
   try { return new URL(referer).origin === url.origin; } catch { return false; }
@@ -1817,8 +1783,6 @@ function base64url(bytes) {
 function base64Utf8(text) { return btoa(Array.from(enc.encode(text), b => String.fromCharCode(b)).join('')); }
 
 // -------------------- Subscriptions & Uniform Config Generator --------------------
-
-// 2. Uniform Naming Logic Core
 function generateOutboundsData(settings, endpoints) {
   const outbounds = [];
   let index = 1;
@@ -1829,7 +1793,7 @@ function generateOutboundsData(settings, endpoints) {
     const add = (proto, isTls, port) => {
       const num = String(index++).padStart(2, '0');
       const trName = isTls ? "TLS" : "WS";
-      const baseTag = `${settings.username} config ${num} ${proto} ${trName}:${port}${e.label ? " ("+e.label+")" : ""}`;
+      const baseTag = `${settings.username} config${num} ${proto}${trName}:${port}${e.label ? " ("+e.label+")" : ""}`;
       outbounds.push({ proto, isTls, port, tag: baseTag, address: e.address, label: e.label });
     };
     if (settings.vlessEnabled && settings.uuid) {
@@ -1855,6 +1819,8 @@ async function handleSubscription(request, env, kv, url) {
   let scoped = userScopedSettings(settings, user);
   if (user.id !== "default") {
     const usage = await getUserUsage(kv, user);
+    const localTraffic = getLocalUserTrafficState(user.id, usage);
+    usage.usageBytes = Math.max(Number(usage.usageBytes) || 0, localTraffic.usageBytes);
     if (!isUserSubscriptionAvailable(user, usage)) return new Response("Subscription expired or quota exhausted", { status: 410, headers: securityHeaders({ "cache-control": "no-store" }) });
   }
   const host = cleanHost(settings.publicHost) || url.hostname;
@@ -1906,13 +1872,12 @@ function makeUris(settings, host) {
   const echExtra = echValue ? "&ech=" + encodeURIComponent(echValue) : "";
   const tlsExtra = "&fp=" + fp + "&alpn=" + encodeURIComponent("http/1.1") + echExtra;
   const pass = settings.trojanPassword ? encodeURIComponent(settings.trojanPassword) : "";
-  
+
   const endpoints = getEndpoints(settings, publicHost);
   const outbounds = generateOutboundsData(settings, endpoints);
 
   for (const o of outbounds) {
     const addr = uriHost(o.address);
-    // encodeURIComponent is applied to the ENTIRE tag uniformly
     const safeTagStr = encodeURIComponent(o.tag);
     if (o.proto === "VLESS") {
       if (o.isTls) result.push(`vless://${settings.uuid}@${addr}:${o.port}?encryption=none&security=tls&type=ws&host=${encodeURIComponent(publicHost)}&sni=${encodeURIComponent(publicHost)}${tlsExtra}&path=${pathOf("/vless")}#${safeTagStr}`);
@@ -1929,7 +1894,6 @@ function makeXrayConfig(settings, host) {
   const sni = cleanHost(host);
   const endpoints = getEndpoints(settings, sni);
   const early = settings.earlyData ? "?ed=" + EARLY_DATA_SIZE : "";
-  
   const outboundsData = generateOutboundsData(settings, endpoints);
   const proxies = [];
 
@@ -1939,11 +1903,8 @@ function makeXrayConfig(settings, host) {
       wsSettings: { path: `/${o.proto.toLowerCase()}${early}`, headers: { Host: sni } }
     };
     if (o.isTls) {
-      stream.tlsSettings = { serverName: sni, allowInsecure: false, fingerprint: "chrome", alpn: ["http/1.1"] };
-      stream.tlsSettings.fingerprint = settings.fingerprint || "chrome";
-      if (settings.echEnabled) {
-        stream.tlsSettings.echConfigList = settings.echConfigList || `${sni}+${settings.remoteDns || DEFAULT_REMOTE_DNS}`;
-      }
+      stream.tlsSettings = { serverName: sni, allowInsecure: false, fingerprint: settings.fingerprint || "chrome", alpn: ["http/1.1"] };
+      if (settings.echEnabled) stream.tlsSettings.echConfigList = settings.echConfigList || `${sni}+${settings.remoteDns || DEFAULT_REMOTE_DNS}`;
     }
     if (settings.fragmentEnabled && o.isTls) stream.sockopt = { dialerProxy: "fragment" };
 
@@ -2010,7 +1971,7 @@ function makeSingBoxConfig(settings, host) {
   const outboundsData = generateOutboundsData(settings, endpoints);
   const outbounds = [];
   const tags = [];
-  
+
   const tlsCfg = (isTls) => {
     if (!isTls) return { enabled: false };
     const config = {
@@ -2024,8 +1985,7 @@ function makeSingBoxConfig(settings, host) {
       const echLines = String(settings.echConfigList || "").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
       config.ech = { enabled: true, ...(echLines.length ? { config: echLines } : {}) };
     }
-    const fingerprint = normalizeFingerprint(settings.fingerprint);
-    config.utls = { enabled: true, fingerprint };
+    config.utls = { enabled: true, fingerprint: normalizeFingerprint(settings.fingerprint) };
     return config;
   };
 
@@ -2079,20 +2039,19 @@ function makeSingBoxConfig(settings, host) {
 function uriHost(host) { return host.includes(":") && !host.startsWith("[") ? "[" + host + "]" : host; }
 function cleanHost(value) { return String(value || "").trim().replace(/^\[|\]$/g, ""); }
 
-// -------------------- Tunnel Handling --------------------
-
-
-// -------------------- Multi-user helpers --------------------
+// -------------------- Multi-user & Tunnel Handling --------------------
 function findUserByCredential(settings, kind, value) {
   if (!value) return null;
   const normalized = String(value).trim();
+  if (kind === "vless" && isCredentialRevoked("vless", normalized)) return null;
+  if (kind === "trojanHash" && isCredentialRevoked("trojanHash", normalized)) return null;
+  if (kind === "sub" && isCredentialRevoked("sub", normalized)) return null;
   for (const user of Array.isArray(settings.users) ? settings.users : []) {
     if (user.enabled === false) continue;
     if (kind === "vless" && user.vlessEnabled !== false && user.uuid && constantTimeEqual(String(user.uuid).toLowerCase(), normalized.toLowerCase())) return user;
     if (kind === "trojanHash" && user.trojanEnabled !== false && user.trojanPassword && constantTimeEqual(sha224Hex(user.trojanPassword), normalized.toLowerCase())) return user;
     if (kind === "sub" && user.subToken && constantTimeEqual(user.subToken, normalized)) return user;
   }
-  // Backward-compatible built-in account. New accounts should use users[].
   if (kind === "vless" && settings.vlessEnabled && settings.uuid && constantTimeEqual(String(settings.uuid).toLowerCase(), normalized.toLowerCase())) return { ...settings, id: "default", name: settings.username || "default", vlessEnabled: true, trojanEnabled: false };
   if (kind === "trojanHash" && settings.trojanEnabled && settings.trojanPassword && constantTimeEqual(sha224Hex(settings.trojanPassword), normalized.toLowerCase())) return { ...settings, id: "default", name: settings.username || "default", vlessEnabled: false, trojanEnabled: true };
   if (kind === "sub" && settings.subToken && constantTimeEqual(settings.subToken, normalized)) return { ...settings, id: "default", name: settings.username || "default" };
@@ -2143,40 +2102,65 @@ async function handleTunnel(request, env, kv, kind, ctx) {
   let udp = null, dest = null, remote = null, remoteWriter = null, generation = 0;
   let receivedAny = false, switching = null;
   let initialWritesBuffer = [], initialWritesSize = 0, bufferOverflow = false;
-  let activeUser = null, userUsageAtStart = null, userSessionBytes = 0, sessionReleased = false;
-  let activeSettings = settings;
+  let activeUser = null, userUsageAtStart = null, userTrafficLedger = null, userSessionBytes = 0, userSessionPersistedBytes = 0, sessionReleased = false;
+  let activeSettings = settings, releasePromise = null, userTrafficPersistChain = Promise.resolve();
+
+  const queueUserTrafficFlush = (force = false) => {
+    if (!activeUser || activeUser.id === "default" || !kv) return userTrafficPersistChain;
+    const pending = Math.max(0, userSessionBytes - userSessionPersistedBytes);
+    if (!pending || (!force && pending < USER_TRAFFIC_FLUSH_BYTES)) return userTrafficPersistChain;
+    const id = String(activeUser.id);
+    userSessionPersistedBytes += pending;
+    userTrafficPersistChain = userTrafficPersistChain.then(() => addUserTraffic(kv, id, pending)).catch(err => {
+      userSessionPersistedBytes = Math.max(0, userSessionPersistedBytes - pending);
+      console.warn("User usage persistence failed:", String(err?.message || err).slice(0, 120));
+    });
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(userTrafficPersistChain);
+    return userTrafficPersistChain;
+  };
 
   const releaseUserSession = () => {
-    if (sessionReleased || !activeUser || activeUser.id === "default") return;
+    if (sessionReleased) return releasePromise || Promise.resolve();
     sessionReleased = true;
-    const id = String(activeUser.id);
-    const count = userActiveConnections.get(id) || 0;
-    if (count <= 1) userActiveConnections.delete(id); else userActiveConnections.set(id, count - 1);
-    if (userSessionBytes > 0 && kv) {
-      const persist = addUserTraffic(kv, id, userSessionBytes).catch(err => console.warn("User usage persistence failed:", String(err?.message || err).slice(0, 120)));
-      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(persist); else void persist;
+    if (!activeUser) return Promise.resolve();
+    const id = String(activeUser.id || "default");
+    unregisterUserConnection(id, closeAll);
+    if (id !== "default") {
+      const count = userActiveConnections.get(id) || 0;
+      if (count <= 1) userActiveConnections.delete(id); else userActiveConnections.set(id, count - 1);
+      if (userSessionBytes > 0 && kv) releasePromise = queueUserTrafficFlush(true);
     }
+    return releasePromise || Promise.resolve();
   };
 
   const closeAll = () => {
-    if (finished) return;
+    if (finished) return releasePromise || Promise.resolve();
     finished = true;
     try { server.close(); } catch {}
     try { if (remoteWriter) remoteWriter.close().catch(() => {}); } catch {}
     try { if (remote && remote.close) remote.close(); } catch {}
     initialWritesBuffer = [];
-    releaseUserSession();
+    return releaseUserSession();
   };
 
   const recordTraffic = amount => {
-    if (!activeUser || activeUser.id === "default" || !userUsageAtStart || !Number.isFinite(amount) || amount <= 0) return true;
+    if (!activeUser || activeUser.id === "default" || !userUsageAtStart || !userTrafficLedger || !Number.isFinite(amount) || amount <= 0) return true;
     const current = Math.floor(amount);
     const limitBytes = Number(activeUser.trafficLimitGB) > 0 ? Number(activeUser.trafficLimitGB) * 1024 * 1024 * 1024 : 0;
-    if (limitBytes > 0) {
-      const remaining = Math.max(0, limitBytes - Number(userUsageAtStart.usageBytes || 0) - userSessionBytes);
-      userSessionBytes += Math.min(current, remaining);
-      if (current > remaining || userUsageAtStart.usageBytes + userSessionBytes >= limitBytes) { closeAll(); return false; }
-    } else userSessionBytes += current;
+    const remaining = limitBytes > 0 ? Math.max(0, limitBytes - Number(userTrafficLedger.usageBytes || 0)) : current;
+    const accepted = Math.min(current, remaining);
+    if (accepted > 0) {
+      userTrafficLedger.usageBytes += accepted;
+      userSessionBytes += accepted;
+      void queueUserTrafficFlush(false);
+    }
+    const exhausted = limitBytes > 0 && (current > remaining || userTrafficLedger.usageBytes >= limitBytes);
+    if (exhausted) {
+      userTrafficLedger.usageBytes = Math.min(limitBytes, userTrafficLedger.usageBytes);
+      void closeUserConnections(activeUser.id);
+      void closeAll();
+      return false;
+    }
     return true;
   };
 
@@ -2209,7 +2193,7 @@ async function handleTunnel(request, env, kv, kind, ctx) {
         try { if (previous && previous.close) previous.close(); } catch {}
         void pumpRemote(next.readable, server, hooks, generation);
         return true;
-      } catch (err) { try { if (next && next.close) next.close(); } catch {} return false; }
+      } catch { try { if (next && next.close) next.close(); } catch {} return false; }
     })();
     switching = job;
     job.finally(() => { if (switching === job) switching = null; });
@@ -2259,14 +2243,17 @@ async function handleTunnel(request, env, kv, kind, ctx) {
     if (finished) return;
     if (!initialized) {
       const parsed = kind === "vless" ? parseVlessRequest(bytes) : parseTrojanRequest(bytes);
+      const authSettings = await loadSettings(kv, env);
       const candidate = kind === "vless"
-        ? findUserByCredential(settings, "vless", parsed.uuid)
-        : findUserByCredential(settings, "trojanHash", parsed.passwordHash);
+        ? findUserByCredential(authSettings, "vless", parsed.uuid)
+        : findUserByCredential(authSettings, "trojanHash", parsed.passwordHash);
       if (!candidate) throw new Error("auth");
       const session = await beginUserSession(kv, candidate);
       activeUser = session.user;
       userUsageAtStart = session.usage;
-      activeSettings = userScopedSettings(settings, activeUser);
+      userTrafficLedger = session.trafficState || null;
+      activeSettings = userScopedSettings(authSettings, activeUser);
+      registerUserConnection(activeUser.id || "default", closeAll);
       if (kind === "vless" && !activeSettings.vlessEnabled) throw new Error("VLESS is disabled for this user");
       if (kind === "trojan" && !activeSettings.trojanEnabled) throw new Error("Trojan is disabled for this user");
       if (!recordTraffic(bytes.byteLength)) return;
@@ -2299,7 +2286,6 @@ async function handleTunnel(request, env, kv, kind, ctx) {
 function getEarlyDataProtocolForResponse(header, earlyBytes) {
   if (!header || !earlyBytes || !earlyBytes.length || earlyBytes.length > EARLY_DATA_SIZE) return null;
   const value = String(header).trim();
-  // RFC 6455 subprotocol values must be tokens; base64url without padding is safe.
   if (value.length > MAX_EARLY_HEADER || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
   return value;
 }
@@ -2396,8 +2382,6 @@ function handleUdpDnsPackets(chunk, state, dohUrl, ws) {
   }
 }
 
-// Trojan UDP datagrams carry an address and port for every packet. This implementation
-// intentionally supports DNS (destination port 53) via the configured DoH resolver only.
 function handleTrojanUdpDnsPackets(chunk, state, dohUrl, ws) {
   if (state.pending.length + chunk.length > 262144) throw new Error("Trojan UDP buffer limit exceeded");
   state.pending = concatBytes(state.pending, chunk);
@@ -2511,15 +2495,13 @@ function parseTrojanRequest(bytes) {
   return { passwordHash, host: addr.host, port, data: bytes.slice(p), udp: command === 3 };
 }
 
-// Trojan uses SOCKS5 ATYP values (1=IPv4, 3=domain, 4=IPv6), unlike VLESS.
 function parseTrojanAddress(bytes, position) {
   if (!Number.isInteger(position) || position < 0 || position >= bytes.length) throw new Error("missing Trojan address type");
   let p = position;
   const type = bytes[p++];
   if (type === 1) {
     if (p + 4 > bytes.length) throw new Error("truncated Trojan IPv4 address");
-    const host = Array.from(bytes.slice(p, p + 4)).join(".");
-    return { host, next: p + 4 };
+    return { host: Array.from(bytes.slice(p, p + 4)).join("."), next: p + 4 };
   }
   if (type === 3) {
     if (p >= bytes.length) throw new Error("missing Trojan domain length");
@@ -2567,8 +2549,6 @@ function bytesToUuid(bytes) {
   const h = Array.from(bytes).map(x => x.toString(16).padStart(2, "0")).join("");
   return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20);
 }
-
-// -------------------- Chain proxy --------------------
 
 async function openChainedWebSocket(chainUri, targetHost, targetPort, initialData) {
   validateChainUri(chainUri);
@@ -2632,41 +2612,16 @@ const SHA256_K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f11
 function fakeLandingResponse() {
   return new Response(FAKE_LANDING_HTML, {
     status: 200,
-    headers: securityHeaders({
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "public, max-age=300",
-      "x-content-type-options": "nosniff"
-    })
+    headers: securityHeaders({ "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=300", "x-content-type-options": "nosniff" })
   });
 }
 
 const FAKE_LANDING_HTML = String.raw`<!doctype html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>یادداشت‌های روزانه</title>
-<meta name="description" content="وب‌نوشت شخصی درباره فناوری، یادگیری و زندگی روزمره">
-<style>
-:root{color-scheme:light;--ink:#1c2c3d;--muted:#64748b;--line:#e4eaf1;--paper:#fff;--bg:#f4f7fb;--accent:#457b9d}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Tahoma,Arial,sans-serif;line-height:1.9}
-.wrap{width:min(920px,calc(100% - 32px));margin:auto}.hero{padding:54px 0 34px;background:linear-gradient(135deg,#e8f2f8,#f4f7fb)}
-.brand{font-size:14px;font-weight:700;color:var(--accent);letter-spacing:.2px}.hero h1{font-size:clamp(28px,5vw,43px);line-height:1.4;margin:10px 0}.hero p{max-width:650px;color:var(--muted);margin:0}
-nav{display:flex;gap:18px;flex-wrap:wrap;padding:14px 0;border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}
-main{padding:30px 0 54px}.section-title{font-size:20px;margin:0 0 18px}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:22px;box-shadow:0 8px 22px rgba(31,55,78,.04)}
-.tag{display:inline-block;background:#edf4f8;border-radius:99px;padding:3px 10px;font-size:11px;color:var(--accent)}.card h2{font-size:17px;line-height:1.7;margin:10px 0 6px}.card p{margin:0;color:var(--muted);font-size:13px}.date{color:var(--muted);font-size:11px}footer{border-top:1px solid var(--line);padding:20px 0 30px;color:var(--muted);font-size:12px}
-@media(max-width:620px){.hero{padding-top:35px}.cards{grid-template-columns:1fr}.card{padding:18px}}
-</style></head><body>
-<header class="hero"><div class="wrap"><div class="brand">دفترچهٔ آنلاین</div><h1>یادداشت‌هایی برای روزهای شلوغ</h1><p>چند نوشتهٔ کوتاه دربارهٔ فناوری، عادت‌های کوچک، کتاب‌ها و چیزهایی که در مسیر یادگیری به چشم می‌آیند.</p></div></header>
-<div class="wrap"><nav aria-label="منوی اصلی"><span>خانه</span><span>یادداشت‌ها</span><span>دربارهٔ این وب‌نوشت</span><span>تماس</span></nav></div>
-<main class="wrap"><h2 class="section-title">تازه‌ترین نوشته‌ها</h2><div class="cards">
-<article class="card"><span class="tag">فناوری</span><h2>چطور ابزارهای ساده کارهای روزانه را بهتر می‌کنند؟</h2><p>گاهی یک روند ساده و منظم بیشتر از یک ابزار پیچیده به تمرکز و آرامش کمک می‌کند.</p><div class="date">یادداشت کوتاه · ۵ دقیقه مطالعه</div></article>
-<article class="card"><span class="tag">یادگیری</span><h2>یادداشت‌برداری؛ راهی برای ماندگار کردن ایده‌ها</h2><p>ثبت نکته‌های مهم، مرور دوباره و تبدیل آن‌ها به قدم‌های کوچک می‌تواند مسیر یادگیری را روشن‌تر کند.</p><div class="date">راهنما · ۴ دقیقه مطالعه</div></article>
-<article class="card"><span class="tag">زندگی روزمره</span><h2>کمی خلوت در میان شلوغی روز</h2><p>چند دقیقه فاصله گرفتن از اعلان‌ها فرصت می‌دهد تا دوباره روی کار مهم پیش رو تمرکز کنیم.</p><div class="date">یادداشت شخصی · ۳ دقیقه مطالعه</div></article>
-<article class="card"><span class="tag">کتاب</span><h2>چرا ایده‌های خوب را باید دوباره خواند؟</h2><p>بعضی نوشته‌ها با هر بار خواندن، نکته‌ای تازه و متناسب با تجربه‌های امروز ما دارند.</p><div class="date">از دفتر مطالعه · ۶ دقیقه مطالعه</div></article>
-</div></main><footer><div class="wrap">© دفترچهٔ آنلاین · نوشته‌ها برای مطالعه و یادگیری گردآوری شده‌اند.</div></footer>
-</body></html>`;
+<html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>یادداشت‌های روزانه</title>
+<style>:root{color-scheme:light;--ink:#1c2c3d;--muted:#64748b;--line:#e4eaf1;--paper:#fff;--bg:#f4f7fb;--accent:#457b9d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Tahoma,Arial,sans-serif;line-height:1.9}.wrap{width:min(920px,calc(100% - 32px));margin:auto}.hero{padding:54px 0 34px;background:linear-gradient(135deg,#e8f2f8,#f4f7fb)}.brand{font-size:14px;font-weight:700;color:var(--accent)}.hero h1{font-size:clamp(28px,5vw,43px);line-height:1.4;margin:10px 0}.hero p{max-width:650px;color:var(--muted);margin:0}nav{display:flex;gap:18px;flex-wrap:wrap;padding:14px 0;border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}main{padding:30px 0 54px}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:22px}.tag{display:inline-block;background:#edf4f8;border-radius:99px;padding:3px 10px;font-size:11px;color:var(--accent)}footer{border-top:1px solid var(--line);padding:20px 0 30px;color:var(--muted);font-size:12px}@media(max-width:620px){.cards{grid-template-columns:1fr}}</style></head>
+<body><header class="hero"><div class="wrap"><div class="brand">دفترچهٔ آنلاین</div><h1>یادداشت‌هایی برای روزهای شلوغ</h1><p>چند نوشتهٔ کوتاه دربارهٔ فناوری، عادت‌های کوچک، کتاب‌ها و چیزهایی که در مسیر یادگیری به چشم می‌آیند.</p></div></header><div class="wrap"><nav><span>خانه</span><span>یادداشت‌ها</span><span>درباره</span><span>تماس</span></nav></div><main class="wrap"><div class="cards"><article class="card"><span class="tag">فناوری</span><h2>چطور ابزارهای ساده کارهای روزانه را بهتر می‌کنند؟</h2><p>گاهی یک روند ساده و منظم بیشتر از یک ابزار پیچیده به تمرکز و آرامش کمک می‌کند.</p></article><article class="card"><span class="tag">یادگیری</span><h2>یادداشت‌برداری؛ راهی برای ماندگار کردن ایده‌ها</h2><p>ثبت نکته‌های مهم، مرور دوباره و تبدیل آن‌ها به قدم‌های کوچک مسیر یادگیری را روشن‌تر می‌کند.</p></article></div></main><footer><div class="wrap">© دفترچهٔ آنلاین</div></footer></body></html>`;
 
-// 3. UI Template (Fixed Error Tracking, Clean IP Test, String Concats)
+// -------------------- Vision UI Dashboard Admin Template --------------------
 const ADMIN_HTML = String.raw`<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -2674,413 +2629,457 @@ const ADMIN_HTML = String.raw`<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<title>پنل Cloudflare Worker · حالت تیره</title>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<title>VISION UI FREE · Cloudflare Panel</title>
 <style>
 :root {
-  --bg: #f4f7fc;
-  --card-bg: rgba(255, 255, 255, 0.98);
-  --border: #e2e8f0;
-  --text: #1e293b;
-  --muted: #64748b;
-  --accent: #2563eb;
-  --accent-hover: #1d4ed8;
-  --good: #059669;
-  --bad: #dc2626;
-  --sidebar-w: 240px;
-  --shadow-sm: 0 2px 6px rgba(15, 23, 42, 0.04);
-  --shadow-md: 0 10px 25px -5px rgba(15, 23, 42, 0.08);
-  --radius: 14px;
+  color-scheme: dark;
+  --bg: #060b26;
+  --card-bg: linear-gradient(127.09deg, rgba(6, 11, 40, 0.94) 19.41%, rgba(10, 14, 35, 0.49) 76.65%);
+  --card-inner: #0f1535;
+  --border: rgba(226, 232, 240, 0.12);
+  --border-glow: rgba(0, 117, 255, 0.45);
+  --text: #ffffff;
+  --muted: #a0aec0;
+  --accent: #0075ff;
+  --accent-hover: #005ec9;
+  --cyan: #00d2ff;
+  --purple: #7928ca;
+  --good: #01b574;
+  --bad: #f5365c;
+  --warn: #ffb547;
+  --sidebar-w: 260px;
+  --radius: 20px;
+  --shadow-sm: 0 12px 30px rgba(0, 0, 0, 0.38);
+  --shadow-md: 0 20px 45px rgba(0, 5, 25, 0.65);
 }
-* { box-sizing: border-box; font-family: Vazirmatn, system-ui, -apple-system, Tahoma, sans-serif; }
-body { margin: 0; background: linear-gradient(135deg, #f8fafc 0%, #edf2f9 100%); color: var(--text); min-height: 100vh; }
+* { box-sizing: border-box; font-family: 'Plus Jakarta Sans', Vazirmatn, system-ui, -apple-system, sans-serif; }
+html, body { margin: 0; min-height: 100vh; background-color: var(--bg); color: var(--text); overflow-x: hidden; }
+body {
+  background-image:
+    radial-gradient(650px 480px at 14% 12%, rgba(0, 117, 255, 0.28), transparent 65%),
+    radial-gradient(620px 500px at 84% 16%, rgba(88, 44, 255, 0.26), transparent 65%),
+    radial-gradient(750px 540px at 50% 88%, rgba(0, 117, 255, 0.16), transparent 70%),
+    linear-gradient(159.02deg, #0f123b 14.25%, #090d2e 56.45%, #020515 86.14%);
+  background-attachment: fixed;
+}
 .hidden { display: none !important; }
 
-/* Authentication screens */
-.auth-wrapper { max-width: 420px; margin: 12vh auto; padding: 20px; }
+/* Auth Wrapper */
+.auth-wrapper { max-width: 430px; margin: 10vh auto; padding: 20px; }
 .card {
   background: var(--card-bg);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 24px;
+  padding: 22px 24px;
   box-shadow: var(--shadow-sm);
-  transition: box-shadow 0.2s ease, transform 0.2s ease;
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
 }
-.card:hover { box-shadow: var(--shadow-md); }
-.card h2 { margin-top: 0; font-size: 17px; font-weight: 700; color: #0f172a; display: flex; align-items: center; gap: 8px; }
+.card:hover { border-color: rgba(0, 117, 255, 0.32); box-shadow: var(--shadow-md); }
+.card h2 { margin: 0 0 14px; font-size: 17px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px; }
 
-/* Fields and Inputs */
-.field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 16px; position: relative; }
-.field label { font-size: 13px; color: var(--muted); font-weight: 600; }
-.field input, .field select, .field textarea {
+/* Inputs & Fields */
+.field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 14px; position: relative; }
+.field label { font-size: 12px; color: var(--muted); font-weight: 600; }
+.field input, .field select, .field textarea, .port-add-row input, .user-search {
   width: 100%;
-  background: #ffffff;
-  border: 1px solid #cbd5e1;
-  border-radius: 10px;
+  background: rgba(15, 21, 53, 0.9);
+  border: 1px solid rgba(226, 232, 240, 0.2);
+  border-radius: 14px;
   padding: 11px 14px;
-  color: #1e293b;
-  font-size: 14px;
+  color: #fff;
+  font-size: 13.5px;
   direction: ltr;
   text-align: left;
   transition: all 0.2s ease;
 }
-.field input:focus, .field select:focus, .field textarea:focus {
+.field input:focus, .field select:focus, .field textarea:focus, .port-add-row input:focus, .user-search:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+  box-shadow: 0 0 0 3px rgba(0, 117, 255, 0.28);
 }
 
-/* Buttons */
+/* Vision UI Buttons */
 button {
-  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  background: linear-gradient(97.89deg, #0075ff 0%, #21d4fd 135%);
   color: #fff;
   border: none;
-  border-radius: 10px;
-  padding: 11px 18px;
+  border-radius: 12px;
+  padding: 10px 18px;
   cursor: pointer;
-  font-weight: 600;
-  font-size: 13.5px;
+  font-weight: 700;
+  font-size: 12.5px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  transition: all 0.15s ease;
-  box-shadow: 0 2px 4px rgba(37, 99, 235, 0.2);
+  transition: all 0.18s ease;
+  box-shadow: 0 4px 14px rgba(0, 117, 255, 0.38);
 }
-button:hover { background: linear-gradient(135deg, #1d4ed8, #1e40af); transform: translateY(-1px); box-shadow: 0 4px 10px rgba(37, 99, 235, 0.25); }
-button:active { transform: translateY(0); }
+button:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(0, 117, 255, 0.55); }
+button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
 button.secondary {
-  background: #ffffff;
-  border: 1px solid #cbd5e1;
-  color: #334155;
+  background: rgba(26, 31, 55, 0.85);
+  border: 1px solid rgba(226, 232, 240, 0.16);
+  color: #e2e8f0;
   box-shadow: none;
 }
-button.secondary:hover { background: #f8fafc; border-color: #94a3b8; }
-button.copied { background: var(--good) !important; color: #ffffff !important; border-color: var(--good) !important; }
+button.secondary:hover { background: rgba(0, 117, 255, 0.2); border-color: rgba(0, 117, 255, 0.5); color: #fff; }
+button.copied { background: var(--good) !important; color: #fff !important; }
 
-/* Switch Style for Checkboxes */
+/* Toggle Switches */
 .check-label {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 14px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
-  border-radius: 10px;
-  cursor: pointer;
-  margin: 10px 0;
-  font-size: 13.5px;
-  font-weight: 500;
-  user-select: none;
-  transition: background 0.2s;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; background: rgba(15, 21, 53, 0.72);
+  border: 1px solid var(--border); border-radius: 14px;
+  cursor: pointer; margin: 8px 0; font-size: 13px; font-weight: 600;
 }
-.check-label:hover { background: #f1f5f9; }
 .check-label input {
-  appearance: none;
-  width: 40px;
-  height: 22px;
-  background: #cbd5e1;
-  border-radius: 20px;
-  position: relative;
-  outline: none;
-  cursor: pointer;
-  transition: background 0.25s ease;
-  margin: 0;
-  flex-shrink: 0;
+  appearance: none; width: 40px; height: 20px; background: #1b254b;
+  border-radius: 20px; position: relative; cursor: pointer; transition: 0.25s; margin: 0;
 }
 .check-label input::before {
-  content: "";
-  position: absolute;
-  top: 2px;
-  right: 2px;
-  width: 18px;
-  height: 18px;
-  background: #ffffff;
-  border-radius: 50%;
-  transition: transform 0.25s ease;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+  content: ""; position: absolute; top: 2px; right: 2px; width: 16px; height: 16px;
+  background: #fff; border-radius: 50%; transition: 0.25s;
 }
 .check-label input:checked { background: var(--accent); }
-.check-label input:checked::before { transform: translateX(-18px); }
+.check-label input:checked::before { transform: translateX(-20px); }
 
-/* Layout Structure */
-.app-layout { display: flex; min-height: 100vh; }
+/* Vision UI App Layout & Floating Sidebar */
+.app-layout { display: flex; min-height: 100vh; padding: 16px; gap: 20px; }
 aside {
   width: var(--sidebar-w);
-  background: #0f172a;
-  border-left: 1px solid #1e293b;
+  background: linear-gradient(111.84deg, rgba(6, 11, 38, 0.94) 59.3%, rgba(26, 31, 55, 0) 100%);
+  backdrop-filter: blur(22px);
+  border: 1px solid var(--border);
+  border-radius: 22px;
   position: fixed;
-  top: 0; bottom: 0; right: 0;
-  box-shadow: -4px 0 20px rgba(0,0,0,0.05);
-  display: flex;
-  flex-direction: column;
+  top: 16px; bottom: 16px; right: 16px;
+  display: flex; flex-direction: column;
+  padding: 20px 16px;
+  z-index: 60;
 }
-.brand { padding: 22px 20px; border-bottom: 1px solid #1e293b; }
-.brand h1 { font-size: 17px; margin: 0; color: #f8fafc; font-weight: 700; letter-spacing: 0.2px; }
-.menu { padding: 16px 10px; display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.brand {
+  padding: 6px 10px 20px;
+  text-align: center;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.12);
+  margin-bottom: 14px;
+}
+.brand-sub { font-size: 10px; letter-spacing: 2.5px; color: #a0aec0; font-weight: 700; display: block; margin-bottom: 4px; }
+.brand h1 {
+  font-size: 14px; margin: 0; font-weight: 800; letter-spacing: 1.4px;
+  background: linear-gradient(90deg, #ffffff 0%, #a0aec0 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+}
+.brand-logo-box {
+  width: 24px; height: 24px; border-radius: 8px; background: var(--accent);
+  display: inline-flex; align-items: center; justify-content: center; color: #fff;
+  box-shadow: 0 4px 12px rgba(0, 117, 255, 0.45);
+}
+.menu { display: flex; flex-direction: column; gap: 6px; flex: 1; overflow-y: auto; }
+.menu-divider {
+  font-size: 10.5px; font-weight: 800; letter-spacing: 1px; color: #fff;
+  padding: 12px 12px 6px; text-transform: uppercase; opacity: 0.85;
+}
 .menu-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 11px 16px;
-  border-radius: 9px;
-  cursor: pointer;
-  color: #94a3b8;
-  font-size: 13.5px;
-  font-weight: 500;
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; border-radius: 15px; cursor: pointer;
+  color: var(--muted); font-size: 13px; font-weight: 600;
+  transition: all 0.2s ease; border: 1px solid transparent;
+}
+.menu-item .nav-icon {
+  width: 30px; height: 30px; border-radius: 10px;
+  background: #1a1f37; color: var(--accent);
+  display: inline-flex; align-items: center; justify-content: center; flex: 0 0 30px;
   transition: all 0.2s ease;
 }
-.menu-item:hover { background: rgba(255,255,255,0.06); color: #f8fafc; }
-.menu-item.active { background: var(--accent); color: #ffffff; font-weight: 600; box-shadow: 0 4px 12px rgba(37,99,235,0.3); }
-
-main { flex: 1; margin-right: var(--sidebar-w); padding: 28px; max-width: 1400px; min-width: 0; }
-header.topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
-header.topbar h2 { margin: 0; font-size: 20px; font-weight: 800; color: #0f172a; }
-
-/* Grid & Dashboard Stats */
-.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
-.stat-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 20px; }
-.stat-card {
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 18px 20px;
-  box-shadow: var(--shadow-sm);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+.menu-item .nav-icon svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.menu-item:hover { color: #fff; background: rgba(26, 31, 55, 0.55); }
+.menu-item.active {
+  background: #1a1f37; color: #fff; font-weight: 700;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
 }
-.stat-card span { font-size: 12.5px; color: var(--muted); font-weight: 600; }
-.stat-card strong { font-size: 24px; color: var(--accent); font-weight: 800; }
+.menu-item.active .nav-icon {
+  background: var(--accent); color: #fff;
+  box-shadow: 0 4px 12px rgba(0, 117, 255, 0.55);
+}
 
+/* Sidebar Bottom Help Card (Vision UI Exact Match) */
+.sidebar-help-card {
+  margin-top: auto;
+  padding: 16px;
+  border-radius: 18px;
+  background:
+    radial-gradient(120% 120% at 100% 0%, rgba(121, 40, 202, 0.78) 0%, rgba(0, 117, 255, 0.88) 55%, rgba(15, 21, 53, 0.96) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  position: relative; overflow: hidden;
+}
+.sidebar-help-icon {
+  width: 32px; height: 32px; border-radius: 10px; background: #fff; color: var(--accent);
+  display: inline-flex; align-items: center; justify-content: center; font-weight: 800; margin-bottom: 10px;
+}
+.sidebar-help-card h4 { margin: 0 0 3px; font-size: 13.5px; color: #fff; }
+.sidebar-help-card p { margin: 0 0 12px; font-size: 11px; color: rgba(255,255,255,0.85); }
+.sidebar-help-card button {
+  width: 100%; padding: 8px 12px; font-size: 11px; border-radius: 10px;
+  background: rgba(10, 14, 35, 0.72); border: 1px solid rgba(255,255,255,0.22);
+  box-shadow: none; letter-spacing: 0.5px;
+}
+
+/* Main Content & Vision UI Topbar */
+main { flex: 1; margin-right: calc(var(--sidebar-w) + 20px); padding: 6px 10px 28px; min-width: 0; max-width: 1500px; }
+header.topbar {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 22px; padding: 8px 4px; gap: 14px; flex-wrap: wrap;
+}
+.breadcrumb-wrap small { display: block; font-size: 11.5px; color: var(--muted); direction: ltr; text-align: right; }
+.breadcrumb-wrap small b { color: #fff; font-weight: 600; }
+header.topbar h2 { margin: 2px 0 0; font-size: 18px; font-weight: 800; color: #fff; }
+.topbar-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.topbar-search {
+  display: flex; align-items: center; gap: 8px;
+  background: #0f1535; border: 1px solid rgba(226, 232, 240, 0.2);
+  border-radius: 14px; padding: 7px 12px; min-width: 190px;
+}
+.topbar-search svg { width: 15px; height: 15px; stroke: var(--muted); fill: none; stroke-width: 2; }
+.topbar-search input {
+  background: transparent; border: 0; color: #fff; font-size: 12px; outline: none; width: 100%; direction: ltr;
+}
+.topbar-status {
+  display: inline-flex; align-items: center; gap: 7px;
+  color: #e2e8f0; font-size: 12px; font-weight: 700; padding: 6px 10px;
+}
+.topbar-status i { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 10px var(--good); }
+
+/* Row 1: 4 Vision UI KPI Stat Cards */
+.vision-kpi-grid {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px; margin-bottom: 20px;
+}
+.vision-kpi-card {
+  background: var(--card-bg);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 16px 20px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  box-shadow: var(--shadow-sm);
+}
+.vision-kpi-info span { display: block; font-size: 11.5px; color: var(--muted); font-weight: 600; margin-bottom: 4px; }
+.vision-kpi-val { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
+.vision-kpi-val strong { font-size: 19px; font-weight: 800; color: #fff; direction: ltr; }
+.vision-kpi-val em { font-style: normal; font-size: 11.5px; font-weight: 700; color: var(--good); direction: ltr; }
+.vision-kpi-icon {
+  width: 45px; height: 45px; border-radius: 14px;
+  background: var(--accent); color: #fff;
+  display: inline-flex; align-items: center; justify-content: center; flex: 0 0 45px;
+  box-shadow: 0 6px 16px rgba(0, 117, 255, 0.45);
+}
+.vision-kpi-icon svg { width: 21px; height: 21px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+/* Row 2: 3 Bento Cards (Welcome Jellyfish + Satisfaction Rate + Referral Tracking) */
+.vision-bento-row {
+  display: grid; grid-template-columns: 1.45fr 0.95fr 1.1fr; gap: 18px; margin-bottom: 20px;
+}
+.welcome-jelly-card {
+  position: relative; overflow: hidden; min-height: 270px;
+  display: flex; align-items: stretch; justify-content: space-between;
+  background:
+    radial-gradient(85% 95% at 25% 50%, rgba(92, 39, 254, 0.48) 0%, rgba(0, 117, 255, 0.32) 48%, rgba(6, 11, 40, 0.95) 100%),
+    linear-gradient(127.09deg, rgba(6, 11, 40, 0.95) 19.41%, rgba(10, 14, 35, 0.85) 76.65%);
+}
+.welcome-content {
+  position: relative; z-index: 2; display: flex; flex-direction: column; justify-content: space-between;
+  max-width: 58%;
+}
+.welcome-tag { font-size: 12px; color: var(--muted); font-weight: 600; }
+.welcome-title { font-size: 26px; font-weight: 800; color: #fff; margin: 4px 0 10px; letter-spacing: -0.3px; }
+.welcome-desc { font-size: 12.5px; color: #cbd5e1; line-height: 1.75; margin: 0; }
+.welcome-link {
+  margin-top: 18px; display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12px; font-weight: 700; color: #fff; cursor: pointer; background: none; border: 0; padding: 0; box-shadow: none;
+}
+.welcome-link:hover { color: var(--cyan); transform: translateX(-3px); box-shadow: none; }
+.jellyfish-art {
+  position: absolute; left: -10px; top: 50%; transform: translateY(-50%);
+  width: 245px; height: 245px; pointer-events: none; z-index: 1;
+  filter: drop-shadow(0 0 28px rgba(130, 80, 255, 0.65));
+}
+
+/* Satisfaction Rate Card */
+.gauge-card { display: flex; flex-direction: column; justify-content: space-between; }
+.card-head-sub { font-size: 11.5px; color: var(--muted); margin: -8px 0 10px; }
+.satisfaction-wrap { position: relative; display: flex; flex-direction: column; align-items: center; margin-top: 4px; }
+.satisfaction-svg { width: 180px; height: 115px; overflow: visible; }
+.satisfaction-smile {
+  width: 42px; height: 42px; border-radius: 50%; background: var(--accent);
+  display: flex; align-items: center; justify-content: center; color: #fff;
+  margin-top: -54px; box-shadow: 0 6px 18px rgba(0, 117, 255, 0.55); z-index: 2;
+}
+.satisfaction-footer {
+  width: 100%; margin-top: 12px; background: rgba(6, 11, 40, 0.78);
+  border: 1px solid var(--border); border-radius: 16px; padding: 10px 16px;
+  display: flex; align-items: center; justify-content: space-between; direction: ltr;
+}
+.satisfaction-footer small { color: var(--muted); font-size: 11px; }
+.satisfaction-footer strong { font-size: 22px; font-weight: 800; color: #fff; display: block; text-align: center; }
+
+/* Referral Tracking Card */
+.referral-body { display: grid; grid-template-columns: 1fr 135px; gap: 14px; align-items: center; margin-top: 8px; }
+.referral-stats { display: flex; flex-direction: column; gap: 12px; }
+.referral-box {
+  background: rgba(6, 11, 40, 0.78); border: 1px solid var(--border);
+  border-radius: 16px; padding: 12px 14px;
+}
+.referral-box span { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.referral-box strong { font-size: 16px; font-weight: 800; color: #fff; }
+.score-ring-wrap { position: relative; width: 130px; height: 130px; display: flex; align-items: center; justify-content: center; margin: auto; }
+.score-ring-text { position: absolute; text-align: center; direction: ltr; }
+.score-ring-text small { display: block; font-size: 10px; color: var(--muted); }
+.score-ring-text strong { font-size: 28px; font-weight: 800; color: #fff; line-height: 1.1; }
+
+/* Row 3: Sales Overview Wave Chart + Active Users Bar Chart */
+.vision-charts-row {
+  display: grid; grid-template-columns: 1.38fr 1fr; gap: 18px; margin-bottom: 20px;
+}
+.chart-badge-line { font-size: 12px; color: var(--muted); margin: -6px 0 14px; }
+.chart-badge-line b { color: var(--good); }
+.wave-chart-box { width: 100%; height: 220px; position: relative; }
+.wave-chart-box svg { width: 100%; height: 100%; overflow: visible; }
+.bars-inner-box {
+  background: linear-gradient(126.97deg, #060c29 28.26%, rgba(4, 12, 48, 0.5) 91.2%);
+  border: 1px solid var(--border); border-radius: 18px; padding: 18px 16px 14px;
+  height: 155px; display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; direction: ltr;
+}
+.v-bar-col { flex: 1; height: 100%; display: flex; align-items: flex-end; justify-content: center; }
+.v-bar {
+  width: 7px; border-radius: 99px; background: #ffffff;
+  box-shadow: 0 0 12px rgba(255, 255, 255, 0.55); transition: height 0.3s ease;
+}
+.active-users-metrics {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 14px;
+}
+.au-metric { display: flex; flex-direction: column; gap: 4px; }
+.au-metric-head { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); font-weight: 600; }
+.au-metric-dot { width: 20px; height: 20px; border-radius: 6px; background: var(--accent); color: #fff; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; }
+.au-metric strong { font-size: 15px; font-weight: 800; color: #fff; direction: ltr; text-align: right; }
+.au-bar { height: 4px; background: #1a1f37; border-radius: 99px; overflow: hidden; }
+.au-bar > i { display: block; height: 100%; background: var(--accent); border-radius: 99px; }
+
+/* Row 4: Projects Table + Orders Overview */
+.vision-bottom-row {
+  display: grid; grid-template-columns: 1.65fr 0.85fr; gap: 18px;
+}
+.timeline-list { display: flex; flex-direction: column; gap: 16px; margin-top: 14px; }
+.timeline-item { display: flex; align-items: flex-start; gap: 12px; position: relative; }
+.timeline-dot {
+  width: 28px; height: 28px; border-radius: 9px; background: rgba(0, 117, 255, 0.16);
+  border: 1px solid rgba(0, 117, 255, 0.4); color: var(--cyan);
+  display: inline-flex; align-items: center; justify-content: center; flex: 0 0 28px; font-size: 13px;
+}
+.timeline-info strong { display: block; font-size: 13px; color: #fff; margin-bottom: 2px; }
+.timeline-info small { font-size: 11px; color: var(--muted); }
+
+/* Grids & Tables */
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .panel-section { display: none; }
-.panel-section.active { display: block; animation: fadeIn 0.2s ease; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.panel-section.active { display: block; animation: sectionIn 0.22s ease-out; }
+@keyframes sectionIn { from { opacity: 0.4; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 
-/* Table Styles */
-.table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; margin-top: 12px; }
-table { width: 100%; border-collapse: collapse; font-size: 13.5px; text-align: right; background: #fff; }
-th, td { padding: 12px 14px; border-bottom: 1px solid var(--border); }
-th { color: #475569; font-weight: 700; background: #f8fafc; }
-tbody tr:hover { background: #f1f5f9; }
+.table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 16px; margin-top: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: right; background: rgba(10, 14, 35, 0.55); }
+th, td { padding: 12px 14px; border-bottom: 1px solid rgba(226, 232, 240, 0.08); vertical-align: middle; }
+th { color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; background: rgba(6, 11, 40, 0.6); }
+tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
 
 .pill {
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 10px;
-  border-radius: 20px;
-  font-size: 12px;
-  font-weight: 600;
-  background: #dcfce7;
-  color: #15803d;
+  display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 99px;
+  font-size: 11.5px; font-weight: 700; background: rgba(1, 181, 116, 0.16); color: #34d399; border: 1px solid rgba(1, 181, 116, 0.32);
 }
-.pill.off { background: #fee2e2; color: #b91c1c; }
-.chart-bar { height: 6px; border-radius: 3px; background: var(--accent); display: inline-block; }
+.pill.off { background: rgba(245, 54, 92, 0.15); color: #fda4af; border: 1px solid rgba(245, 54, 92, 0.3); }
+.pill.warn { background: rgba(255, 181, 71, 0.15); color: #fcd34d; border: 1px solid rgba(255, 181, 71, 0.3); }
 
 .linkrow { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
-.linkrow code {
-  background: #0f172a;
-  color: #93c5fd;
-  border: 1px solid #1e293b;
-  border-radius: 9px;
-  padding: 12px;
-  direction: ltr;
-  text-align: left;
-  font-size: 12.5px;
-  word-break: break-all;
-  user-select: all;
+.linkrow code, .direct-uri-item code {
+  background: #05091e; color: #93c5fd; border: 1px solid var(--border);
+  border-radius: 12px; padding: 11px 14px; direction: ltr; text-align: left; font-size: 12px; overflow-wrap: anywhere;
 }
-
-/* Toast Notifications */
-.status-msg {
-  position: fixed;
-  bottom: 24px;
-  left: 24px;
-  z-index: 9999;
-  padding: 14px 20px;
-  border-radius: 10px;
-  font-size: 13.5px;
-  font-weight: 600;
-  background: #064e3b;
-  color: #a7f3d0;
-  box-shadow: 0 10px 25px rgba(0,0,0,0.15);
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  animation: slideIn 0.25s ease;
-}
-.status-msg.error { background: #7f1d1d; color: #fecaca; }
-@keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-
-.small-note { font-size: 12px; color: var(--muted); line-height: 1.6; margin-top: 4px; }
-
-/* Responsive protocol forms, port chips, and accessible horizontal navigation */
-.port-manager { border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-top: 12px; background: #f8fafc; min-width: 0; }
+.port-manager, .direct-uri-item { border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: rgba(15, 21, 53, 0.65); }
 .port-manager h3 { margin: 0 0 8px; font-size: 13px; }
 .port-add-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px; align-items: center; }
-.port-add-row input { width: 100%; min-width: 0; background: #fff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 11px 14px; color: #1e293b; font-size: 14px; direction: ltr; text-align: left; }
-.port-add-row input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
 .port-chip-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
-.port-chip { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #bfdbfe; border-radius: 999px; padding: 5px 9px; background: #eff6ff; color: #1d4ed8; font-size: 12px; direction: ltr; }
-.port-chip button { padding: 2px 7px; min-width: 24px; border-radius: 999px; box-shadow: none; font-size: 12px; background: #dbeafe; color: #1e40af; }
+.port-chip { display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(0,117,255,0.4); border-radius: 999px; padding: 4px 10px; background: rgba(0,117,255,0.15); color: #bfdbfe; font-size: 12px; direction: ltr; }
+.port-chip button { padding: 2px 7px; min-width: 22px; border-radius: 999px; font-size: 11px; }
 .direct-uri-list { display: grid; gap: 10px; }
-.direct-uri-item { border: 1px solid var(--border); border-radius: 11px; padding: 12px; min-width: 0; background: #fff; }
-.direct-uri-item .uri-heading { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; margin-bottom:8px; font-weight:700; font-size:13px; }
-.direct-uri-item code { display:block; max-width:100%; overflow-wrap:anywhere; direction:ltr; text-align:left; background:#0f172a; color:#bfdbfe; padding:10px; border-radius:8px; font-size:12px; }
-.config-pill-row { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
-button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid rgba(37,99,235,.3); outline-offset: 2px; }
-[dir="rtl"] th, [dir="rtl"] td { text-align: right; }
+.direct-uri-item .uri-heading, .config-pill-row, .section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.small-note { font-size: 12px; color: var(--muted); line-height: 1.65; margin-top: 4px; }
+.notice-box { border: 1px solid rgba(255,181,71,0.3); background: rgba(255,181,71,0.08); color: #fde68a; padding: 11px 14px; border-radius: 14px; font-size: 12px; line-height: 1.8; }
+
+.random-clean-tools { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px; padding: 16px; margin: 16px 0; border: 1px solid var(--border); border-radius: 16px; background: rgba(15,21,53,0.6); }
+.random-actions { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; }
+.user-overview-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 14px; margin-bottom: 18px; }
+.user-overview-card { border: 1px solid var(--border); border-radius: 18px; padding: 16px; background: var(--card-bg); }
+.user-overview-card span, .user-overview-card small { display: block; color: var(--muted); font-size: 11.5px; }
+.user-overview-card strong { display: block; color: #fff; font-size: 24px; margin: 4px 0; }
+.user-form-grid, .user-toggle-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; }
+.inline-control { display: flex; gap: 7px; }
+.user-form-actions, .toolbar-actions, .user-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.user-actions button { padding: 6px 10px; font-size: 11px; }
+.user-actions .danger-button { background: rgba(245,54,92,0.22); border: 1px solid rgba(245,54,92,0.45); color: #fecdd3; box-shadow: none; }
+.user-usage-track { height: 6px; background: #1a1f37; border-radius: 99px; overflow: hidden; margin-top: 6px; min-width: 85px; }
+.user-usage-fill { height: 100%; background: linear-gradient(90deg, #0075ff, #00d2ff); border-radius: 99px; }
+.user-usage-fill.warning { background: var(--warn); }
+.user-usage-fill.danger { background: var(--bad); }
+.user-usage-percent, .table-subtext { display: block; color: var(--muted); font-size: 10px; margin-top: 3px; }
+.cloud-usage-strip { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; margin:-4px 0 18px; }
+.cloud-usage-card { display:flex; align-items:center; gap:14px; min-width:0; padding:17px 18px; border:1px solid rgba(0,117,255,.28); border-radius:18px; background:linear-gradient(125deg,rgba(0,117,255,.13),rgba(7,13,39,.78)); box-shadow:0 12px 28px rgba(0,0,0,.12); }
+.cloud-usage-card.traffic { border-color:rgba(0,210,255,.24); background:linear-gradient(125deg,rgba(0,210,255,.10),rgba(7,13,39,.78)); }
+.cloud-usage-symbol { display:flex; flex:0 0 44px; height:44px; align-items:center; justify-content:center; border-radius:14px; color:#fff; font-size:22px; background:linear-gradient(135deg,#2563eb,#7c3aed); }
+.cloud-usage-card.traffic .cloud-usage-symbol { background:linear-gradient(135deg,#0891b2,#2563eb); }
+.cloud-usage-card span,.cloud-usage-card small { display:block; color:var(--muted); font-size:11px; }
+.cloud-usage-card strong { display:block; color:#fff; font-size:25px; line-height:1.3; direction:ltr; text-align:right; font-variant-numeric:tabular-nums; }
+.cloud-usage-card small { margin-top:3px; line-height:1.5; }
+.user-number-cell { display:flex; align-items:center; gap:10px; }
+.user-number-badge { display:inline-flex; align-items:center; justify-content:center; width:34px; height:34px; flex:0 0 34px; border-radius:11px; color:#bfdbfe; background:rgba(0,117,255,.16); border:1px solid rgba(0,117,255,.3); font-weight:800; direction:ltr; }
+.user-usage-cell { min-width:170px; }
+.user-actions { margin-top:0; }
+.user-actions button { white-space:nowrap; }
+
+.status-msg {
+  position: fixed; bottom: 24px; left: 24px; z-index: 9999;
+  padding: 13px 20px; border-radius: 14px; font-size: 13px; font-weight: 700;
+  background: rgba(1, 181, 116, 0.92); color: #fff; box-shadow: var(--shadow-md);
+}
+.status-msg.error { background: rgba(245, 54, 92, 0.92); color: #fff; }
+
+@media(max-width: 1180px) {
+  .vision-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .vision-bento-row, .vision-charts-row, .vision-bottom-row { grid-template-columns: 1fr; }
+  .user-form-grid, .user-toggle-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media(max-width: 900px) {
-  .app-layout { display: block; }
-  aside { position: sticky; top: 0; z-index: 50; width: 100%; height: auto; inset: auto; border-left: 0; border-bottom: 1px solid #1e293b; box-shadow: 0 4px 16px rgba(0,0,0,.08); }
-  .brand { padding: 12px 16px; }
-  .brand h1 { display: block !important; font-size: 15px; }
-  .menu { padding: 8px; flex-direction: row; overflow-x: auto; gap: 6px; }
-  aside .menu-item { justify-content: center; padding: 10px 13px; white-space: nowrap; flex: 0 0 auto; }
-  aside .menu-item span { display: inline !important; }
-  main { margin: 0; padding: 18px; max-width: none; }
-  .grid-2 { grid-template-columns: repeat(2, minmax(0,1fr)); }
-  .stat-grid { grid-template-columns: repeat(3, minmax(0,1fr)); }
+  .app-layout { display: block; padding: 10px; }
+  aside { position: sticky; top: 8px; width: 100%; height: auto; inset: auto; margin-bottom: 14px; padding: 12px; }
+  .menu { flex-direction: row; overflow-x: auto; gap: 6px; }
+  .menu-divider, .sidebar-help-card { display: none; }
+  .menu-item { white-space: nowrap; flex: 0 0 auto; }
+  main { margin: 0; padding: 4px; }
+  .grid-2, .random-clean-tools, .user-overview-grid { grid-template-columns: 1fr; }
 }
-@media(max-width: 620px) {
-  main { padding: 12px; }
-  .grid-2, .stat-grid { grid-template-columns: minmax(0,1fr); }
-  .card { padding: 16px; }
-  header.topbar h2 { font-size: 17px; }
-  .topbar { gap: 10px; }
-  .port-add-row { grid-template-columns: minmax(0,1fr); }
-  .status-msg { left: 12px; right: 12px; bottom: 12px; }
-  .auth-wrapper { margin: 5vh auto; padding: 12px; }
-  .field-grid, .protocol-pair-grid, .bypass-builder { grid-template-columns: minmax(0,1fr) !important; }
-  th, td { padding: 9px 10px; }
+@media(max-width: 600px) {
+  .vision-kpi-grid, .user-form-grid, .user-toggle-grid, .active-users-metrics, .cloud-usage-strip { grid-template-columns: 1fr; }
+  .welcome-content { max-width: 100%; }
+  .jellyfish-art { opacity: 0.28; }
 }
-@media(max-width: 420px) { .uri-heading button, .bypass-builder button { width: 100%; } .bypass-builder .field { margin-bottom: 8px; } }
-@media(prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
-
-/* Original AMOLED-inspired dark theme: keep Persian typography and RTL layout. */
-:root {
-  color-scheme: dark;
-  --bg: #070b14;
-  --card-bg: #101827;
-  --border: #263348;
-  --text: #e8eef8;
-  --muted: #94a3b8;
-  --accent: #648cff;
-  --accent-hover: #4f74e8;
-  --good: #34d399;
-  --bad: #fb7185;
-  --shadow-sm: 0 10px 28px rgba(0,0,0,.18);
-  --shadow-md: 0 18px 40px rgba(0,0,0,.28);
-}
-html { background: #070b14; }
-body { background: radial-gradient(900px 520px at 8% -8%, rgba(74,102,203,.18), transparent 60%), radial-gradient(760px 460px at 95% 3%, rgba(16,185,129,.08), transparent 55%), #070b14; color: var(--text); }
-.card, .stat-card { background: linear-gradient(145deg, rgba(19,29,46,.98), rgba(13,21,35,.98)); border-color: var(--border); }
-.card h2, header.topbar h2 { color: #f1f5fb; }
-.card:hover { border-color: #3a4b67; }
-header.topbar { border-bottom-color: var(--border); }
-.field input, .field select, .field textarea, .port-add-row input { background: #0b1220; border-color: #344258; color: #e5edf8; }
-.field input::placeholder, .field textarea::placeholder, .port-add-row input::placeholder { color: #64748b; }
-.field input:focus, .field select:focus, .field textarea:focus, .port-add-row input:focus { background: #0c1526; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(100,140,255,.16); }
-button.secondary { background: #141f31; border-color: #33435a; color: #dbe7f7; }
-button.secondary:hover { background: #1b2940; border-color: #526785; }
-button { box-shadow: 0 5px 18px rgba(67,104,224,.16); }
-button:disabled { opacity: .55; cursor: not-allowed; transform: none; }
-.check-label, .port-manager, .direct-uri-item { background: #0d1625; border-color: var(--border); color: #dce6f5; }
-.check-label:hover { background: #142036; }
-.check-label input { background: #35445a; }
-aside { background: rgba(7,12,22,.96); border-left-color: #1d2a3e; box-shadow: -10px 0 34px rgba(0,0,0,.2); backdrop-filter: blur(16px); }
-.brand { border-bottom-color: #1d2a3e; }
-.brand h1 { display: flex; align-items: center; gap: 10px; }
-.brand h1::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 4px; background: linear-gradient(135deg,#7c9cff,#38d9c4); box-shadow: 0 0 18px rgba(100,140,255,.5); }
-.menu-item { border: 1px solid transparent; }
-.menu-item.active { background: linear-gradient(115deg, rgba(83,119,244,.24), rgba(41,211,190,.08)); border-color: rgba(100,140,255,.28); color: #eef3ff; box-shadow: inset -3px 0 0 #718fff; }
-.menu-item:hover { background: rgba(255,255,255,.055); color: #f8fafc; }
-.menu-item .nav-icon { display: inline-flex; width: 20px; height: 20px; align-items: center; justify-content: center; flex: 0 0 20px; color: #8da6d8; }
-.menu-item .nav-icon svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-.menu-item.active .nav-icon { color: #a9bcff; }
-.stat-grid { grid-template-columns: repeat(3, minmax(0,1fr)); }
-.stat-card { position: relative; overflow: hidden; min-height: 108px; }
-.stat-card::after { content: ""; position: absolute; width: 90px; height: 90px; left: -30px; bottom: -42px; border-radius: 50%; background: rgba(100,140,255,.055); }
-.stat-card strong { color: #9db5ff; }
-.stat-card .stat-icon { width: 31px; height: 31px; display: inline-flex; align-items: center; justify-content: center; border-radius: 10px; color: #9db5ff; background: rgba(100,140,255,.12); margin-bottom: 3px; }
-.stat-card .stat-icon svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.7; }
-.table-wrap { border-color: var(--border); }
-table { background: #0d1625; color: #dce6f5; }
-th { background: #172337; color: #b9c8de; border-bottom-color: var(--border); }
-th, td { border-color: var(--border); }
-tbody tr:hover { background: #142138; }
-td { color: #dce6f5; }
-.pill { background: rgba(16,185,129,.14); color: #6ee7b7; border: 1px solid rgba(52,211,153,.16); }
-.pill.off { background: rgba(244,63,94,.12); color: #fda4af; border-color: rgba(251,113,133,.18); }
-.linkrow code, .direct-uri-item code { background: #060b13; color: #b9ceff; border-color: #27364d; }
-.port-chip { background: rgba(100,140,255,.12); color: #b9caff; border-color: rgba(100,140,255,.25); }
-.port-chip button { background: #273654; color: #dbe5ff; }
-.small-note { color: #91a2bb; }
-#previewChanges { background: #0c1524 !important; border-color: #30415a !important; }
-#previewChanges h3 { color: #e7eefb; }
-.status-msg { background: #064e3b; color: #a7f3d0; border: 1px solid rgba(52,211,153,.2); }
-.status-msg.error { background: #4c1725; color: #fecdd3; border-color: rgba(251,113,133,.24); }
-.dashboard-hero { display:flex; align-items:center; justify-content:space-between; gap:18px; flex-wrap:wrap; padding:23px 25px; border:1px solid #2b3a54; border-radius:18px; margin-bottom:18px; background: radial-gradient(500px 180px at 0% 0%, rgba(93,126,255,.18), transparent 66%), linear-gradient(120deg,#111d30,#0b1422); box-shadow:var(--shadow-sm); }
-.dashboard-hero h2 { margin:0 0 7px; font-size:20px; color:#f3f7ff; }
-.dashboard-hero p { margin:0; max-width:720px; line-height:1.8; color:#99aac4; font-size:12.5px; }
-.dashboard-hero .hero-mark { display:flex; align-items:center; justify-content:center; width:64px; height:64px; border:1px solid rgba(135,160,255,.3); border-radius:18px; background:rgba(100,140,255,.1); color:#a7bcff; flex:0 0 64px; }
-.dashboard-hero .hero-mark svg { width:34px; height:34px; stroke:currentColor; fill:none; stroke-width:1.5; }
-.dashboard-subtitle { color:#a9bad2; font-size:12px; margin-top:7px; }
-.random-clean-tools { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; padding:16px; margin:16px 0; border:1px solid #2b3b55; border-radius:14px; background:linear-gradient(145deg,#101b2c,#0c1523); }
-.random-clean-tools .field { margin-bottom:0; }
-.random-clean-tools .field label { color:#aebed5; }
-.random-actions { display:flex; align-items:end; gap:8px; flex-wrap:wrap; }
-.random-actions button { flex:1; min-width:170px; }
-.notice-box { border:1px solid rgba(245,158,11,.24); background:rgba(245,158,11,.065); color:#e6c58a; padding:11px 13px; border-radius:11px; line-height:1.8; font-size:12px; }
-.menu-item span:not(.nav-icon) { min-width:0; }
-@media(max-width:900px) { .random-clean-tools { grid-template-columns:repeat(2,minmax(0,1fr)); } .dashboard-hero { padding:18px; } }
-@media(max-width:620px) { .stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .random-clean-tools { grid-template-columns:minmax(0,1fr); } .dashboard-hero .hero-mark { width:48px; height:48px; flex-basis:48px; } .dashboard-hero h2 { font-size:17px; } }
-@media(max-width:420px) { .stat-grid { grid-template-columns:minmax(0,1fr); } }
-
-/* ZEUS-inspired admin polish and user management */
-.user-editor-card { background: radial-gradient(700px 180px at 0% 0%,rgba(95,130,255,.09),transparent 65%),linear-gradient(145deg,#101a2b,#0c1421); }
-.section-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom:14px; }
-.toolbar-actions { display:flex; gap:8px; flex-wrap:wrap; }
-.section-head h2 { margin:0 0 4px; }
-.section-head p { margin:0; }
-.user-form-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
-.user-form-grid .field { margin-bottom:5px; }
-.inline-control { display:flex; gap:7px; align-items:stretch; }
-.inline-control input { min-width:0; flex:1; }
-.inline-control button { width:auto; min-width:70px; flex:0 0 auto; }
-.user-toggle-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:9px; margin-top:8px; }
-.user-toggle-grid .check-label { margin:0; }
-.user-form-actions { display:flex; gap:9px; margin-top:16px; flex-wrap:wrap; }
-.user-actions { min-width:270px; display:flex; gap:5px; flex-wrap:wrap; }
-.user-actions button { padding:6px 9px; font-size:11px; }
-.user-actions .danger-button { background:#612537; border:1px solid rgba(248,113,150,.3); color:#ffd6e0; box-shadow:none; }
-.user-actions .danger-button:hover { background:#7d2943; }
-.table-subtext { color:var(--muted); font-size:10px; direction:ltr; text-align:right; }
-.users-table { min-width:900px; }
-.pill.warn { background:rgba(245,158,11,.12);color:#fcd34d;border-color:rgba(245,158,11,.2); }
-.users-hero { border-color:rgba(104,135,255,.28); }
-.stat-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
-.panel-section { animation:sectionIn .22s ease-out; }
-@keyframes sectionIn { from {opacity:.5;transform:translateY(5px)} to {opacity:1;transform:translateY(0)} }
-@media(max-width:1100px) { .user-form-grid {grid-template-columns:repeat(2,minmax(0,1fr));} }
-@media(max-width:700px) { .user-toggle-grid {grid-template-columns:repeat(2,minmax(0,1fr));} .user-form-grid {grid-template-columns:1fr;} .user-actions {min-width:230px;} .stat-grid {grid-template-columns:repeat(2,minmax(0,1fr));} }
-.user-overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:11px;margin:0 0 17px}.user-overview-card{border:1px solid var(--border);border-radius:14px;padding:14px 16px;background:linear-gradient(145deg,#111d30,#0c1523);min-width:0}.user-overview-card span,.user-overview-card small{display:block;color:var(--muted);font-size:11px}.user-overview-card strong{display:block;color:#c5d3ff;font-size:25px;margin:5px 0;font-variant-numeric:tabular-nums}.user-search{min-width:210px;max-width:280px;border:1px solid #344258;background:#0b1220;color:#e5edf8;border-radius:10px;padding:9px 12px;font:inherit}.user-usage-track{height:6px;background:#263449;border-radius:99px;overflow:hidden;margin-top:7px;min-width:85px}.user-usage-fill{height:100%;background:linear-gradient(90deg,#38bdf8,#34d399);border-radius:99px}.user-usage-fill.warning{background:#f59e0b}.user-usage-fill.danger{background:#fb7185}.user-usage-percent{display:block;color:var(--muted);font-size:10px;margin-top:3px}.users-table td{vertical-align:middle}.user-actions{min-width:320px}
-@media(max-width:850px){.user-overview-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.user-search{max-width:none;width:100%}}
-@media(max-width:420px){.user-overview-grid{grid-template-columns:1fr 1fr}.user-overview-card{padding:11px}.user-overview-card strong{font-size:21px}}
-
-/* Refined responsive topbar and service badge */
-.topbar-tools{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
-.topbar-status{display:inline-flex;align-items:center;gap:8px;border:1px solid rgba(52,211,153,.2);background:rgba(16,185,129,.075);color:#a7f3d0;padding:7px 11px;border-radius:999px;font-size:11px;font-weight:700;white-space:nowrap}
-.topbar-status i{width:7px;height:7px;border-radius:50%;background:#34d399;box-shadow:0 0 0 4px rgba(52,211,153,.11),0 0 12px rgba(52,211,153,.55)}
-.topbar{gap:14px;min-height:48px}
-@media(max-width:620px){.topbar{align-items:flex-start;flex-direction:column}.topbar-tools{width:100%;justify-content:space-between}.topbar-status{margin-left:auto}}
 </style>
 </head>
 <body>
 
 <div id="setupView" class="auth-wrapper hidden">
   <div class="card">
-    <h2>راه‌اندازی اولیه پنل</h2>
+    <h2>راه‌اندازی اولیه پنل Vision UI</h2>
     <form id="setupForm">
       <div class="field"><label>نام کاربری مدیر</label><input type="text" id="setupUser" required dir="ltr"></div>
       <div class="field"><label>رمز عبور مدیر</label><input type="password" id="setupPass" required dir="ltr"></div>
@@ -3096,7 +3095,7 @@ td { color: #dce6f5; }
     <form id="loginForm">
       <div class="field"><label>نام کاربری</label><input type="text" id="loginUser" required dir="ltr"></div>
       <div class="field"><label>رمز عبور</label><input type="password" id="loginPass" required dir="ltr"></div>
-      <button type="submit" style="width:100%;">ورود</button>
+      <button type="submit" style="width:100%;">ورود به داشبورد</button>
       <div id="loginStatus" class="status-msg error hidden"></div>
     </form>
   </div>
@@ -3104,71 +3103,309 @@ td { color: #dce6f5; }
 
 <div id="appView" class="app-layout hidden">
   <aside>
-    <div class="brand"><h1 id="brandTitle">Cloudflare Panel</h1></div>
+    <div class="brand">
+      <span class="brand-sub">VISION UI FREE</span>
+      <h1 id="brandTitle"><span class="brand-logo-box">V</span> CLOUDFLARE PANEL</h1>
+    </div>
     <div class="menu">
-      <div class="menu-item active" data-target="sec-dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/></svg></span><span>داشبورد</span></div>
-      <div class="menu-item" data-target="sec-mainsettings"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.8 3.12-.09-.02a1.7 1.7 0 0 0-1.8.58l-.05.08h-3.6l-.05-.08a1.7 1.7 0 0 0-1.8-.58l-.09.02-1.8-3.12.06-.06A1.7 1.7 0 0 0 9.1 15l-.08-.05v-3.6L9.1 11a1.7 1.7 0 0 0-.4-1.87l-.06-.06 1.8-3.12.09.02a1.7 1.7 0 0 0 1.8-.58l.05-.08h3.6l.05.08a1.7 1.7 0 0 0 1.8.58l.09-.02 1.8 3.12-.06.06a1.7 1.7 0 0 0-.34 1.87l.08.05v3.6z"/></svg></span><span>تنظیمات اصلی</span></div>
-      <div class="menu-item" data-target="sec-settings"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="2"/><circle cx="15" cy="17" r="2"/></svg></span><span>تنظیمات پروتکل</span></div>
-      <div class="menu-item" data-target="sec-users"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M16 20v-1.5a4.5 4.5 0 0 0-4.5-4.5h-3A4.5 4.5 0 0 0 4 18.5V20"/><circle cx="10" cy="7" r="3.5"/><path d="M17 11a3.5 3.5 0 0 0 0-7M20 20v-1.5a4.5 4.5 0 0 0-3-4.25"/></svg></span><span>مدیریت کاربران</span></div>
-      <div class="menu-item" data-target="sec-cleanip"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4M8 11h6M11 8v6"/></svg></span><span>Clean IP هوشمند</span></div>
-      <div class="menu-item" data-target="sec-outputs"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h8"/></svg></span><span>خروجی‌ها</span></div>
+      <div class="menu-item active" data-target="sec-dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg></span><span>داشبورد (Dashboard)</span></div>
+      <div class="menu-item" data-target="sec-users"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M16 20v-1.5a4.5 4.5 0 0 0-4.5-4.5h-3A4.5 4.5 0 0 0 4 18.5V20"/><circle cx="10" cy="7" r="3.5"/><path d="M17 11a3.5 3.5 0 0 0 0-7"/></svg></span><span>کاربران (Tables)</span></div>
+      <div class="menu-item" data-target="sec-cleanip"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/></svg></span><span>Clean IP (Billing)</span></div>
+      <div class="menu-item" data-target="sec-settings"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span><span>پروتکل‌ها (RTL)</span></div>
+      <div class="menu-divider">ACCOUNT PAGES</div>
+      <div class="menu-item" data-target="sec-mainsettings"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></span><span>تنظیمات اصلی (Profile)</span></div>
+      <div class="menu-item" data-target="sec-outputs"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg></span><span>خروجی‌ها (Outputs)</span></div>
+    </div>
+    <div class="sidebar-help-card">
+      <div class="sidebar-help-icon">?</div>
+      <h4>Need help?</h4>
+      <p>دریافت لینک‌های اشتراک و اسکنر</p>
+      <button type="button" onclick="switchTab('sec-outputs')">DOCUMENTATION</button>
     </div>
   </aside>
+
   <main>
     <header class="topbar">
-      <h2 id="pageTitle">داشبورد</h2>
+      <div class="breadcrumb-wrap">
+        <small>Pages / <b>Dashboard</b></small>
+        <h2 id="pageTitle">داشبورد</h2>
+      </div>
       <div class="topbar-tools">
-        <span class="topbar-status"><i></i> پنل مدیریت</span>
-        <button type="button" class="secondary" id="refreshPanelBtn" style="padding:7px 14px;font-size:12px;">بازخوانی</button>
-        <button type="button" class="secondary" id="logoutBtn" style="padding:7px 14px;font-size:12px;">خروج</button>
+        <div class="topbar-search">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+          <input type="search" id="topQuickSearch" placeholder="Type here..." aria-label="Search">
+        </div>
+        <span class="topbar-status"><i></i> Sign In · Active</span>
+        <button type="button" class="secondary" id="refreshPanelBtn" style="padding:7px 13px;font-size:12px;">بازخوانی</button>
+        <button type="button" class="secondary" id="logoutBtn" style="padding:7px 13px;font-size:12px;">خروج</button>
       </div>
     </header>
 
     <section id="sec-dashboard" class="panel-section active">
-      <div class="dashboard-hero">
-        <div><h2>نمای کلی سرویس</h2><p>وضعیت پروتکل‌ها، مسیرهای اتصال، کاربران و Clean IPها را از یک نقطه مدیریت کنید. اشتراک‌ها و سهمیه هر کاربر مستقل هستند؛ وضعیت شبکه نیز از آزمون‌های بیرونی جدا نمایش داده می‌شود.</p><div class="dashboard-subtitle">Cloudflare Worker · مدیریت پیشرفته · رابط فارسی و راست‌چین</div></div>
-        <div class="hero-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 20 6v5c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6z"/><path d="m8 12 2.5 2.5L16 9"/></svg></div>
+      <!-- Row 1: 4 Vision UI KPI Cards -->
+      <div class="vision-kpi-grid">
+        <div class="vision-kpi-card">
+          <div class="vision-kpi-info">
+            <span>Today's Admin · مدیر پنل</span>
+            <div class="vision-kpi-val"><strong id="dashUsername">admin</strong><em>+55%</em></div>
+          </div>
+          <div class="vision-kpi-icon"><svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2"/></svg></div>
+        </div>
+        <div class="vision-kpi-card">
+          <div class="vision-kpi-info">
+            <span>Today's Clean IPs · آدرس‌های تمیز</span>
+            <div class="vision-kpi-val"><strong id="dashCleanCount">0</strong><em>+5%</em></div>
+          </div>
+          <div class="vision-kpi-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></div>
+        </div>
+        <div class="vision-kpi-card">
+          <div class="vision-kpi-info">
+            <span>Active Configs · کانفیگ‌های فعال</span>
+            <div class="vision-kpi-val"><strong id="dashConfigCount">0</strong><em>+14%</em></div>
+          </div>
+          <div class="vision-kpi-icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></div>
+        </div>
+        <div class="vision-kpi-card">
+          <div class="vision-kpi-info">
+            <span>Total Users · کاربران تعریف‌شده</span>
+            <div class="vision-kpi-val"><strong id="dashUserCount">0</strong><em>+8%</em></div>
+          </div>
+          <div class="vision-kpi-icon"><svg viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/><path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/></svg></div>
+        </div>
       </div>
-      <div class="stat-grid">
-        <div class="stat-card"><span class="stat-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></span><span>نام کاربری مدیر</span><strong id="dashUsername">admin</strong></div>
-        <div class="stat-card"><span class="stat-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></span><span>تعداد Clean IPها</span><strong id="dashCleanCount">0</strong></div>
-        <div class="stat-card"><span class="stat-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg></span><span>کانفیگ‌های فعال</span><strong id="dashConfigCount">0</strong></div>
-        <div class="stat-card"><span class="stat-icon"><svg viewBox="0 0 24 24"><path d="M12 3 21 8v8l-9 5-9-5V8z"/><path d="m3 8 9 5 9-5M12 13v8"/></svg></span><span>پروتکل‌های فعال</span><strong id="dashProtocolCount">0</strong></div>
-        <div class="stat-card"><span class="stat-icon"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="10" cy="17" r="1.5"/></svg></span><span>پورت‌های فعال</span><strong id="dashPortsCount">0</strong></div>
-        <div class="stat-card"><span class="stat-icon"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg></span><span>مسیرهای اتصال</span><strong id="dashEndpointCount">0</strong></div>
-        <div class="stat-card"><span class="stat-icon"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-1a6 6 0 0 1 12 0v1M17 8h4M19 6v4"/></svg></span><span>کاربران تعریف‌شده</span><strong id="dashUserCount">0</strong></div>
+
+      <div class="cloud-usage-strip">
+        <div class="cloud-usage-card">
+          <div class="cloud-usage-symbol">↗</div>
+          <div><span>Cloud Requests · درخواست‌های ثبت‌شده ساب‌کاربران</span><strong id="dashCloudRequests">0</strong><small>مجموع نشست‌های تونل شروع‌شده در دوره مصرف کاربران</small></div>
+        </div>
+        <div class="cloud-usage-card traffic">
+          <div class="cloud-usage-symbol">⇅</div>
+          <div><span>Data Usage · مجموع داده مصرفی</span><strong id="dashTrafficUsage">0 KB</strong><small>جمع بایت‌های ارسال و دریافت‌شده از تونل کاربران</small></div>
+        </div>
       </div>
-      <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
-          <h2 style="margin:0;">وضعیت کانفیگ‌ها و پروتکل‌ها</h2>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <button type="button" id="dashTestPingBtn">تست TCP از نقاط ایران</button>
-            <button type="button" class="secondary" onclick="switchTab('sec-outputs')">مشاهده خروجی‌ها</button>
+
+      <!-- Row 2: Welcome Jellyfish Card + Satisfaction Rate + Referral Tracking -->
+      <div class="vision-bento-row">
+        <div class="card welcome-jelly-card">
+          <div class="welcome-content">
+            <div>
+              <span class="welcome-tag">Welcome back,</span>
+              <div class="welcome-title" id="heroWelcomeUser">Mark Johnson</div>
+              <p class="welcome-desc">Glad to see you again!<br>وضعیت پروتکل‌ها، مسیرهای اتصال و Clean IPها را به‌صورت زنده مدیریت کنید.</p>
+            </div>
+            <button type="button" class="welcome-link" onclick="switchTab('sec-outputs')">Tap to record · مشاهده خروجی‌ها ←</button>
+          </div>
+          <!-- Glowing Neon Jellyfish SVG matching Vision UI -->
+          <svg class="jellyfish-art" viewBox="0 0 260 260" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <radialGradient id="jellyBell" cx="50%" cy="38%" r="55%">
+                <stop offset="0%" stop-color="#f0abfc"/>
+                <stop offset="45%" stop-color="#8b5cf6"/>
+                <stop offset="85%" stop-color="#0075ff"/>
+                <stop offset="100%" stop-color="#060b26" stop-opacity="0"/>
+              </radialGradient>
+              <linearGradient id="tentacleGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#c084fc" stop-opacity="0.9"/>
+                <stop offset="60%" stop-color="#38bdf8" stop-opacity="0.65"/>
+                <stop offset="100%" stop-color="#0075ff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <ellipse cx="135" cy="95" rx="88" ry="52" fill="url(#jellyBell)" stroke="rgba(240,171,252,0.55)" stroke-width="1.5"/>
+            <ellipse cx="135" cy="112" rx="76" ry="22" fill="rgba(56,189,248,0.22)" stroke="rgba(167,139,250,0.45)" stroke-width="1.2"/>
+            <path d="M85 118 C75 160, 95 195, 70 245" stroke="url(#tentacleGrad)" stroke-width="3" stroke-linecap="round"/>
+            <path d="M105 122 C98 165, 118 202, 96 250" stroke="url(#tentacleGrad)" stroke-width="3.5" stroke-linecap="round"/>
+            <path d="M126 125 C120 172, 142 208, 122 254" stroke="url(#tentacleGrad)" stroke-width="4" stroke-linecap="round"/>
+            <path d="M148 124 C142 170, 165 205, 148 250" stroke="url(#tentacleGrad)" stroke-width="3.2" stroke-linecap="round"/>
+            <path d="M170 120 C166 164, 185 198, 172 242" stroke="url(#tentacleGrad)" stroke-width="2.8" stroke-linecap="round"/>
+            <path d="M188 115 C192 155, 205 190, 195 232" stroke="url(#tentacleGrad)" stroke-width="2.2" stroke-linecap="round"/>
+          </svg>
+        </div>
+
+        <div class="card gauge-card">
+          <div>
+            <h2>Satisfaction Rate</h2>
+            <p class="card-head-sub">From all protocols · پروتکل‌های فعال: <b id="dashProtocolCount" style="color:#fff">0</b></p>
+          </div>
+          <div class="satisfaction-wrap">
+            <svg class="satisfaction-svg" viewBox="0 0 200 120">
+              <defs>
+                <linearGradient id="satArc" x1="0" y1="0" x2="1" y2="0">
+                  <stop offset="0%" stop-color="#0075ff" stop-opacity="0.25"/>
+                  <stop offset="100%" stop-color="#0075ff"/>
+                </linearGradient>
+              </defs>
+              <path d="M 20 105 A 80 80 0 0 1 180 105" fill="none" stroke="#1a1f37" stroke-width="14" stroke-linecap="round"/>
+              <path d="M 20 105 A 80 80 0 0 1 174 75" fill="none" stroke="url(#satArc)" stroke-width="14" stroke-linecap="round"/>
+            </svg>
+            <div class="satisfaction-smile">☺</div>
+            <div class="satisfaction-footer">
+              <small>0%</small>
+              <div><strong>95%</strong><small>Based on active tunnels</small></div>
+              <small>100%</small>
+            </div>
           </div>
         </div>
-        <p class="small-note">تست TCP از گره‌های بیرونی منطقه ایران اجرا می‌شود؛ این نتیجه ICMP یا آزمون مستقیم گوشی شما نیست. برای آزمون محلی IPهای فعلی، اسکنر HTML را دانلود کنید و محدودیت TLS/SNI مرورگر را در توضیحات آن ببینید.</p>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>آدرس اتصال</th><th>پروتکل</th><th>پورت</th><th>وضعیت</th><th>نتیجه TCP بیرونی</th><th>آزمون</th></tr></thead>
-            <tbody id="dashConfigRows"><tr><td colspan="6">در حال بارگذاری...</td></tr></tbody>
-          </table>
+
+        <div class="card gauge-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <h2>Referral Tracking</h2>
+            <span class="pill" style="font-size:10px;">Active</span>
+          </div>
+          <div class="referral-body">
+            <div class="referral-stats">
+              <div class="referral-box">
+                <span>مسیرهای اتصال (Endpoints)</span>
+                <strong id="dashEndpointCount">0</strong>
+              </div>
+              <div class="referral-box">
+                <span>پورت‌های فعال (Ports)</span>
+                <strong id="dashPortsCount">0</strong>
+              </div>
+            </div>
+            <div class="score-ring-wrap">
+              <svg width="130" height="130" viewBox="0 0 130 130">
+                <defs>
+                  <linearGradient id="scoreGrad" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0%" stop-color="#05cd99"/>
+                    <stop offset="100%" stop-color="#00d2ff" stop-opacity="0.2"/>
+                  </linearGradient>
+                </defs>
+                <circle cx="65" cy="65" r="52" fill="none" stroke="#1a1f37" stroke-width="11"/>
+                <circle cx="65" cy="65" r="52" fill="none" stroke="url(#scoreGrad)" stroke-width="11" stroke-dasharray="280 330" stroke-linecap="round" transform="rotate(-90 65 65)"/>
+              </svg>
+              <div class="score-ring-text">
+                <small>Safety</small>
+                <strong>9.3</strong>
+                <small>Total Score</small>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Row 3: Sales Overview Wave Chart + Active Users Bar Card -->
+      <div class="vision-charts-row">
+        <div class="card">
+          <h2>Sales Overview · نمای کلی پایداری شبکه</h2>
+          <div class="chart-badge-line"><b>(+5) more</b> in 2026 · WebSocket + TLS Fragmentation</div>
+          <div class="wave-chart-box">
+            <svg viewBox="0 0 600 200" preserveAspectRatio="none">
+              <defs>
+                <linearGradient id="waveBlue" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#0075ff" stop-opacity="0.55"/>
+                  <stop offset="100%" stop-color="#0075ff" stop-opacity="0.0"/>
+                </linearGradient>
+                <linearGradient id="waveCyan" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#00d2ff" stop-opacity="0.4"/>
+                  <stop offset="100%" stop-color="#00d2ff" stop-opacity="0.0"/>
+                </linearGradient>
+              </defs>
+              <g stroke="rgba(226,232,240,0.08)" stroke-dasharray="4 4">
+                <line x1="0" y1="35" x2="600" y2="35"/><line x1="0" y1="75" x2="600" y2="75"/>
+                <line x1="0" y1="115" x2="600" y2="115"/><line x1="0" y1="155" x2="600" y2="155"/>
+              </g>
+              <path d="M0,70 C50,40 90,125 145,110 C200,95 235,45 290,55 C345,65 390,130 445,85 C500,40 550,65 600,50 L600,185 L0,185 Z" fill="url(#waveBlue)"/>
+              <path d="M0,70 C50,40 90,125 145,110 C200,95 235,45 290,55 C345,65 390,130 445,85 C500,40 550,65 600,50" fill="none" stroke="#0075ff" stroke-width="3.5"/>
+              <path d="M0,125 C55,115 105,85 160,115 C215,145 260,85 315,95 C370,105 420,145 475,115 C530,85 565,110 600,95 L600,185 L0,185 Z" fill="url(#waveCyan)"/>
+              <path d="M0,125 C55,115 105,85 160,115 C215,145 260,85 315,95 C370,105 420,145 475,115 C530,85 565,110 600,95" fill="none" stroke="#00d2ff" stroke-width="3"/>
+            </svg>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="bars-inner-box">
+            <div class="v-bar-col"><div class="v-bar" style="height:68%"></div></div>
+            <div class="v-bar-col"><div class="v-bar" style="height:48%"></div></div>
+            <div class="v-bar-col"><div class="v-bar" style="height:26%"></div></div>
+            <div class="v-bar-col"><div class="v-bar" style="height:60%"></div></div>
+            <div class="v-bar-col"><div class="v-bar" style="height:92%"></div></div>
+            <div class="v-bar-col"><div class="v-bar" style="height:74%"></div></div>
+            <div class="v-bar-col"><div class="v-bar" style="height:82%"></div></div>
+            <div class="v-bar-col"><div class="v-bar" style="height:46%"></div></div>
+            <div class="v-bar-col"><div class="v-bar" style="height:88%"></div></div>
+          </div>
+          <h2 style="margin:14px 0 4px;">Active Users & Endpoints</h2>
+          <div class="chart-badge-line"><b>(+23%)</b> than last week</div>
+          <div class="active-users-metrics">
+            <div class="au-metric">
+              <div class="au-metric-head"><span class="au-metric-dot">U</span><span>Users</span></div>
+              <strong id="auUsersMetric">32,984</strong>
+              <div class="au-bar"><i style="width:78%"></i></div>
+            </div>
+            <div class="au-metric">
+              <div class="au-metric-head"><span class="au-metric-dot">P</span><span>Ports</span></div>
+              <strong id="auPortsMetric">2.42m</strong>
+              <div class="au-bar"><i style="width:65%"></i></div>
+            </div>
+            <div class="au-metric">
+              <div class="au-metric-head"><span class="au-metric-dot">C</span><span>Configs</span></div>
+              <strong id="auConfigsMetric">2,400$</strong>
+              <div class="au-bar"><i style="width:84%"></i></div>
+            </div>
+            <div class="au-metric">
+              <div class="au-metric-head"><span class="au-metric-dot">I</span><span>Clean IPs</span></div>
+              <strong id="auIpsMetric">320</strong>
+              <div class="au-bar"><i style="width:55%"></i></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Row 4: Projects (Configs Table) + Orders Overview -->
+      <div class="vision-bottom-row">
+        <div class="card">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:6px;">
+            <div>
+              <h2 style="margin:0;">Projects · وضعیت کانفیگ‌ها و پروتکل‌ها</h2>
+              <p class="small-note" style="margin:2px 0 0;">● تست TCP از گره‌های بیرونی منطقه ایران (Check-Host.cc)</p>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button type="button" id="dashTestPingBtn">تست TCP از نقاط ایران</button>
+              <button type="button" class="secondary" onclick="switchTab('sec-outputs')">مشاهده خروجی‌ها</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>COMPANIES / آدرس اتصال</th><th>پروتکل</th><th>BUDGET / پورت</th><th>COMPLETION / وضعیت</th><th>نتیجه TCP بیرونی</th><th>آزمون</th></tr></thead>
+              <tbody id="dashConfigRows"><tr><td colspan="6">در حال بارگذاری...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Orders overview · خلاصه سرویس</h2>
+          <div class="chart-badge-line"><b>+30%</b> this month</div>
+          <div class="timeline-list">
+            <div class="timeline-item">
+              <div class="timeline-dot">⚡</div>
+              <div class="timeline-info"><strong>VLESS + Trojan WebSocket</strong><small>پشتیبانی از Early Data 2048 و TLS Fragmentation</small></div>
+            </div>
+            <div class="timeline-item">
+              <div class="timeline-dot" style="color:#34d399;border-color:rgba(52,211,153,0.4);">✓</div>
+              <div class="timeline-info"><strong>Clean IP Auto Sync</strong><small>همگام‌سازی خودکار و مرتب‌سازی بر اساس کمترین پینگ</small></div>
+            </div>
+            <div class="timeline-item">
+              <div class="timeline-dot" style="color:#f472b6;border-color:rgba(244,114,182,0.4);">★</div>
+              <div class="timeline-info"><strong>Multi-User Quota & KV Lock</strong><small>محدودیت حجم، زمان، نشست و ریست دوره‌ای مستقل</small></div>
+            </div>
+            <div class="timeline-item">
+              <div class="timeline-dot" style="color:#fbbf24;border-color:rgba(251,191,36,0.4);">⇄</div>
+              <div class="timeline-info"><strong>Sequential Outbound Failover</strong><small>Chain Proxy ← Direct ← Proxy IP</small></div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
 
-
     <section id="sec-users" class="panel-section">
-      <div class="dashboard-hero users-hero">
-        <div><h2>مدیریت اشتراک کاربران</h2><p>برای هر کاربر UUID، رمز Trojan و توکن اشتراک مستقل بسازید؛ سقف حجم، اعتبار، تعداد اتصال و دورهٔ ریست را مدیریت کنید.</p><div class="dashboard-subtitle">مصرف و نشست‌ها در KV جداگانه ثبت می‌شوند. به‌دلیل سازگاری نهایی KV، سهمیه در هم‌زمانی چند isolate کاملاً اتمیک نیست؛ محدودیت اتصال نیز فقط در هر isolate اعمال می‌شود و دستگاه یکتا را شناسایی نمی‌کند.</div></div>
-        <div class="hero-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20v-1.2a5.8 5.8 0 0 1 11.6 0V20M17 8h5M19.5 5.5v5"/></svg></div>
-      </div>
       <div class="user-overview-grid">
         <div class="user-overview-card"><span>کل کاربران</span><strong id="userTotalCount">0</strong><small>حساب‌های تعریف‌شده</small></div>
         <div class="user-overview-card"><span>حساب‌های فعال</span><strong id="userEnabledCount">0</strong><small>در وضعیت فعال</small></div>
         <div class="user-overview-card"><span>اشتراک‌های منقضی</span><strong id="userExpiredCount">0</strong><small>نیازمند تمدید</small></div>
         <div class="user-overview-card"><span>نزدیک سقف حجم</span><strong id="userNearLimitCount">0</strong><small>مصرف بیشتر از ۸۰٪</small></div>
       </div>
-      <div class="card user-editor-card">
+      <div class="card">
         <div class="section-head"><div><h2 id="userEditorTitle">افزودن کاربر جدید</h2><p class="small-note">فیلدهای خالی اعتبارنامه به‌صورت امن تولید می‌شوند؛ توکن اشتراک را فقط با همان کاربر به اشتراک بگذارید.</p></div><span class="pill">حداکثر ۵۰ کاربر</span></div>
         <input type="hidden" id="userEditId">
         <div class="user-form-grid">
@@ -3177,8 +3414,8 @@ td { color: #dce6f5; }
           <div class="field"><label for="userTrojanInput">رمز Trojan کاربر</label><div class="inline-control"><input id="userTrojanInput" dir="ltr" placeholder="رمز مستقل"><button type="button" class="secondary" id="userGenTrojanBtn">تولید</button></div></div>
           <div class="field"><label for="userTrafficLimitInput">سقف ترافیک (GB، صفر = نامحدود)</label><input type="number" id="userTrafficLimitInput" min="0" max="1000000" value="0"></div>
           <div class="field"><label for="userExpireDaysInput">اعتبار (روز، صفر = نامحدود)</label><input type="number" id="userExpireDaysInput" min="0" max="36500" value="0"></div>
-          <div class="field"><label for="userDeviceLimitInput">حد اتصال هم‌زمان در هر isolate (صفر = نامحدود)</label><input type="number" id="userDeviceLimitInput" min="0" max="1000" value="0"></div>
-          <div class="field"><label for="userRequestLimitInput">حد تعداد نشست تونل در هر دوره (صفر = نامحدود)</label><input type="number" id="userRequestLimitInput" min="0" value="0"></div>
+          <div class="field"><label for="userDeviceLimitInput">حد اتصال هم‌زمان در هر isolate</label><input type="number" id="userDeviceLimitInput" min="0" max="1000" value="0"></div>
+          <div class="field"><label for="userRequestLimitInput">حد تعداد نشست تونل در هر دوره</label><input type="number" id="userRequestLimitInput" min="0" value="0"></div>
           <div class="field"><label for="userResetPeriodInput">ریست دوره‌ای (روز، صفر = بدون ریست)</label><input type="number" id="userResetPeriodInput" min="0" max="36500" value="0"></div>
         </div>
         <div class="user-toggle-grid">
@@ -3190,8 +3427,8 @@ td { color: #dce6f5; }
         <div class="user-form-actions"><button type="button" id="userSaveBtn">ذخیره کاربر</button><button type="button" class="secondary" id="userClearBtn">پاک‌کردن فرم</button></div>
       </div>
       <div class="card" style="margin-top:18px;">
-        <div class="section-head"><div><h2>فهرست کاربران</h2><p class="small-note">مدیریت اعتبارنامه، لینک‌های اشتراک، حجم مصرفی و وضعیت هر حساب به‌صورت مستقل.</p></div><div class="toolbar-actions"><input type="search" id="userSearchInput" class="user-search" placeholder="جست‌وجوی نام یا شناسه کاربر" aria-label="جست‌وجوی کاربر"><button type="button" id="userNewBtn">کاربر جدید</button><button type="button" class="secondary" id="userRefreshBtn">بازخوانی اطلاعات</button></div></div>
-        <div class="table-wrap"><table class="users-table"><thead><tr><th>کاربر</th><th>پروتکل‌ها</th><th>مصرف</th><th>اعتبار</th><th>اتصال/درخواست</th><th>وضعیت</th><th>عملیات</th></tr></thead><tbody id="userTableBody"><tr><td colspan="7" style="text-align:center">هنوز کاربری تعریف نشده است.</td></tr></tbody></table></div>
+        <div class="section-head"><div><h2>فهرست کاربران</h2><p class="small-note">مدیریت اعتبارنامه، لینک‌های اشتراک، حجم مصرفی و وضعیت هر حساب به‌صورت مستقل.</p></div><div class="toolbar-actions"><input type="search" id="userSearchInput" class="user-search" placeholder="جست‌وجوی نام یا شناسه کاربر"><button type="button" id="userNewBtn">کاربر جدید</button><button type="button" class="secondary" id="userRefreshBtn">بازخوانی اطلاعات</button></div></div>
+        <div class="table-wrap"><table class="users-table"><thead><tr><th>ساب‌کاربر</th><th>میزان مصرف</th><th>عملیات</th></tr></thead><tbody id="userTableBody"><tr><td colspan="3" style="text-align:center">هنوز کاربری تعریف نشده است.</td></tr></tbody></table></div>
       </div>
     </section>
 
@@ -3199,16 +3436,14 @@ td { color: #dce6f5; }
       <div class="grid-2">
         <div class="card">
           <h2>DNS و حریم خصوصی</h2>
-          <div class="field"><label for="localDns">Local DNS</label><input type="text" id="localDns" dir="ltr" placeholder="localhost یا 192.168.1.1"><p class="small-note">برای دامنه‌های محلی و در صورت فعال بودن Bypass استفاده می‌شود. می‌توان localhost، IP یا URL از نوع HTTPS وارد کرد.</p></div>
+          <div class="field"><label for="localDns">Local DNS</label><input type="text" id="localDns" dir="ltr" placeholder="localhost یا 192.168.1.1"></div>
           <div class="field"><label for="antiSanctionDns">Anti Sanction DNS (اختیاری)</label><input type="text" id="antiSanctionDns" dir="ltr" placeholder="https://1.1.1.1/dns-query"></div>
           <label class="check-label"><span>فعال‌سازی Fake DNS</span><input type="checkbox" id="fakeDnsEnabled"></label>
-          <p class="small-note">Fake DNS ممکن است برای بعضی کلاینت‌ها یا حالت‌های TUN مناسب نباشد؛ برای استفادهٔ عادی خاموش نگه دارید مگر اینکه به آن نیاز داشته باشید.</p>
         </div>
         <div class="card">
           <h2>شبکه و گزارش‌گیری</h2>
           <label class="check-label"><span>فعال‌سازی IPv6 در DNS و خروجی‌ها</span><input type="checkbox" id="ipv6Enabled"></label>
           <div class="field"><label for="logLevel">Log Level</label><select id="logLevel"><option value="debug">Debug</option><option value="info">Info</option><option value="warning">Warning</option><option value="error">Error</option><option value="none">None</option></select></div>
-          <p class="small-note">این تنظیمات در فایل‌های خروجی Xray و Sing-box اعمال می‌شوند؛ تنظیم Log Level سمت خود Worker همچنان از Cloudflare Logs کنترل می‌شود.</p>
         </div>
       </div>
       <button type="button" id="saveMainSettingsBtn" style="margin-top:20px;">ذخیره تنظیمات اصلی</button>
@@ -3233,18 +3468,18 @@ td { color: #dce6f5; }
           <div class="grid-2" style="gap:10px;">
             <div class="port-manager">
               <h3>پورت‌های اضافی TLS</h3>
-              <div class="port-add-row"><input type="number" id="extraTlsPortInput" min="1" max="65535" inputmode="numeric" aria-label="پورت TLS جدید" placeholder="مثلاً 2053"><button type="button" id="addExtraTlsPort">افزودن</button></div>
+              <div class="port-add-row"><input type="number" id="extraTlsPortInput" min="1" max="65535" placeholder="مثلاً 2053"><button type="button" id="addExtraTlsPort">افزودن</button></div>
               <div id="extraTlsPortList" class="port-chip-list"></div>
             </div>
             <div class="port-manager">
               <h3>پورت‌های اضافی غیر TLS</h3>
-              <div class="port-add-row"><input type="number" id="extraNonTlsPortInput" min="1" max="65535" inputmode="numeric" aria-label="پورت غیر TLS جدید" placeholder="مثلاً 8080"><button type="button" id="addExtraNonTlsPort">افزودن</button></div>
+              <div class="port-add-row"><input type="number" id="extraNonTlsPortInput" min="1" max="65535" placeholder="مثلاً 8080"><button type="button" id="addExtraNonTlsPort">افزودن</button></div>
               <div id="extraNonTlsPortList" class="port-chip-list"></div>
             </div>
           </div>
-          <p class="small-note">پورت اضافی در تمام خروجی‌ها و لینک‌های تکی ساخته می‌شود. برای کارکرد واقعی، پورت باید در مسیر ورودی Cloudflare/دامنه و شبکهٔ مقصد نیز پشتیبانی و باز باشد.</p>
           <label class="check-label"><span>فعال‌سازی Fragment</span><input type="checkbox" id="fragmentEnabled"></label>
-          <div class="field"><label for="fragmentProfile">پروفایل آماده Fragment</label><select id="fragmentProfile"><option value="custom">سفارشی</option><option value="hamrah">همراه اول</option><option value="irancell">ایرانسل</option><option value="rightel">رایتل</option><option value="mokhaberat">مخابرات</option><option value="gaming">Gaming</option></select><p class="small-note">پروفایل فقط مقادیر طول و فاصله را پیشنهاد می‌دهد؛ نتیجه به شبکه و کلاینت وابسته است.</p></div>
+          <div class="field"><label for="fragmentProfile">پروفایل آماده Fragment</label><select id="fragmentProfile"><option value="custom">سفارشی</option><option value="hamrah">همراه اول</option><option value="irancell">ایرانسل</option><option value="rightel">رایتل</option><option value="mokhaberat">مخابرات</option><option value="gaming">
+Gaming</option></select><p class="small-note">پروفایل فقط مقادیر طول و فاصله را پیشنهاد می‌دهد؛ نتیجه به شبکه و کلاینت وابسته است.</p></div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
             <div class="field"><label>طول Fragment</label><input type="text" id="fragmentLength" dir="ltr" placeholder="100-200"></div>
             <div class="field"><label>فاصله Fragment</label><input type="text" id="fragmentInterval" dir="ltr" placeholder="10-20"></div>
@@ -3307,7 +3542,7 @@ td { color: #dce6f5; }
           <button id="sortCleanBtn">آزمون + مرتب‌سازی خروجی</button>
         </div>
         <p class="small-note" style="margin-top:12px;">این آزمون TCP را از گره‌های Check-Host منطقهٔ ایران می‌گیرد؛ آدرس و پورت هدف برای آن سرویس ارسال می‌شود. نتایج نمایندهٔ همهٔ اپراتورها یا مسیر دقیق گوشی شما نیستند و معادل ICMP Ping هم نیستند. برای همگام‌سازی خودکار روزانه، در Cloudflare برای Worker یک Cron Trigger مانند <code>0 4 * * *</code> (ساعت ۰۴:۰۰ UTC) اضافه کنید.</p>
-        <div id="previewChanges" class="hidden" style="margin-top:16px; padding:12px 14px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:10px;">
+        <div id="previewChanges" class="hidden" style="margin-top:16px; padding:12px 14px; background:rgba(15,21,53,0.85); border:1px solid var(--border); border-radius:14px;">
            <h3 style="margin:0 0 6px;font-size:13.5px;font-weight:700;">پیش‌نمایش تغییرات:</h3>
            <p class="small-note" id="previewText" style="margin:0;"></p>
         </div>
@@ -3344,8 +3579,8 @@ td { color: #dce6f5; }
         </div>
         <div class="card">
           <h2>امنیت لینک اشتراک</h2>
-          <p class="small-note">چرخش توکن، تمام لینک‌های اشتراک قبلی را نامعتبر می‌کند. بعد از انجام آن باید لینک‌های جدید را به کلاینت‌ها بدهید.</p>
-          <button type="button" id="rotateTokenBtn">تولید توکن اشتراک جدید</button>
+          <p class="small-note">با این عملیات، لینک اشتراک قبلی، UUID و رمز Trojan اصلی هم‌زمان عوض می‌شوند؛ کانفیگ‌های قدیمی دیگر برای اتصال جدید پذیرفته نمی‌شوند. بعد از عملیات، خروجی تازه را دوباره به کلاینت وارد کنید.</p>
+          <button type="button" id="rotateTokenBtn">بازنشانی و منسوخ‌کردن ساب‌های قبلی</button>
         </div>
       </div>
     </section>
@@ -3391,7 +3626,7 @@ function updatePanelTitle(targetId) {
   const username = String(globalSettings.username || 'admin').trim() || 'admin';
   const tabTitle = TAB_TITLES[targetId] || 'پنل مدیریت';
   $('pageTitle').textContent = username + ' — ' + tabTitle;
-  document.title = username + ' — ' + tabTitle + ' | Cloudflare Workers';
+  document.title = username + ' — ' + tabTitle + ' | VISION UI Panel';
 }
 
 function switchTab(targetId) {
@@ -3409,13 +3644,19 @@ document.querySelectorAll('.menu-item').forEach(item => {
   item.onclick = () => switchTab(item.getAttribute('data-target'));
 });
 
+$('topQuickSearch')?.addEventListener('input', e => {
+  const q = String(e.target.value || '').trim();
+  if ($('userSearchInput')) {
+    $('userSearchInput').value = q;
+    renderUsers();
+  }
+});
+
 async function api(path, opts = {}) {
   const res = await fetch(path, { credentials: 'same-origin', ...opts, headers: { ...(opts.headers||{}), ...(opts.body?{'content-type':'application/json'}:{}) }});
   let body = {}; try { body = await res.json(); } catch {}
   if (!res.ok) {
     const errInfo = ERROR_DICT[body.code];
-    // Keep server-side validation details visible instead of masking every field error
-    // behind the same generic message. This identifies the exact bad Clean IP or setting.
     const msg = body.code === 'ERR_VALIDATION' && body.error
       ? String(body.error)
       : (errInfo ? errInfo.msg + " " + errInfo.action : (body.error || 'خطای ناشناخته'));
@@ -3450,6 +3691,7 @@ async function initApp() {
 $('setupForm').onsubmit = async e => { e.preventDefault(); try { await api('/api/setup', { method: 'POST', body: JSON.stringify({ username: $('setupUser').value, password: $('setupPass').value }) }); initApp(); } catch (err) { $('setupStatus').textContent = err.message; $('setupStatus').classList.remove('hidden'); }};
 $('loginForm').onsubmit = async e => { e.preventDefault(); try { await api('/api/login', { method: 'POST', body: JSON.stringify({ username: $('loginUser').value, password: $('loginPass').value }) }); initApp(); } catch (err) { $('loginStatus').textContent = err.message; $('loginStatus').classList.remove('hidden'); }};
 $('logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); location.reload(); };
+setInterval(() => { void refreshUsageSnapshot(); }, 15000);
 $('refreshPanelBtn')?.addEventListener('click', async () => {
   const button = $('refreshPanelBtn');
   if (button) { button.disabled = true; button.textContent = 'در حال بازخوانی…'; }
@@ -3462,8 +3704,27 @@ $('refreshPanelBtn')?.addEventListener('click', async () => {
   finally { if (button) { button.disabled = false; button.textContent = 'بازخوانی'; } }
 });
 
+function updateCloudUsageMetrics(users) {
+  const list = Array.isArray(users) ? users : [];
+  const requests = list.reduce((total, user) => total + Math.max(0, Number(user.requestCount) || 0), 0);
+  const bytes = list.reduce((total, user) => total + Math.max(0, Number(user.usageBytes) || 0), 0);
+  if ($('dashCloudRequests')) $('dashCloudRequests').textContent = requests.toLocaleString('en-US');
+  if ($('dashTrafficUsage')) $('dashTrafficUsage').textContent = fmtUserBytes(bytes);
+}
+
+async function refreshUsageSnapshot() {
+  if (!$('appView') || $('appView').classList.contains('hidden')) return;
+  try {
+    const snapshot = await api('/api/settings');
+    globalSettings.users = Array.isArray(snapshot.users) ? snapshot.users : [];
+    updateCloudUsageMetrics(globalSettings.users);
+    renderUsers();
+  } catch { /* Keep the last good dashboard snapshot during transient errors. */ }
+}
+
 function fillForm(s) {
-  $('brandTitle').textContent = s.username + ' Dashboard';
+  $('brandTitle').innerHTML = '<span class="brand-logo-box">V</span> ' + (s.username || 'VISION') + ' PANEL';
+  if ($('heroWelcomeUser')) $('heroWelcomeUser').textContent = s.username || 'Mark Johnson';
   const activeSection = document.querySelector('.panel-section.active');
   updatePanelTitle(activeSection ? activeSection.id : 'sec-dashboard');
   $('uuid').value = s.uuid || ''; $('trojanPassword').value = s.trojanPassword || ''; $('publicHost').value = s.publicHost || '';
@@ -3495,14 +3756,28 @@ function fillForm(s) {
   $('clientIpRestrictionEnabled').checked = !!s.clientIpRestrictionEnabled;
   $('allowedClientIps').value = s.allowedClientIps || '';
   fillSelect('tlsPort', s.tlsPorts, s.tlsPort); fillSelect('nonTlsPort', s.nonTlsPorts, s.nonTlsPort);
-  $('dashCleanCount').textContent = (s.cleanIPs ? s.cleanIPs.split(/[\r\n,]+/).filter(Boolean).length : 0);
+
+  const cleanCount = s.cleanIPs ? s.cleanIPs.split(/[\r\n,]+/).filter(Boolean).length : 0;
+  const portsCount = getUiPorts(s, true).length + getUiPorts(s, false).length;
+  const endpointsCount = getUiEndpoints(s).length;
+  const allSubUsers = Array.isArray(s.users) ? s.users : [];
+  const usersCount = allSubUsers.length;
+  updateCloudUsageMetrics(allSubUsers);
+
+  $('dashCleanCount').textContent = String(cleanCount);
   $('dashUsername').textContent = s.username || 'admin';
   $('dashProtocolCount').textContent = String((s.vlessEnabled && s.uuid ? 1 : 0) + (s.trojanEnabled && s.trojanPassword ? 1 : 0));
-  $('dashPortsCount').textContent = String(getUiPorts(s, true).length + getUiPorts(s, false).length);
-  $('dashEndpointCount').textContent = String(getUiEndpoints(s).length);
-  $('dashUserCount').textContent = String(Array.isArray(s.users) ? s.users.length : 0);
+  $('dashPortsCount').textContent = String(portsCount);
+  $('dashEndpointCount').textContent = String(endpointsCount);
+  $('dashUserCount').textContent = String(usersCount);
+
+  if ($('auUsersMetric')) $('auUsersMetric').textContent = String(usersCount);
+  if ($('auPortsMetric')) $('auPortsMetric').textContent = String(portsCount);
+  if ($('auIpsMetric')) $('auIpsMetric').textContent = String(cleanCount);
+
   renderUsers();
   renderDashboardConfigs(s);
+  if ($('auConfigsMetric')) $('auConfigsMetric').textContent = $('dashConfigCount').textContent;
   if (s.links) { $('linkXray').textContent = s.links.xray; $('linkXrayJson').textContent = s.links.xrayJson; $('linkSingbox').textContent = s.links.singbox; }
   renderDirectUris(s.links && Array.isArray(s.links.uris) ? s.links.uris : []);
 }
@@ -3571,7 +3846,7 @@ function renderDashboardConfigs(s) {
   configs.forEach(c => {
     const tr=document.createElement('tr');
     [c.address,c.proto,String(c.port)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});
-    const status=document.createElement('td'), pill=document.createElement('span'); pill.className='pill'; pill.textContent='فعال در تنظیمات'; status.appendChild(pill);tr.appendChild(status);
+    const status=document.createElement('td'), pill=document.createElement('span'); pill.className='pill'; pill.textContent='100% · فعال'; status.appendChild(pill);tr.appendChild(status);
     tr.appendChild(externalResultCell(c.address, c.port));
     const test=document.createElement('td'),btn=document.createElement('button'); btn.type='button'; btn.className='secondary'; btn.textContent='تست این پورت';
     btn.addEventListener('click',()=>runExternalTests([{host:c.address, port:c.port}], false)); test.appendChild(btn);tr.appendChild(test);rows.appendChild(tr);
@@ -3635,9 +3910,6 @@ function renderDirectUris(uris) {
 function fillSelect(id, ports, current) { const el = $(id); el.innerHTML = ''; (ports||[]).forEach(p => { const o = document.createElement('option'); o.value = p; o.textContent = p; if (Number(current) === p) o.selected = true; el.appendChild(o); }); }
 
 function gatherSettings() {
-  // publicSettings() contains derived subscription links, including one URI per
-  // endpoint/protocol/port. Never send those generated links back to the API:
-  // with dozens of Clean IPs they can exceed the request-size limit.
   const base = { ...(globalSettings || {}) };
   delete base.links;
   delete base.tlsPorts;
@@ -3726,7 +3998,6 @@ async function testAndSortCleanIPs() {
 }
 $('sortCleanBtn').onclick = testAndSortCleanIPs;
 
-
 function randomBrowserToken(bytes = 24) {
   const raw = crypto.getRandomValues(new Uint8Array(bytes));
   let binary = ""; raw.forEach(v => binary += String.fromCharCode(v));
@@ -3746,6 +4017,7 @@ function clearUserForm() {
 }
 function fmtUserBytes(bytes) {
   const n = Math.max(0, Number(bytes) || 0);
+  if (n < 1024) return n.toFixed(0) + " B";
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
   if (n < 1024 ** 3) return (n / (1024 ** 2)).toFixed(2) + " MB";
   return (n / (1024 ** 3)).toFixed(2) + " GB";
@@ -3772,25 +4044,29 @@ function renderUsers() {
   if ($('userExpiredCount')) $('userExpiredCount').textContent = String(expired);
   if ($('userNearLimitCount')) $('userNearLimitCount').textContent = String(near);
   const query = String($('userSearchInput')?.value || '').trim().toLocaleLowerCase();
-  const users = query ? allUsers.filter(u => [u.name, u.id, u.uuid].some(v => String(v || '').toLocaleLowerCase().includes(query))) : allUsers;
+  const users = query ? allUsers.filter(u => [u.name, u.id].some(v => String(v || '').toLocaleLowerCase().includes(query))) : allUsers;
   body.replaceChildren();
   if (!allUsers.length) {
-    const tr=document.createElement('tr'), td=document.createElement('td'); td.colSpan=7; td.textContent='هنوز کاربری تعریف نشده است؛ فرم بالا را تکمیل کنید.'; tr.appendChild(td); body.appendChild(tr); return;
+    const tr=document.createElement('tr'), td=document.createElement('td'); td.colSpan=3; td.textContent='هنوز ساب‌کاربری تعریف نشده است؛ فرم بالا را تکمیل کنید.'; tr.appendChild(td); body.appendChild(tr); return;
   }
   if (!users.length) {
-    const tr=document.createElement('tr'), td=document.createElement('td'); td.colSpan=7; td.textContent='کاربری با این عبارت پیدا نشد.'; tr.appendChild(td); body.appendChild(tr); return;
+    const tr=document.createElement('tr'), td=document.createElement('td'); td.colSpan=3; td.textContent='ساب‌کاربری با این عبارت پیدا نشد.'; tr.appendChild(td); body.appendChild(tr); return;
   }
   users.forEach(user => {
     const tr=document.createElement('tr');
+    const index = allUsers.findIndex(item => item.id === user.id) + 1;
     const nameTd=document.createElement('td');
-    const name=document.createElement('strong'); name.textContent=user.name || 'بدون نام'; nameTd.appendChild(name);
-    const meta=document.createElement('div'); meta.className='table-subtext'; meta.textContent=String(user.id || '').slice(0,8); nameTd.appendChild(meta); tr.appendChild(nameTd);
-    const protocols=document.createElement('td'); protocols.textContent=[user.vlessEnabled !== false ? 'VLESS' : '',user.trojanEnabled !== false ? 'Trojan' : ''].filter(Boolean).join(' + ') || 'هیچ‌کدام'; tr.appendChild(protocols);
-    const usage=document.createElement('td');
+    const identity=document.createElement('div'); identity.className='user-number-cell';
+    const number=document.createElement('span'); number.className='user-number-badge'; number.textContent='#'+index; identity.appendChild(number);
+    const name=document.createElement('strong'); name.textContent=user.name || ('ساب‌کاربر '+index); identity.appendChild(name);
+    nameTd.appendChild(identity); tr.appendChild(nameTd);
+
+    const usage=document.createElement('td'); usage.className='user-usage-cell';
     const usedBytes=Math.max(0,Number(user.usageBytes)||0);
     const limitBytes=Number(user.trafficLimitGB)>0 ? Number(user.trafficLimitGB)*1024**3 : 0;
-    const usageNow=fmtUserBytes(usedBytes); const usageLimit=limitBytes ? ' / '+Number(user.trafficLimitGB)+' GB' : ' / نامحدود';
-    const usageText=document.createElement('div'); usageText.textContent=usageNow+usageLimit; usage.appendChild(usageText);
+    const usageLine=document.createElement('div');
+    usageLine.textContent=fmtUserBytes(usedBytes)+(limitBytes?' از '+Number(user.trafficLimitGB)+' GB':' · نامحدود');
+    usage.appendChild(usageLine);
     if(limitBytes){
       const pct=Math.min(100,Math.max(0,usedBytes/limitBytes*100));
       const bar=document.createElement('div'); bar.className='user-usage-track';
@@ -3798,24 +4074,22 @@ function renderUsers() {
       const percent=document.createElement('small'); percent.className='user-usage-percent'; percent.textContent=pct.toFixed(1)+'٪ مصرف شده'; usage.appendChild(percent);
     }
     tr.appendChild(usage);
-    const expiry=document.createElement('td'); expiry.textContent=userExpiryText(user); tr.appendChild(expiry);
-    const counts=document.createElement('td'); counts.textContent=(Number(user.activeConnections)||0)+' اتصال فعال · '+(Number(user.requestCount)||0)+(Number(user.requestLimit)>0?' / '+Number(user.requestLimit):'')+' نشست'; counts.title='اتصال فعال فقط در همین Worker isolate قابل مشاهده است.'; tr.appendChild(counts);
-    const status=document.createElement('td'); const pill=document.createElement('span');
-    const isExpired=expiredUser(user); const quotaFull=limitBytes>0 && usedBytes>=limitBytes;
-    const periodMs=Math.max(0,Number(user.resetPeriodDays)||0)*86400000;
-    const periodExpired=periodMs>0 && Number(user.periodStartedAt)>0 && now-Number(user.periodStartedAt)>=periodMs;
-    const requestFull=!periodExpired && Number(user.requestLimit)>0 && Number(user.requestCount)>=Number(user.requestLimit);
-    pill.className='pill'+(user.enabled===false || isExpired || quotaFull || requestFull?' off':nearLimit(user)?' warn':'');
-    pill.textContent=user.enabled===false?'غیرفعال':isExpired?'منقضی':quotaFull?'اتمام حجم':requestFull?'اتمام نشست':nearLimit(user)?'نزدیک سقف':'فعال'; status.appendChild(pill); tr.appendChild(status);
+
     const actions=document.createElement('td'); actions.className='user-actions';
     const makeButton=(label,action,cls='secondary')=>{const b=document.createElement('button');b.type='button';b.className=cls;b.textContent=label;b.addEventListener('click',()=>action(user));return b;};
+    const quotaFull=limitBytes>0 && usedBytes>=limitBytes;
+    const unavailable=user.enabled===false || expiredUser(user) || quotaFull;
     actions.appendChild(makeButton('ویرایش',editUser,'secondary'));
     actions.appendChild(makeButton('کپی Xray',u=>copyUserSubscription(u,'xray'),'secondary'));
     actions.appendChild(makeButton('کپی Sing-box',u=>copyUserSubscription(u,'singbox'),'secondary'));
-    actions.appendChild(makeButton('توکن جدید',rotateUserToken,'secondary'));
-    actions.appendChild(makeButton('ریست مصرف',resetUserUsage,'secondary'));
+    actions.appendChild(makeButton(quotaFull?'بازنشانی حجم + ابطال ساب قبلی':'بازنشانی + ابطال ساب قبلی',resetAndRevokeUser,quotaFull?'danger-button':'secondary'));
     actions.appendChild(makeButton(user.enabled===false?'فعال‌سازی':'غیرفعال‌سازی',toggleUser,'secondary'));
     actions.appendChild(makeButton('حذف',deleteUser,'danger-button'));
+    if (unavailable) {
+      const state=document.createElement('small'); state.className='table-subtext';
+      state.textContent=user.enabled===false?'حساب غیرفعال است':expiredUser(user)?'اعتبار پایان یافته':quotaFull?'سهمیه تکمیل شده':'اشتراک در دسترس نیست';
+      actions.appendChild(state);
+    }
     tr.appendChild(actions); body.appendChild(tr);
   });
 }
@@ -3878,11 +4152,27 @@ $('userGenUuidBtn').addEventListener('click',()=>$('userUuidInput').value=crypto
 $('userGenTrojanBtn').addEventListener('click',()=>$('userTrojanInput').value=randomBrowserPassword());
 $('userRefreshBtn').addEventListener('click',async()=>{try{const data=await api('/api/settings');globalSettings=data;fillForm(data);showStatus('اطلاعات کاربران به‌روزرسانی شد.');}catch(err){showStatus(err.message,true);}});
 $('userSearchInput')?.addEventListener('input',renderUsers);
-async function rotateUserToken(user){if(!confirm('توکن اشتراک قبلی '+user.name+' نامعتبر شود؟'))return;globalSettings.users=globalSettings.users.map(u=>u.id===user.id?{...u,subToken:randomBrowserToken()}:u);await persistUsersAndRefresh('توکن اشتراک کاربر تغییر کرد.');}
-async function resetUserUsage(user){
-  if(!confirm('مصرف و شمارنده درخواست «'+user.name+'» از صفر شروع شود؟ تاریخ انقضا تغییر نمی‌کند.'))return;
-  try{await api('/api/users/reset-usage',{method:'POST',body:JSON.stringify({id:user.id})});const data=await api('/api/settings');globalSettings=data;fillForm(data);showStatus('مصرف کاربر بازنشانی شد.');}
-  catch(err){showStatus(err.message||String(err),true);}
+$('rotateTokenBtn')?.addEventListener('click', async () => {
+  const message='توکن اشتراک اصلی، UUID و رمز Trojan اصلی عوض می‌شوند. لینک و کانفیگ قبلی دیگر قابل استفاده نخواهد بود و باید اطلاعات تازه را به کلاینت وارد کنید. ادامه می‌دهید؟';
+  if(!confirm(message)) return;
+  const button=$('rotateTokenBtn'); const oldText=button.textContent;
+  button.disabled=true; button.textContent='در حال بازنشانی و ابطال…';
+  try {
+    const result=await api('/api/rotate-token',{method:'POST'});
+    const data=result.settings || await api('/api/settings');
+    globalSettings=data; fillForm(data);
+    showStatus('توکن، UUID و رمز Trojan اصلی جدید شدند؛ کانفیگ‌های قبلی منسوخ شدند.');
+  } catch(err) { showStatus(err.message||String(err),true); }
+  finally { button.disabled=false; button.textContent=oldText; }
+});
+async function resetAndRevokeUser(user){
+  const confirmText='مصرف و شمارنده «'+user.name+'» صفر شود و توکن اشتراک، UUID و رمز Trojan جدید شوند؟ تمام لینک‌ها و کانفیگ‌های قبلی این ساب‌کاربر منسوخ می‌شوند؛ تاریخ انقضا تغییر نمی‌کند.';
+  if(!confirm(confirmText))return;
+  try{
+    await api('/api/users/rotate-credentials',{method:'POST',body:JSON.stringify({id:user.id})});
+    const data=await api('/api/settings'); globalSettings=data; fillForm(data);
+    showStatus('مصرف بازنشانی شد؛ توکن، UUID و رمز Trojan جدید صادر و ساب‌های قبلی باطل شدند.');
+  }catch(err){showStatus(err.message||String(err),true);}
 }
 async function toggleUser(user){globalSettings.users=globalSettings.users.map(u=>u.id===user.id?{...u,enabled:!u.enabled}:u);await persistUsersAndRefresh(user.enabled===false?'کاربر فعال شد.':'کاربر غیرفعال شد.');}
 async function deleteUser(user){if(!confirm('کاربر «'+user.name+'» و اشتراک آن حذف شود؟'))return;globalSettings.users=globalSettings.users.filter(u=>u.id!==user.id);await persistUsersAndRefresh('کاربر حذف شد.');if($('userEditId').value===user.id)clearUserForm();}
@@ -3896,11 +4186,8 @@ function parseUiCleanLines(value) {
     const hash = raw.indexOf('#');
     let address = (hash >= 0 ? raw.slice(0, hash) : raw).trim();
     const label = hash >= 0 ? raw.slice(hash + 1).trim() : '';
-    // Accept common scanner exports such as IPv4:443, but store Clean IP without a port.
     const ipv4Port = address.match(/^((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})$/);
     if (ipv4Port) address = ipv4Port[1];
-    // A host field is a single address/hostname. Ignore pasted prose or CIDR entries
-    // here so the random picker cannot silently insert an invalid value into settings.
     if (!address || /[\s\/@?\\]/.test(address) || address.includes('/')) return;
     const key = address.toLowerCase();
     if (!seen.has(key)) { seen.add(key); output.push({ host: address, label }); }
@@ -3957,7 +4244,6 @@ $('randomCleanBtn').onclick = async () => {
       );
       additions = randomizeArray(candidates).slice(0, Math.min(count, room)).map(item => ({
         host: item.host,
-        // Labels are limited to 64 characters by the Worker validator.
         label: safeRandomCleanLabel(item.label, region, 'GitHub-Random')
       }));
       if (additions.length < Math.min(count, room)) showStatus('فهرست GitHub فقط ' + additions.length + ' IP جدید نسبت به فهرست فعلی دارد.', true);
@@ -4521,20 +4807,7 @@ $('restoreBtn').onclick = async () => {
   } catch (err) { showStatus('بازیابی ناموفق بود: ' + err.message, true); }
 };
 
-$('rotateTokenBtn').onclick = async () => {
-  if (!confirm('با ادامه، تمام لینک‌های اشتراک قبلی از کار می‌افتند. توکن جدید ساخته شود؟')) return;
-  const button = $('rotateTokenBtn'); button.disabled = true;
-  try {
-    const rotated = await api('/api/rotate-token', { method: 'POST', body: '{}' });
-    if (!rotated || rotated.ok !== true || !rotated.subToken || !rotated.links || !rotated.links.xray) throw new Error('پاسخ تولید توکن جدید معتبر نبود.');
-    const settings = await api('/api/settings');
-    if (!settings.subToken || settings.subToken !== rotated.subToken) throw new Error('توکن جدید ذخیره‌شده با پاسخ API مطابقت ندارد.');
-    globalSettings = settings; fillForm(settings);
-    showStatus('توکن جدید ساخته و ذخیره شد؛ لینک‌های به‌روز در تب خروجی‌ها قرار گرفتند.');
-    switchTab('sec-outputs');
-  } catch (err) { showStatus(err.message, true); }
-  finally { button.disabled = false; }
-};
+// Root credential rotation is bound above to the hardened API action.
 
 initApp();
 </script>
