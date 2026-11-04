@@ -1,4 +1,4 @@
-// BUILD_ID: cf-worker-zeus-usage-revoke-v5-20261104-ui-tcp
+// BUILD_ID: cf-worker-zeus-usage-revoke-v7-20261104-admin-usage-tcp-ui
 // Enhanced with ZEUS-inspired features + Exact Vision UI Dashboard Redesign:
 // - Multi-user structure (users[] with traffic/expire/device/request limits, startOnFirstConnect, resetPeriod)
 // - Fragment profiles for operators (hamrah, irancell, rightel, mokhaberat, gaming, custom)
@@ -25,6 +25,7 @@ const DEFAULT_DOH_URL = "https://cloudflare-dns.com/dns-query";
 const DEFAULT_REMOTE_DNS = "https://8.8.8.8/dns-query";
 const DEFAULT_CLEAN_IP_SOURCE = "https://raw.githubusercontent.com/babaeali626-dot/clean-ips/refs/heads/main/clean-ips.txt";
 const USER_USAGE_PREFIX = "panel-user-usage-v1:";
+const ADMIN_USAGE_KEY = "panel-admin-usage-v1";
 const USER_TRAFFIC_FLUSH_BYTES = 32 * 1024;
 const TCP_TEST_HISTORY_KEY = "panel-tcp-test-history-v1";
 const TCP_TEST_HISTORY_LIMIT = 500;
@@ -365,8 +366,8 @@ export default {
         if (!kv) throw new Error("KV Binding یافت نشد؛ همگام‌سازی زمان‌بندی‌شده متوقف شد.");
         const settings = await loadSettings(kv, env);
         const synced = await fetchCleanIpLists(settings.cleanIpSources || "");
-        const sample = parseCleanIPs(synced.cleanIPs).slice(0, 3).map(item => item.host);
-        const tests = await Promise.all(sample.map((host, index) => checkHostExternalTcp(host, settings.tlsPort || 443, index * 900)));
+        const sample = parseCleanIPs(synced.cleanIPs).slice(0, 1).map(item => item.host);
+        const tests = await Promise.all(sample.map(host => checkHostExternalTcp(host, settings.tlsPort || 443, 0, env)));
         settings.cleanIPs = sortCleanIpListByTestResults(synced.cleanIPs, tests);
         await saveSettings(kv, env, settings);
         console.log(`Scheduled Clean IP sync complete: ${synced.count} addresses, ${tests.filter(x => x.status === "ok").length} sampled TCP success(es), ${synced.sources.length} source(s).`);
@@ -455,7 +456,7 @@ async function handlePingIp(request) {
   return json({ results });
 }
 
-const MAX_EXTERNAL_PING_TARGETS = 3;
+const MAX_EXTERNAL_PING_TARGETS = 1;
 const CHECK_HOST_API = "https://api.check-host.cc";
 const CHECK_HOST_WEB = "https://check-host.cc";
 
@@ -489,26 +490,76 @@ function externalChecksArray(node) {
 }
 
 async function checkHostExternalTcp(host, port, dispatchDelayMs = 0, env = {}) {
+  const apiKey = String(env?.CHECK_HOST_API_KEY || "").trim();
+  const headers = { "content-type": "application/json" };
+  if (apiKey) headers.Authorization = "Bearer " + apiKey;
+  const isValidStart = result => !!(result?.response?.ok && result?.data?.success === true && result?.data?.uuid);
+  const retryDelay = response => Math.min(15000, Math.max(1000, Number(response?.headers?.get("retry-after") || 5) * 1000));
   try {
     if (dispatchDelayMs > 0) await sleep(dispatchDelayMs);
-    const headers = { "content-type": "application/json" };
-    const apiKey = String(env?.CHECK_HOST_API_KEY || "").trim();
-    if (apiKey) headers.Authorization = "Bearer " + apiKey;
-    const started = await fetchJsonWithTimeout(`${CHECK_HOST_API}/tcp`, 7000, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ target: host, port: Number(port), timeout: 1800 })
-    });
-    if (!started.response.ok || !started.data || started.data.success !== true || !started.data.uuid) {
-      const httpStatus = started.response.status;
+
+    // /usage is explicitly outside Check-Host's rate limiter. Check that one
+    // start plus possible fallback and report polling fit the current budget.
+    try {
+      const budget = await fetchJsonWithTimeout(`${CHECK_HOST_API}/usage`, 2500, {
+        headers: apiKey ? { Authorization: "Bearer " + apiKey } : {}
+      });
+      const remaining = budget?.data?.remaining;
+      if (budget.response.ok && budget.data?.success === true && remaining && typeof remaining === "object") {
+        const shortWindow = Number(remaining["10s"]);
+        const minuteWindow = Number(remaining.min);
+        const hourWindow = Number(remaining.hour);
+        if ((Number.isFinite(shortWindow) && shortWindow < 6) ||
+            (Number.isFinite(minuteWindow) && minuteWindow < 6) ||
+            (Number.isFinite(hourWindow) && hourWindow < 6)) {
+          const waitMs = Number.isFinite(shortWindow) && shortWindow < 6 ? 11000
+            : Number.isFinite(minuteWindow) && minuteWindow < 6 ? 60000 : 3600000;
+          return { host, port, status: "rate_limited", latency: null, successes: 0, nodes: 0,
+            retryAfterMs: waitMs, error: "سهمیهٔ درخواست Check-Host برای این بازه کافی نیست؛ کمی بعد دوباره تست کنید.",
+            reportUrl: null, providerMethod: "preflight" };
+        }
+      }
+    } catch { /* Continue when the read-only usage endpoint is temporarily unavailable. */ }
+
+    // Primary path: official POST API with no region property, which asks all
+    // available Check-Host nodes instead of the old hard-coded IR-only subset.
+    let started = null;
+    let method = "POST";
+    let postTransportError = "";
+    try {
+      started = await fetchJsonWithTimeout(`${CHECK_HOST_API}/tcp`, 7000, {
+        method: "POST", headers,
+        body: JSON.stringify({ target: host, port: Number(port), timeout: 2500 })
+      });
+    } catch (error) {
+      postTransportError = String(error?.message || error).slice(0, 120);
+    }
+
+    // Check-Host also publishes an official GET shortcut. Use it if POST was
+    // rejected or failed at transport level (except 429, which must not be retried).
+    if (!isValidStart(started) && started?.response?.status !== 429) {
+      try {
+        const getUrl = `${CHECK_HOST_API}/tcp/${encodeURIComponent(host)}/${Number(port)}?timeout=2500`;
+        const fallback = await fetchJsonWithTimeout(getUrl, 7000, {
+          headers: apiKey ? { Authorization: "Bearer " + apiKey } : {}
+        });
+        if (isValidStart(fallback)) { started = fallback; method = "GET"; }
+        else if (!started || fallback.response.status === 429) started = fallback;
+      } catch (error) {
+        if (!started) started = { response: { status: 0, headers: { get: () => "" } }, data: null, bodyText: String(error?.message || error).slice(0, 120) };
+      }
+    }
+
+    if (!isValidStart(started)) {
+      const httpStatus = Number(started?.response?.status) || 0;
       const status = httpStatus === 429 ? "rate_limited" : "error";
-      const reason = shortExternalError(started.data, started.bodyText,
-        httpStatus === 403 ? "سرویس تست دسترسی این درخواست را رد کرد." : "پاسخ نامعتبر از سرویس تست دریافت شد.");
+      const reason = shortExternalError(started?.data, started?.bodyText,
+        httpStatus === 403 ? "دسترسی API رد شد." : postTransportError || "پاسخ معتبر از مسیر POST یا GET برای شروع آزمون دریافت نشد.");
       return {
         host, port, status, latency: null, successes: 0, nodes: 0,
-        retryAfterMs: Math.min(15000, Math.max(1000, Number(started.response.headers.get("retry-after") || 5) * 1000)),
-        error: `سرویس تست بیرونی درخواست را نپذیرفت (HTTP ${httpStatus})${reason ? `: ${reason}` : ""}`,
-        reportUrl: null
+        retryAfterMs: retryDelay(started?.response),
+        error: `Check-Host نتوانست آزمون را شروع کند (HTTP ${httpStatus || "بدون پاسخ"}): ${reason}`,
+        reportUrl: null, providerMethod: method
       };
     }
 
@@ -520,28 +571,33 @@ async function checkHostExternalTcp(host, port, dispatchDelayMs = 0, env = {}) {
       ? started.data.reportURL
       : (/^[a-f0-9-]{30,40}$/i.test(requestId) ? `${CHECK_HOST_WEB}/report/${requestId}` : null);
 
-    // Check-Host reports asynchronously. Continue polling until every currently
-    // returned node has a check, or the bounded polling window expires.
     let reportData = null;
-    const pollDelays = [1000, 1800, 2500, 3000];
+    let lastPollError = "";
+    // Probes can take up to ~10 seconds. Poll beyond that, but keep the wait bounded.
+    const pollDelays = [1500, 2000, 2500, 3000];
     for (const delay of pollDelays) {
       await sleep(delay);
       let poll;
       try {
-        poll = await fetchJsonWithTimeout(apiReportUrl, 3500, {
+        poll = await fetchJsonWithTimeout(apiReportUrl, 3200, {
           headers: apiKey ? { Authorization: "Bearer " + apiKey } : {}
         });
-      } catch { continue; }
+      } catch (error) {
+        lastPollError = String(error?.message || error).slice(0, 100);
+        continue;
+      }
       if (poll.response.status === 429) {
         return { host, port, status: "rate_limited", latency: null, successes: 0, nodes: 0,
-          retryAfterMs: Math.min(15000, Math.max(1000, Number(poll.response.headers.get("retry-after") || 5) * 1000)),
-          error: "سرویس تست بیرونی محدودیت درخواست اعمال کرده است؛ پس از مکث دوباره تلاش کنید.", reportUrl };
+          retryAfterMs: retryDelay(poll.response), error: "محدودیت درخواست Check-Host؛ پس از مکث دوباره آزمون کنید.", reportUrl, providerMethod: method };
       }
       if (poll.response.status === 403) {
         return { host, port, status: "error", latency: null, successes: 0, nodes: 0,
-          error: `خواندن گزارش رد شد (HTTP 403): ${shortExternalError(poll.data, poll.bodyText, "دسترسی رد شد")}`, reportUrl };
+          error: `خواندن گزارش Check-Host رد شد (HTTP 403): ${shortExternalError(poll.data, poll.bodyText, "دسترسی رد شد")}`, reportUrl, providerMethod: method };
       }
-      if (!poll.response.ok || !poll.data || poll.data.success === false) continue;
+      if (!poll.response.ok || !poll.data || poll.data.success === false) {
+        lastPollError = `HTTP ${poll.response.status}`;
+        continue;
+      }
       reportData = poll.data;
       const map = reportData.data && typeof reportData.data === "object" ? reportData.data : {};
       const nodes = Object.values(map);
@@ -551,22 +607,25 @@ async function checkHostExternalTcp(host, port, dispatchDelayMs = 0, env = {}) {
 
     const map = reportData?.data && typeof reportData.data === "object" ? reportData.data : {};
     const entries = Object.entries(map);
+    if (!entries.length) {
+      return { host, port, status: "pending", latency: null, successes: 0, nodes: 0,
+        error: lastPollError ? `آزمون ساخته شد اما گزارش هنوز در دسترس نیست (${lastPollError}).` : "آزمون ساخته شد؛ گزارش گره‌ها هنوز آماده نیست.",
+        reportUrl, providerMethod: method };
+    }
+
     const times = [];
     let successfulNodes = 0, failed = 0, pending = 0;
     const nodeResults = entries.map(([locationName, node]) => {
       const city = [node?.city || node?.country || "گره نامشخص", node?.isp || node?.datacenter || locationName].filter(Boolean).join(" — ");
       const checks = externalChecksArray(node);
-      if (!checks.length) {
-        pending++;
-        return { node: locationName, city, status: "pending", latency: null };
-      }
+      if (!checks.length) { pending++; return { node: locationName, city, status: "pending", latency: null }; }
       const check = checks[0] || {};
       const rawStatus = check.status;
       const statusText = String(rawStatus ?? "").toLowerCase();
       const hasStatus = rawStatus !== null && rawStatus !== undefined && statusText.trim() !== "";
-      const statusCode = hasStatus ? Number(rawStatus) : NaN;
-      const isOk = statusCode === 1 || ["ok", "success", "connected", "open", "true"].includes(statusText);
-      const isFailed = hasStatus && (statusCode === 0 || ["error", "failed", "closed", "timeout", "false"].includes(statusText));
+      const code = hasStatus ? Number(rawStatus) : NaN;
+      const isOk = code === 1 || ["ok", "success", "connected", "open", "true"].includes(statusText);
+      const isFailure = code === 0 || ["error", "failed", "closed", "timeout", "false"].includes(statusText);
       if (isOk) {
         successfulNodes++;
         const rawLatency = check.connectiontime;
@@ -575,29 +634,25 @@ async function checkHostExternalTcp(host, port, dispatchDelayMs = 0, env = {}) {
         if (latency !== null) times.push(latency);
         return { node: locationName, city, status: "ok", latency };
       }
-      if (!isFailed) {
-        pending++;
-        return { node: locationName, city, status: "pending", latency: null };
-      }
+      if (!isFailure) { pending++; return { node: locationName, city, status: "pending", latency: null }; }
       failed++;
-      const nodeError = String(check.errortext || check.error || "اتصال TCP برقرار نشد").slice(0, 160);
-      return { node: locationName, city, status: "error", latency: null, error: nodeError };
+      return { node: locationName, city, status: "error", latency: null, error: String(check.errortext || check.error || "اتصال TCP برقرار نشد").slice(0, 160) };
     });
-
     const avg = times.length ? Math.round(times.reduce((a, b) => a + b, 0) / times.length) : null;
-    const status = successfulNodes > 0 ? "ok" : (pending > 0 || entries.length === 0 ? "pending" : "error");
+    const status = successfulNodes > 0 ? "ok" : pending > 0 ? "pending" : "error";
     return {
       host, port, status, latency: avg, successes: successfulNodes, nodes: entries.length,
       minLatency: times.length ? Math.min(...times) : null,
       maxLatency: times.length ? Math.max(...times) : null,
-      error: status === "error"
-        ? (failed ? "هیچ‌یک از گره‌های فعال Check-Host نتوانست اتصال TCP برقرار کند." : "اتصال TCP ناموفق بود.")
-        : (status === "pending" ? "گزارش هنوز نتیجهٔ کافی ندارد؛ این وضعیت به‌معنای بسته‌بودن پورت نیست. بعداً دوباره تست کنید." : null),
-      reportUrl, failedNodes: failed, pendingNodes: pending, nodeResults
+      error: status === "error" ? (() => {
+        const reasons = nodeResults.filter(node => node.status === "error" && node.error).slice(0, 3).map(node => node.city + ": " + node.error);
+        return "هیچ‌یک از گره‌های پاسخ‌دهنده اتصال TCP برقرار نکردند." + (reasons.length ? " جزئیات: " + reasons.join("؛ ") : "");
+      })() : status === "pending" ? "برخی گره‌ها هنوز پاسخ نداده‌اند؛ نامشخص به‌معنای بسته‌بودن پورت نیست." : null,
+      reportUrl, failedNodes: failed, pendingNodes: pending, nodeResults, providerMethod: method
     };
   } catch (err) {
     return { host, port, status: "error", latency: null, successes: 0, nodes: 0,
-      error: (err && err.name === "AbortError") ? "مهلت ارتباط با سرویس تست بیرونی تمام شد." : `دسترسی به سرویس تست بیرونی ممکن نشد: ${String(err?.message || err).slice(0, 120)}`, reportUrl: null };
+      error: (err && err.name === "AbortError") ? "مهلت ارتباط با Check-Host تمام شد." : `ارتباط با Check-Host ممکن نشد: ${String(err?.message || err).slice(0, 120)}`, reportUrl: null };
   }
 }
 
@@ -617,6 +672,13 @@ function normalizeTcpTestHistoryEntry(item) {
     pendingNodes: Math.max(0, Math.floor(Number(item.pendingNodes) || 0)),
     error: String(item.error || "").slice(0, 180),
     reportUrl: typeof item.reportUrl === "string" && item.reportUrl.startsWith(CHECK_HOST_WEB + "/report/") ? item.reportUrl : null,
+    providerMethod: ["POST", "GET", "preflight"].includes(item.providerMethod) ? item.providerMethod : "unknown",
+    nodeResults: Array.isArray(item.nodeResults) ? item.nodeResults.slice(0, 80).map(node => ({
+      node: String(node.node || "").slice(0, 100), city: String(node.city || "").slice(0, 120),
+      status: ["ok", "error", "pending"].includes(node.status) ? node.status : "pending",
+      latency: node.latency == null ? null : Math.max(0, Math.round(Number(node.latency) || 0)),
+      error: String(node.error || "").slice(0, 160)
+    })) : [],
     checkedAt: Number.isFinite(checkedAt) && checkedAt > 0 ? checkedAt : Date.now()
   };
 }
@@ -673,12 +735,11 @@ async function handleExternalPing(request, kv, env, requestUrl) {
   } catch (err) {
     return json({ error: err.message || "هدف آزمون نامعتبر است", code: "ERR_VALIDATION" }, 400);
   }
-  const results = [];
-  for (let index = 0; index < targets.length; index++) {
-    const target = targets[index];
-    results.push(await checkHostExternalTcp(target.host, target.port, 0, env));
-    if (index < targets.length - 1) await sleep(5000);
-  }
+  // Up to three starts are staggered to stay below the provider's anonymous
+  // burst threshold, while report polling remains parallel to avoid long Worker requests.
+  const results = await Promise.all(targets.map((target, index) =>
+    checkHostExternalTcp(target.host, target.port, index * 1100, env)
+  ));
   const stampedResults = await appendTcpTestHistory(kv, results);
   const byKey = new Map(stampedResults.map(item => [`${item.host}|${item.port}`, item]));
   const resultsWithTime = results.map(item => ({ ...item, checkedAt: byKey.get(`${item.host}|${item.port}`)?.checkedAt || Date.now() }));
@@ -1182,9 +1243,62 @@ async function saveUserUsage(kv, userId, usage) {
   await kv.put(USER_USAGE_PREFIX + userId, JSON.stringify(usage));
 }
 
+function normalizeAdminUsage(raw = {}) {
+  return {
+    usageBytes: Math.max(0, Number(raw.usageBytes) || 0),
+    requestCount: Math.max(0, Math.floor(Number(raw.requestCount) || 0)),
+    dailyStats: normalizeDailyUsageStats(raw.dailyStats),
+    firstConnectedAt: Math.max(0, Number(raw.firstConnectedAt) || 0),
+    lastConnectedAt: Math.max(0, Number(raw.lastConnectedAt) || 0),
+    periodStartedAt: Math.max(0, Number(raw.periodStartedAt) || Date.now()),
+    unlimited: true
+  };
+}
+
+async function getAdminUsage(kv) {
+  if (!kv) return normalizeAdminUsage();
+  const raw = readKvJson(await kv.get(ADMIN_USAGE_KEY, { type: "json" }));
+  return normalizeAdminUsage(raw || {});
+}
+
+async function saveAdminUsage(kv, usage) {
+  if (!kv) return;
+  await kv.put(ADMIN_USAGE_KEY, JSON.stringify(normalizeAdminUsage(usage)));
+}
+
+async function addAdminTraffic(kv, amount, dailyDeltas = null) {
+  if (!kv || !Number.isFinite(amount) || amount <= 0) return null;
+  return withUserUsageLock("default", async () => {
+    const usage = await getAdminUsage(kv);
+    const acceptedAmount = Math.floor(amount);
+    usage.usageBytes += acceptedAmount;
+    const deltas = dailyDeltas && typeof dailyDeltas === "object" ? dailyDeltas : { [utcUsageDayKey()]: acceptedAmount };
+    let dailyTotal = 0;
+    for (const [day, rawBytes] of Object.entries(deltas)) {
+      const bytes = Math.max(0, Math.floor(Number(rawBytes) || 0));
+      if (!bytes) continue;
+      addDailyUsage(usage, day, 0, bytes);
+      dailyTotal += bytes;
+    }
+    if (dailyTotal < acceptedAmount) addDailyUsage(usage, utcUsageDayKey(), 0, acceptedAmount - dailyTotal);
+    await saveAdminUsage(kv, usage);
+    const local = userTrafficState.get("default");
+    if (local && local.periodStartedAt === Number(usage.periodStartedAt || 0)) local.usageBytes = Math.max(local.usageBytes, usage.usageBytes);
+    return usage;
+  });
+}
+
 async function attachUserUsage(settings, kv) {
-  if (!Array.isArray(settings.users) || !settings.users.length) return settings;
-  settings.users = await Promise.all(settings.users.map(async user => {
+  const adminUsage = kv ? await getAdminUsage(kv) : normalizeAdminUsage();
+  const adminLocal = getLocalUserTrafficState("default", adminUsage);
+  settings.adminUsage = {
+    ...adminUsage,
+    usageBytes: Math.max(Number(adminUsage.usageBytes) || 0, adminLocal.usageBytes),
+    activeConnections: userActiveConnections.get("default") || 0,
+    unlimited: true
+  };
+  const users = Array.isArray(settings.users) ? settings.users : [];
+  settings.users = await Promise.all(users.map(async user => {
     const usage = kv ? await getUserUsage(kv, user) : defaultUserUsage(user);
     const localTraffic = getLocalUserTrafficState(user.id, usage);
     return { ...user, ...usage, usageBytes: Math.max(Number(usage.usageBytes) || 0, localTraffic.usageBytes), activeConnections: userActiveConnections.get(user.id) || 0 };
@@ -1204,9 +1318,8 @@ function getUserAccessError(user, usage, now = Date.now()) {
 async function beginUserSession(kv, candidate) {
   if (!candidate) throw new Error("اعتبارنامه نامعتبر است.");
   if (candidate.id === "default") {
-    // Re-read root credentials immediately before accepting the session. KV is
-    // eventually consistent across locations, but this prevents stale snapshots
-    // within the current Worker isolate after a local credential rotation.
+    // The administrator is unlimited, but is still measured exactly like a user.
+    // Re-read credentials before accepting the tunnel to reject rotated secrets.
     if (kv) {
       const latest = readKvJson(await kv.get(SETTINGS_KEY, { type: "json" }));
       if (!latest) throw new Error("تنظیمات اصلی در دسترس نیست.");
@@ -1216,8 +1329,20 @@ async function beginUserSession(kv, candidate) {
       if (candidate.trojanPassword && String(latest.trojanPassword || "") !== String(candidate.trojanPassword)) {
         throw new Error("رمز Trojan اصلی قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
       }
+      return withUserUsageLock("default", async () => {
+        const usage = await getAdminUsage(kv);
+        const trafficState = getLocalUserTrafficState("default", usage);
+        usage.usageBytes = Math.max(Number(usage.usageBytes) || 0, trafficState.usageBytes);
+        usage.requestCount++;
+        usage.lastConnectedAt = Date.now();
+        if (!usage.firstConnectedAt) usage.firstConnectedAt = Date.now();
+        addDailyUsage(usage, utcUsageDayKey(), 1, 0);
+        await saveAdminUsage(kv, usage);
+        userActiveConnections.set("default", (userActiveConnections.get("default") || 0) + 1);
+        return { user: candidate, usage, trafficState, tracked: true };
+      });
     }
-    return { user: candidate, usage: null, tracked: false };
+    return { user: candidate, usage: normalizeAdminUsage(), trafficState: getLocalUserTrafficState("default", normalizeAdminUsage()), tracked: false };
   }
   if (!kv) throw new Error("مدیریت کاربر به KV نیاز دارد.");
   const id = String(candidate.id);
@@ -2223,14 +2348,14 @@ async function handleTunnel(request, env, kv, kind, ctx) {
   const userSessionDailyBytes = new Map();
 
   const queueUserTrafficFlush = (force = false) => {
-    if (!activeUser || activeUser.id === "default" || !kv) return userTrafficPersistChain;
+    if (!activeUser || !kv) return userTrafficPersistChain;
     const pending = Math.max(0, userSessionBytes - userSessionPersistedBytes);
     if (!pending || (!force && pending < USER_TRAFFIC_FLUSH_BYTES)) return userTrafficPersistChain;
     const id = String(activeUser.id);
     const dailyDeltas = Object.fromEntries(userSessionDailyBytes.entries());
     userSessionDailyBytes.clear();
     userSessionPersistedBytes += pending;
-    userTrafficPersistChain = userTrafficPersistChain.then(() => addUserTraffic(kv, id, pending, dailyDeltas)).catch(err => {
+    userTrafficPersistChain = userTrafficPersistChain.then(() => id === "default" ? addAdminTraffic(kv, pending, dailyDeltas) : addUserTraffic(kv, id, pending, dailyDeltas)).catch(err => {
       userSessionPersistedBytes = Math.max(0, userSessionPersistedBytes - pending);
       for (const [day, bytes] of Object.entries(dailyDeltas)) userSessionDailyBytes.set(day, (userSessionDailyBytes.get(day) || 0) + bytes);
       console.warn("User usage persistence failed:", String(err?.message || err).slice(0, 120));
@@ -2246,11 +2371,9 @@ async function handleTunnel(request, env, kv, kind, ctx) {
     if (!activeUser) return Promise.resolve();
     const id = String(activeUser.id || "default");
     unregisterUserConnection(id, closeAll);
-    if (id !== "default") {
-      const count = userActiveConnections.get(id) || 0;
-      if (count <= 1) userActiveConnections.delete(id); else userActiveConnections.set(id, count - 1);
-      if (userSessionBytes > 0 && kv) releasePromise = queueUserTrafficFlush(true);
-    }
+    const count = userActiveConnections.get(id) || 0;
+    if (count <= 1) userActiveConnections.delete(id); else userActiveConnections.set(id, count - 1);
+    if (userSessionBytes > 0 && kv) releasePromise = queueUserTrafficFlush(true);
     return releasePromise || Promise.resolve();
   };
 
@@ -2265,9 +2388,9 @@ async function handleTunnel(request, env, kv, kind, ctx) {
   };
 
   const recordTraffic = amount => {
-    if (!activeUser || activeUser.id === "default" || !userUsageAtStart || !userTrafficLedger || !Number.isFinite(amount) || amount <= 0) return true;
+    if (!activeUser || !userUsageAtStart || !userTrafficLedger || !Number.isFinite(amount) || amount <= 0) return true;
     const current = Math.floor(amount);
-    const limitBytes = Number(activeUser.trafficLimitGB) > 0 ? Number(activeUser.trafficLimitGB) * 1024 * 1024 * 1024 : 0;
+    const limitBytes = activeUser.id === "default" ? 0 : (Number(activeUser.trafficLimitGB) > 0 ? Number(activeUser.trafficLimitGB) * 1024 * 1024 * 1024 : 0);
     const remaining = limitBytes > 0 ? Math.max(0, limitBytes - Number(userTrafficLedger.usageBytes || 0)) : current;
     const accepted = Math.min(current, remaining);
     if (accepted > 0) {
@@ -2375,7 +2498,7 @@ async function handleTunnel(request, env, kv, kind, ctx) {
       activeUser = session.user;
       userUsageAtStart = session.usage;
       userTrafficLedger = session.trafficState || null;
-      if (activeUser.id !== "default") userUsageFlushTimer = setInterval(() => { void queueUserTrafficFlush(true); }, 5000);
+      userUsageFlushTimer = setInterval(() => { void queueUserTrafficFlush(true); }, 5000);
       activeSettings = userScopedSettings(authSettings, activeUser);
       registerUserConnection(activeUser.id || "default", closeAll);
       if (kind === "vless" && !activeSettings.vlessEnabled) throw new Error("VLESS is disabled for this user");
@@ -2807,7 +2930,7 @@ body {
 /* Inputs & Fields */
 .field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 14px; position: relative; }
 .field label { font-size: 12px; color: var(--muted); font-weight: 600; }
-.field input, .field select, .field textarea, .port-add-row input, .user-search {
+.field input, .field select, .field textarea, .port-add-row input {
   width: 100%;
   background: rgba(15, 21, 53, 0.9);
   border: 1px solid rgba(226, 232, 240, 0.2);
@@ -2819,7 +2942,7 @@ body {
   text-align: left;
   transition: all 0.2s ease;
 }
-.field input:focus, .field select:focus, .field textarea:focus, .port-add-row input:focus, .user-search:focus {
+.field input:focus, .field select:focus, .field textarea:focus, .port-add-row input:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(0, 117, 255, 0.28);
@@ -2963,15 +3086,6 @@ header.topbar {
 .breadcrumb-wrap small b { color: #fff; font-weight: 600; }
 header.topbar h2 { margin: 2px 0 0; font-size: 18px; font-weight: 800; color: #fff; }
 .topbar-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.topbar-search {
-  display: flex; align-items: center; gap: 8px;
-  background: #0f1535; border: 1px solid rgba(226, 232, 240, 0.2);
-  border-radius: 14px; padding: 7px 12px; min-width: 190px;
-}
-.topbar-search svg { width: 15px; height: 15px; stroke: var(--muted); fill: none; stroke-width: 2; }
-.topbar-search input {
-  background: transparent; border: 0; color: #fff; font-size: 12px; outline: none; width: 100%; direction: ltr;
-}
 .topbar-status {
   display: inline-flex; align-items: center; gap: 7px;
   color: #e2e8f0; font-size: 12px; font-weight: 700; padding: 6px 10px;
@@ -3179,6 +3293,23 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
 .daily-chart-bar { display:block; width:100%; min-height:2px; border-radius:9px; background:linear-gradient(180deg,#22d3ee,#2563eb); transition:height .25s ease; }
 .daily-chart-column[data-kind="connections"] .daily-chart-bar { background:linear-gradient(180deg,#a78bfa,#4f46e5); }
 .daily-chart-label { font-size:10px; color:var(--muted); white-space:nowrap; }
+.account-usage-chart { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(76px,1fr); align-items:end; gap:10px; height:220px; padding:12px 4px 4px; overflow-x:auto; direction:ltr; }
+.account-chart-column { display:flex; height:100%; min-width:0; flex-direction:column; align-items:center; justify-content:flex-end; gap:6px; }
+.account-chart-track { width:100%; max-width:38px; height:145px; display:flex; align-items:flex-end; overflow:hidden; border-radius:9px; background:rgba(148,163,184,.09); }
+.account-chart-bar { display:block; width:100%; min-height:2px; border-radius:9px; background:linear-gradient(180deg,#38bdf8,#2563eb); }
+.account-chart-name { max-width:90px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10px; color:var(--muted); }
+.user-links-usage { width:100%; flex:1 1 100%; min-width:0; box-sizing:border-box; margin-top:8px; padding:9px 10px; border:1px solid rgba(56,189,248,.22); border-radius:11px; background:rgba(7,13,39,.4); }
+.user-links-title { display:block; font-size:11px; font-weight:700; color:#bfdbfe; }
+.user-link-list { display:flex; flex-wrap:wrap; gap:7px; margin:8px 0; }
+.user-link-list a { color:#7dd3fc; font-size:11px; text-decoration:underline; overflow-wrap:anywhere; }
+.user-total-usage { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; font-size:10px; color:var(--muted); }
+.user-total-usage strong { display:block; color:#fff; font-size:12px; margin-top:3px; direction:ltr; }
+.usage-summary-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:14px; }
+.usage-summary-card { min-width:0; padding:14px; border:1px solid var(--border); border-radius:15px; background:rgba(15,21,53,.58); }
+.usage-summary-card span { display:block; color:var(--muted); font-size:11px; }
+.usage-summary-card strong { display:block; font-size:20px; color:#fff; margin-top:5px; overflow-wrap:anywhere; }
+.usage-table .admin-row { background:rgba(0,117,255,.08); }
+
 .status-msg {
   position: fixed; bottom: 24px; left: 24px; z-index: 9999;
   padding: 13px 20px; border-radius: 14px; font-size: 13px; font-weight: 700;
@@ -3192,6 +3323,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
   .user-form-grid, .user-toggle-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media(max-width: 900px) {
+  .usage-summary-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .app-layout { display: block; width: 100%; padding: 10px; }
   aside { position: sticky; top: 6px; right: auto; bottom: auto; width: 100%; height: auto; inset: auto; margin: 0 0 12px; padding: 10px; z-index: 100; }
   .menu { direction: rtl; flex-direction: row; overflow-x: auto; overflow-y: hidden; gap: 6px; padding: 2px 0 4px; scroll-snap-type: x proximity; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
@@ -3202,15 +3334,16 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
   .grid-2, .random-clean-tools { grid-template-columns: 1fr; }
 }
 @media(max-width: 600px) {
+  .usage-summary-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; }
+  .usage-summary-card { padding:10px; }
+  .usage-summary-card strong { font-size:16px; }
   #sec-dashboard.panel-section.active { display:flex; flex-direction:column; }
-  #sec-dashboard > .vision-kpi-grid { order:1; }
-  #sec-dashboard > .cloud-usage-strip { order:2; }
-  #sec-dashboard > .vision-charts-row { order:3; }
-  #sec-dashboard > .vision-bento-row { order:4; }
-  #sec-dashboard > .vision-bottom-row { order:5; }
+  #sec-dashboard > .vision-bento-row { order:1; }
+  #sec-dashboard > .vision-kpi-grid { order:2; }
+  #sec-dashboard > .cloud-usage-strip { order:3; }
+  #sec-dashboard > .vision-bottom-row { order:4; }
   #sec-dashboard > .vision-kpi-grid,
   #sec-dashboard > .cloud-usage-strip,
-  #sec-dashboard > .vision-charts-row,
   #sec-dashboard > .vision-bento-row,
   #sec-dashboard > .vision-bottom-row { width:100%; min-width:0; }
   .app-layout { padding: 7px; }
@@ -3221,8 +3354,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
   .menu-item .nav-icon { width: 25px; height: 25px; flex-basis: 25px; border-radius: 8px; }
   main { padding: 2px; }
   header.topbar { display:flex; flex-direction:column; align-items:stretch; gap:8px; margin-bottom:12px; }
-  .topbar-tools { display:grid; grid-template-columns:minmax(0,1fr) auto auto; width:100%; gap:7px; }
-  .topbar-search { min-width:0; width:100%; grid-column:1 / -1; }
+  .topbar-tools { display:grid; grid-template-columns:1fr 1fr; width:100%; gap:7px; }
   .topbar-status { display:none; }
   .vision-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px; }
   .vision-kpi-card { padding: 11px; gap: 6px; border-radius: 14px; }
@@ -3252,21 +3384,23 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
   .user-form-actions button { flex:1; }
   .section-head { align-items:stretch; }
   .toolbar-actions { width:100%; }
-  .toolbar-actions .user-search { flex:1; min-width:0; }
   .table-wrap { max-width:100%; }
   .table-wrap table { min-width:640px; }
   .vision-bottom-row > .card { min-width:0; }
   .vision-charts-row > .card { min-width:0; }
   .daily-chart { grid-template-columns:repeat(7,minmax(0,1fr)); }
-  .users-table { background:transparent; }
+  .users-table { min-width:0 !important; width:100%; table-layout:fixed; background:transparent; }
+  .table-wrap .users-table { min-width:0 !important; }
   .users-table thead { display:none; }
-  .users-table, .users-table tbody, .users-table tr, .users-table td { display:block; width:100%; }
-  .users-table tr { border:1px solid var(--border); border-radius:13px; margin:8px 0; padding:8px; background:rgba(10,14,35,.55); }
-  .users-table td { border:0; padding:7px 5px; min-width:0; }
+  .users-table, .users-table tbody { display:block !important; width:100%; height:auto !important; }
+  .users-table tr { display:flex !important; flex-direction:column !important; align-items:stretch; width:100%; height:auto !important; min-height:0 !important; border:1px solid var(--border); border-radius:13px; margin:8px 0; padding:8px; background:rgba(10,14,35,.55); }
+  .users-table td { display:block !important; width:100% !important; height:auto !important; min-height:0 !important; border:0; padding:7px 5px; min-width:0; }
   .users-table td::before { content:attr(data-label); display:block; margin-bottom:4px; color:var(--muted); font-size:10px; }
-  .users-table td.user-actions { display:flex; flex-wrap:wrap; gap:6px; }
-  .users-table td.user-actions::before { width:100%; }
-  .user-actions button { white-space:normal; flex:1 1 42%; }
+  .users-table td.user-actions { display:flex !important; flex-direction:row; flex-wrap:wrap; align-items:flex-start; gap:6px; }
+  .users-table td.user-actions::before { width:100%; flex:1 0 100%; }
+  .user-actions button { white-space:normal; flex:1 1 calc(50% - 6px); min-width:0; }
+  .user-actions .user-links-usage { display:block; flex:1 1 100%; width:100%; max-width:100%; }
+  .user-total-usage { grid-template-columns:1fr 1fr; }
   .user-usage-cell { min-width:0; }
   .status-msg { left:8px; right:8px; bottom:8px; text-align:center; }
 }
@@ -3276,7 +3410,6 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
   .vision-kpi-info span { font-size:9px; }
   .vision-kpi-icon { width:28px; height:28px; flex-basis:28px; }
   .topbar-tools { grid-template-columns:1fr 1fr; }
-  .topbar-search { grid-column:1 / -1; }
   .user-actions button { flex-basis:100%; }
   .welcome-content { max-width:100%; }
   .jellyfish-art { opacity:.12; }
@@ -3317,9 +3450,10 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
     </div>
     <div class="menu">
       <div class="menu-item active" data-target="sec-dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg></span><span>داشبورد (Dashboard)</span></div>
-      <div class="menu-item" data-target="sec-users"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M16 20v-1.5a4.5 4.5 0 0 0-4.5-4.5h-3A4.5 4.5 0 0 0 4 18.5V20"/><circle cx="10" cy="7" r="3.5"/><path d="M17 11a3.5 3.5 0 0 0 0-7"/></svg></span><span>کاربران (Tables)</span></div>
+      <div class="menu-item" data-target="sec-users"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M16 20v-1.5a4.5 4.5 0 0 0-4.5-4.5h-3A4.5 4.5 0 0 0 4 18.5V20"/><circle cx="10" cy="7" r="3.5"/><path d="M17 11a3.5 3.5 0 0 0 0-7"/></svg></span><span>کاربران</span></div>
+      <div class="menu-item" data-target="sec-usage"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V5m0 14h17M8 16v-5m4 5V7m4 9v-8m4 8v-4"/></svg></span><span>میزان اتصالات</span></div>
       <div class="menu-item" data-target="sec-cleanip"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/></svg></span><span>Clean IP (Billing)</span></div>
-      <div class="menu-item" data-target="sec-settings"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span><span>پروتکل‌ها (RTL)</span></div>
+      <div class="menu-item" data-target="sec-settings"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span><span>پروتکل‌ها</span></div>
       <div class="menu-divider">ACCOUNT PAGES</div>
       <div class="menu-item" data-target="sec-mainsettings"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></span><span>تنظیمات اصلی (Profile)</span></div>
       <div class="menu-item" data-target="sec-outputs"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg></span><span>خروجی‌ها (Outputs)</span></div>
@@ -3339,10 +3473,6 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
         <h2 id="pageTitle">داشبورد</h2>
       </div>
       <div class="topbar-tools">
-        <div class="topbar-search">
-          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
-          <input type="search" id="topQuickSearch" placeholder="جست‌وجو در کاربران" aria-label="جست‌وجو در پنل">
-        </div>
         <span class="topbar-status"><i></i> Sign In · Active</span>
         <button type="button" class="secondary" id="refreshPanelBtn" style="padding:7px 13px;font-size:12px;">بازخوانی</button>
         <button type="button" class="secondary" id="logoutBtn" style="padding:7px 13px;font-size:12px;">خروج</button>
@@ -3350,6 +3480,37 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
     </header>
 
     <section id="sec-dashboard" class="panel-section active">
+      <!-- Row 2: Welcome + live configuration summary -->
+      <div class="vision-bento-row">
+        <div class="card welcome-jelly-card">
+          <div class="welcome-content">
+            <div>
+              <span class="welcome-tag">پنل مدیریت</span>
+              <div class="welcome-title" id="heroWelcomeUser">admin</div>
+              <p class="welcome-desc">وضعیت کانفیگ‌ها، مصرف کاربران و تست TCP را از همین داشبورد دنبال کنید.</p>
+            </div>
+            <button type="button" class="welcome-link" onclick="switchTab('sec-outputs')">مشاهده خروجی‌ها ←</button>
+          </div>
+          <svg class="jellyfish-art" viewBox="0 0 260 260" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <defs>
+              <radialGradient id="jellyBell" cx="50%" cy="38%" r="55%"><stop offset="0%" stop-color="#f0abfc"/><stop offset="45%" stop-color="#8b5cf6"/><stop offset="85%" stop-color="#0075ff"/><stop offset="100%" stop-color="#060b26" stop-opacity="0"/></radialGradient>
+              <linearGradient id="tentacleGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#c084fc" stop-opacity="0.9"/><stop offset="60%" stop-color="#38bdf8" stop-opacity="0.65"/><stop offset="100%" stop-color="#0075ff" stop-opacity="0"/></linearGradient>
+            </defs>
+            <ellipse cx="135" cy="95" rx="88" ry="52" fill="url(#jellyBell)" stroke="rgba(240,171,252,0.55)" stroke-width="1.5"/>
+            <path d="M85 118 C75 160, 95 195, 70 245 M105 122 C98 165, 118 202, 96 250 M126 125 C120 172, 142 208, 122 254 M148 124 C142 170, 165 205, 148 250 M170 120 C166 164, 185 198, 172 242" stroke="url(#tentacleGrad)" stroke-width="3" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="card live-network-card">
+          <h2>خلاصهٔ تنظیمات فعال</h2>
+          <div class="live-network-metrics">
+            <div><span>پروتکل‌های فعال</span><strong id="dashProtocolCount">0</strong></div>
+            <div><span>مسیرهای اتصال</span><strong id="dashEndpointCount">0</strong></div>
+            <div><span>پورت‌های فعال</span><strong id="dashPortsCount">0</strong></div>
+          </div>
+          <p class="small-note">تعداد کانفیگ‌ها بر اساس ترکیب واقعی پروتکل، مسیر اتصال و پورت‌های فعال محاسبه می‌شود.</p>
+        </div>
+      </div>
+
       <!-- Row 1: 4 Vision UI KPI Cards -->
       <div class="vision-kpi-grid">
         <div class="vision-kpi-card">
@@ -3385,58 +3546,11 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
       <div class="cloud-usage-strip">
         <div class="cloud-usage-card">
           <div class="cloud-usage-symbol">↗</div>
-          <div><span>اتصال‌های ثبت‌شدهٔ ساب‌کاربران</span><strong id="dashCloudRequests">0</strong><small>تعداد نشست‌های تونل ثبت‌شده در دوره مصرف</small></div>
+          <div><span>اتصال‌های ثبت‌شدهٔ مدیر و ساب‌کاربران</span><strong id="dashCloudRequests">0</strong><small>تعداد نشست‌های تونل ثبت‌شده در دوره مصرف</small></div>
         </div>
         <div class="cloud-usage-card traffic">
           <div class="cloud-usage-symbol">⇅</div>
-          <div><span>مجموع دادهٔ مصرفی</span><strong id="dashTrafficUsage">0 KB</strong><small>جمع بایت‌های ارسال و دریافت‌شده از تونل کاربران</small></div>
-        </div>
-      </div>
-
-      <!-- Row 2: Welcome + live configuration summary -->
-      <div class="vision-bento-row">
-        <div class="card welcome-jelly-card">
-          <div class="welcome-content">
-            <div>
-              <span class="welcome-tag">پنل مدیریت</span>
-              <div class="welcome-title" id="heroWelcomeUser">admin</div>
-              <p class="welcome-desc">وضعیت کانفیگ‌ها، مصرف کاربران و تست TCP را از همین داشبورد دنبال کنید.</p>
-            </div>
-            <button type="button" class="welcome-link" onclick="switchTab('sec-outputs')">مشاهده خروجی‌ها ←</button>
-          </div>
-          <svg class="jellyfish-art" viewBox="0 0 260 260" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <defs>
-              <radialGradient id="jellyBell" cx="50%" cy="38%" r="55%"><stop offset="0%" stop-color="#f0abfc"/><stop offset="45%" stop-color="#8b5cf6"/><stop offset="85%" stop-color="#0075ff"/><stop offset="100%" stop-color="#060b26" stop-opacity="0"/></radialGradient>
-              <linearGradient id="tentacleGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#c084fc" stop-opacity="0.9"/><stop offset="60%" stop-color="#38bdf8" stop-opacity="0.65"/><stop offset="100%" stop-color="#0075ff" stop-opacity="0"/></linearGradient>
-            </defs>
-            <ellipse cx="135" cy="95" rx="88" ry="52" fill="url(#jellyBell)" stroke="rgba(240,171,252,0.55)" stroke-width="1.5"/>
-            <path d="M85 118 C75 160, 95 195, 70 245 M105 122 C98 165, 118 202, 96 250 M126 125 C120 172, 142 208, 122 254 M148 124 C142 170, 165 205, 148 250 M170 120 C166 164, 185 198, 172 242" stroke="url(#tentacleGrad)" stroke-width="3" stroke-linecap="round"/>
-          </svg>
-        </div>
-        <div class="card live-network-card">
-          <h2>خلاصهٔ تنظیمات فعال</h2>
-          <div class="live-network-metrics">
-            <div><span>پروتکل‌های فعال</span><strong id="dashProtocolCount">0</strong></div>
-            <div><span>مسیرهای اتصال</span><strong id="dashEndpointCount">0</strong></div>
-            <div><span>پورت‌های فعال</span><strong id="dashPortsCount">0</strong></div>
-          </div>
-          <p class="small-note">تعداد کانفیگ‌ها بر اساس ترکیب واقعی پروتکل، مسیر اتصال و پورت‌های فعال محاسبه می‌شود.</p>
-        </div>
-      </div>
-
-      <!-- Row 3: real daily usage + connection history -->
-      <div class="vision-charts-row">
-        <div class="card analytics-card">
-          <div class="section-head"><div><h2>مصرف روزانهٔ داده</h2><p class="small-note">مجموع ارسال و دریافت ساب‌کاربران · بر اساس تاریخچهٔ روزانهٔ ذخیره‌شده</p></div><strong id="dailyUsageTotal" class="analytics-total">0 B</strong></div>
-          <div id="dailyUsageChart" class="daily-chart" aria-label="نمودار مصرف روزانه"></div>
-        </div>
-        <div class="card analytics-card">
-          <div class="section-head"><div><h2>اتصال‌های روزانه</h2><p class="small-note">تعداد نشست‌های جدید ساب‌کاربران · بر اساس تاریخچهٔ روزانهٔ ذخیره‌شده</p></div><strong id="dailyConnectionsTotal" class="analytics-total">0</strong></div>
-          <div id="dailyConnectionsChart" class="daily-chart" aria-label="نمودار اتصال‌های روزانه"></div>
-        </div>
-        <div class="card analytics-card">
-          <div class="section-head"><div><h2>تست‌های TCP روزانه</h2><p class="small-note">هر نوبت آزمون TCP · حداکثر ۵۰۰ نتیجهٔ اخیر</p></div><strong id="dailyTcpTotal" class="analytics-total">0</strong></div>
-          <div id="dailyTcpChart" class="daily-chart" aria-label="نمودار تست‌های روزانهٔ TCP"></div>
+          <div><span>مجموع دادهٔ مصرفی</span><strong id="dashTrafficUsage">0 KB</strong><small>جمع بایت‌های ارسال و دریافت‌شده از تونل مدیر و ساب‌کاربران</small></div>
         </div>
       </div>
 
@@ -3476,6 +3590,41 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
       </div>
     </section>
 
+    <section id="sec-usage" class="panel-section">
+      <div class="usage-summary-grid">
+        <div class="usage-summary-card"><span>مصرف مدیر · نامحدود</span><strong id="usageAdminTotal">0 B</strong></div>
+        <div class="usage-summary-card"><span>مصرف کل مدیر و کاربران</span><strong id="usageTotalBytes">0 B</strong></div>
+        <div class="usage-summary-card"><span>مجموع نشست‌های ثبت‌شده</span><strong id="usageRequestTotal">0</strong></div>
+        <div class="usage-summary-card"><span>اتصال‌های هم‌زمان فعلی</span><strong id="usageActiveCount">0</strong></div>
+      </div>
+      <!-- Row 3: real daily usage + connection history -->
+      <div class="vision-charts-row">
+        <div class="card analytics-card">
+          <div class="section-head"><div><h2>مصرف روزانهٔ داده</h2><p class="small-note">مجموع ارسال و دریافت مدیر و ساب‌کاربران · بر اساس تاریخچهٔ روزانهٔ ذخیره‌شده</p></div><strong id="dailyUsageTotal" class="analytics-total">0 B</strong></div>
+          <div id="dailyUsageChart" class="daily-chart" aria-label="نمودار مصرف روزانه"></div>
+        </div>
+        <div class="card analytics-card">
+          <div class="section-head"><div><h2>اتصال‌های روزانه</h2><p class="small-note">تعداد نشست‌های جدید مدیر و ساب‌کاربران · بر اساس تاریخچهٔ روزانهٔ ذخیره‌شده</p></div><strong id="dailyConnectionsTotal" class="analytics-total">0</strong></div>
+          <div id="dailyConnectionsChart" class="daily-chart" aria-label="نمودار اتصال‌های روزانه"></div>
+        </div>
+        <div class="card analytics-card">
+          <div class="section-head"><div><h2>تست‌های TCP روزانه</h2><p class="small-note">هر نوبت آزمون TCP · حداکثر ۵۰۰ نتیجهٔ اخیر</p></div><strong id="dailyTcpTotal" class="analytics-total">0</strong></div>
+          <div id="dailyTcpChart" class="daily-chart" aria-label="نمودار تست‌های روزانهٔ TCP"></div>
+        </div>
+      </div>
+
+      <div class="vision-charts-row" style="grid-template-columns:1fr;">
+        <div class="card analytics-card">
+          <div class="section-head"><div><h2>مقایسهٔ مصرف هر حساب</h2><p class="small-note">نمودار ستونی عمودی؛ مدیر بدون سقف حجم در کنار تمام ساب‌کاربران</p></div></div>
+          <div id="usageByAccountChart" class="account-usage-chart" aria-label="نمودار ستونی مصرف هر حساب"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:14px;">
+        <div class="section-head"><div><h2>جدول مصرف و اتصال حساب‌ها</h2><p class="small-note">مقادیر مدیر و ساب‌کاربران از دفتر مصرف ذخیره‌شده در KV خوانده می‌شوند.</p></div></div>
+        <div class="table-wrap"><table class="usage-table"><thead><tr><th>حساب</th><th>مجموع مصرف</th><th>نشست‌ها</th><th>اتصال هم‌زمان</th><th>محدودیت</th></tr></thead><tbody id="usageAccountTable"><tr><td colspan="5">در حال بارگذاری آمار...</td></tr></tbody></table></div>
+      </div>
+    </section>
+
     <section id="sec-users" class="panel-section">
       <div class="card">
         <div class="section-head"><div><h2 id="userEditorTitle">افزودن کاربر جدید</h2><p class="small-note">فیلدهای خالی اعتبارنامه به‌صورت امن تولید می‌شوند؛ توکن اشتراک را فقط با همان کاربر به اشتراک بگذارید.</p></div><span class="pill">حداکثر ۵۰ کاربر</span></div>
@@ -3488,7 +3637,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
         <div class="user-form-actions"><button type="button" id="userSaveBtn">ذخیره کاربر</button><button type="button" class="secondary" id="userClearBtn">پاک‌کردن فرم</button></div>
       </div>
       <div class="card" style="margin-top:18px;">
-        <div class="section-head"><div><h2>فهرست کاربران</h2><p class="small-note">مدیریت اعتبارنامه، لینک‌های اشتراک، حجم مصرفی و وضعیت هر حساب به‌صورت مستقل.</p></div><div class="toolbar-actions"><input type="search" id="userSearchInput" class="user-search" placeholder="جست‌وجوی نام یا شناسه کاربر"><button type="button" id="userNewBtn">کاربر جدید</button><button type="button" class="secondary" id="userRefreshBtn">بازخوانی اطلاعات</button></div></div>
+        <div class="section-head"><div><h2>فهرست کاربران</h2><p class="small-note">مدیریت اعتبارنامه، لینک‌های اشتراک، حجم مصرفی و وضعیت هر حساب به‌صورت مستقل.</p></div><div class="toolbar-actions"><button type="button" id="userNewBtn">کاربر جدید</button><button type="button" class="secondary" id="userRefreshBtn">بازخوانی اطلاعات</button></div></div>
         <div class="table-wrap"><table class="users-table"><thead><tr><th>ساب‌کاربر</th><th>میزان مصرف</th><th>عملیات</th></tr></thead><tbody id="userTableBody"><tr><td colspan="3" style="text-align:center">هنوز کاربری تعریف نشده است.</td></tr></tbody></table></div>
       </div>
     </section>
@@ -3678,6 +3827,7 @@ const ERROR_DICT = {
 
 const TAB_TITLES = {
   'sec-dashboard': 'داشبورد',
+  'sec-usage': 'میزان اتصالات',
   'sec-mainsettings': 'تنظیمات اصلی',
   'sec-settings': 'تنظیمات پروتکل',
   'sec-users': 'مدیریت کاربران',
@@ -3705,14 +3855,6 @@ function switchTab(targetId) {
 
 document.querySelectorAll('.menu-item').forEach(item => {
   item.onclick = () => switchTab(item.getAttribute('data-target'));
-});
-
-$('topQuickSearch')?.addEventListener('input', e => {
-  const q = String(e.target.value || '').trim();
-  if ($('userSearchInput')) {
-    $('userSearchInput').value = q;
-    renderUsers();
-  }
 });
 
 async function api(path, opts = {}) {
@@ -3767,13 +3909,16 @@ $('refreshPanelBtn')?.addEventListener('click', async () => {
   finally { if (button) { button.disabled = false; button.textContent = 'بازخوانی'; } }
 });
 
-function updateCloudUsageMetrics(users) {
+function updateCloudUsageMetrics(users, adminUsage = globalSettings.adminUsage || {}) {
   const list = Array.isArray(users) ? users : [];
-  const requests = list.reduce((total, user) => total + Math.max(0, Number(user.requestCount) || 0), 0);
-  const bytes = list.reduce((total, user) => total + Math.max(0, Number(user.usageBytes) || 0), 0);
+  const adminRequests = Math.max(0, Number(adminUsage.requestCount) || 0);
+  const adminBytes = Math.max(0, Number(adminUsage.usageBytes) || 0);
+  const requests = adminRequests + list.reduce((total, user) => total + Math.max(0, Number(user.requestCount) || 0), 0);
+  const bytes = adminBytes + list.reduce((total, user) => total + Math.max(0, Number(user.usageBytes) || 0), 0);
   if ($('dashCloudRequests')) $('dashCloudRequests').textContent = requests.toLocaleString('en-US');
   if ($('dashTrafficUsage')) $('dashTrafficUsage').textContent = fmtUserBytes(bytes);
-  renderDailyUsageCharts(list);
+  renderDailyUsageCharts(list, adminUsage);
+  renderConnectionAnalytics(list, adminUsage);
   updateTcpDashboardMetrics();
 }
 
@@ -3786,10 +3931,11 @@ function getLastSevenUsageDays() {
   });
 }
 
-function renderDailyUsageCharts(users) {
+function renderDailyUsageCharts(users, adminUsage = globalSettings.adminUsage || {}) {
   const days = getLastSevenUsageDays();
   const totals = new Map(days.map(day => [day, { usageBytes: 0, requestCount: 0, tcpTests: 0, tcpOk: 0 }]));
-  for (const user of users || []) {
+  const allAccounts = [{ id: "default", dailyStats: adminUsage.dailyStats || [] }, ...(users || [])];
+  for (const user of allAccounts) {
     for (const stat of Array.isArray(user.dailyStats) ? user.dailyStats : []) {
       const total = totals.get(stat.date);
       if (!total) continue;
@@ -3842,6 +3988,54 @@ function renderDailyUsageCharts(users) {
   renderChart('dailyUsageChart', 'usageBytes', fmtCompactUsage, 'usage');
   renderChart('dailyConnectionsChart', 'requestCount', value => Math.round(value).toLocaleString('en-US'), 'connections');
   renderChart('dailyTcpChart', 'tcpTests', value => Math.round(value).toLocaleString('en-US'), 'connections', (value, meta) => String(value) + ' آزمون · ' + String(meta.tcpOk || 0) + ' موفق');
+}
+
+function renderConnectionAnalytics(users, adminUsage = globalSettings.adminUsage || {}) {
+  const list = Array.isArray(users) ? users : [];
+  const accounts = [{
+    id: "default", name: "مدیر", usageBytes: Math.max(0, Number(adminUsage.usageBytes) || 0),
+    requestCount: Math.max(0, Number(adminUsage.requestCount) || 0),
+    activeConnections: Math.max(0, Number(adminUsage.activeConnections) || 0), unlimited: true
+  }, ...list.map(user => ({
+    id: String(user.id), name: user.name || "ساب‌کاربر", usageBytes: Math.max(0, Number(user.usageBytes) || 0),
+    requestCount: Math.max(0, Number(user.requestCount) || 0), activeConnections: Math.max(0, Number(user.activeConnections) || 0),
+    limitBytes: Number(user.trafficLimitGB) > 0 ? Number(user.trafficLimitGB) * 1024 ** 3 : 0
+  }))];
+  const totalBytes = accounts.reduce((sum, item) => sum + item.usageBytes, 0);
+  const totalRequests = accounts.reduce((sum, item) => sum + item.requestCount, 0);
+  const totalActive = accounts.reduce((sum, item) => sum + item.activeConnections, 0);
+  if ($('usageAdminTotal')) $('usageAdminTotal').textContent = fmtUserBytes(accounts[0].usageBytes);
+  if ($('usageTotalBytes')) $('usageTotalBytes').textContent = fmtUserBytes(totalBytes);
+  if ($('usageRequestTotal')) $('usageRequestTotal').textContent = totalRequests.toLocaleString('en-US');
+  if ($('usageActiveCount')) $('usageActiveCount').textContent = totalActive.toLocaleString('en-US');
+
+  const chart = $('usageByAccountChart');
+  if (chart) {
+    chart.replaceChildren();
+    const max = Math.max(1, ...accounts.map(item => item.usageBytes));
+    for (const account of accounts) {
+      const col = document.createElement('div'); col.className = 'account-chart-column';
+      const value = document.createElement('span'); value.className = 'daily-chart-value'; value.textContent = fmtCompactUsage(account.usageBytes);
+      const track = document.createElement('div'); track.className = 'account-chart-track';
+      const bar = document.createElement('i'); bar.className = 'account-chart-bar';
+      bar.style.height = (account.usageBytes > 0 ? Math.max(3, account.usageBytes / max * 100) : 1) + '%';
+      bar.title = account.name + ' · ' + fmtUserBytes(account.usageBytes);
+      track.appendChild(bar);
+      const name = document.createElement('span'); name.className = 'account-chart-name'; name.textContent = account.id === 'default' ? 'مدیر' : account.name;
+      col.append(value, track, name); chart.appendChild(col);
+    }
+  }
+
+  const body = $('usageAccountTable');
+  if (body) {
+    body.replaceChildren();
+    for (const account of accounts) {
+      const tr = document.createElement('tr'); if (account.id === 'default') tr.className = 'admin-row';
+      const cells = [account.id === 'default' ? 'مدیر (نامحدود)' : account.name, fmtUserBytes(account.usageBytes), account.requestCount.toLocaleString('en-US'), account.activeConnections.toLocaleString('en-US'), account.id === 'default' || !account.limitBytes ? 'نامحدود' : fmtUserBytes(account.limitBytes)];
+      for (const value of cells) { const td = document.createElement('td'); td.textContent = value; tr.appendChild(td); }
+      body.appendChild(tr);
+    }
+  }
 }
 
 function mergeTcpTestHistory(items) {
@@ -3914,8 +4108,9 @@ async function refreshUsageSnapshot() {
   try {
     const snapshot = await api('/api/settings');
     globalSettings.users = Array.isArray(snapshot.users) ? snapshot.users : [];
+    globalSettings.adminUsage = snapshot.adminUsage || {};
     mergeTcpTestHistory(snapshot.tcpTestHistory);
-    updateCloudUsageMetrics(globalSettings.users);
+    updateCloudUsageMetrics(globalSettings.users, globalSettings.adminUsage);
     renderUsers();
   } catch { /* Keep the last good dashboard snapshot during transient errors. */ }
   finally { usageSnapshotInFlight = false; }
@@ -3962,7 +4157,8 @@ function fillForm(s) {
   const endpointsCount = getUiEndpoints(s).length;
   const allSubUsers = Array.isArray(s.users) ? s.users : [];
   const usersCount = allSubUsers.length;
-  updateCloudUsageMetrics(allSubUsers);
+  globalSettings.adminUsage = s.adminUsage || {};
+  updateCloudUsageMetrics(allSubUsers, globalSettings.adminUsage);
 
   $('dashCleanCount').textContent = String(cleanCount);
   const activeProtocols = (s.vlessEnabled && s.uuid ? 1 : 0) + (s.trojanEnabled && s.trojanPassword ? 1 : 0);
@@ -4198,9 +4394,9 @@ async function testAndSortCleanIPs() {
   const uniqueHosts = [...new Set(hosts)];
   if (!uniqueHosts.length) return showStatus('ابتدا Clean IP وارد یا از GitHub همگام‌سازی کنید.', true);
   const port = Number(globalSettings.tlsPort || 443);
-  const targets = uniqueHosts.slice(0, 12).map(host => ({ host, port }));
-  if (uniqueHosts.length > targets.length) showStatus('برای کنترل محدودیت سرویس، در این نوبت ۱۲ IP نخست آزمون می‌شوند؛ سایر موارد در خروجی باقی می‌مانند.');
-  await runExternalTests(targets, true, targets.length);
+  const targets = uniqueHosts.map(host => ({ host, port }));
+  if (uniqueHosts.length > 1) showStatus('برای رعایت سقف درخواست Check-Host، در هر نوبت یک IP بررسی می‌شود؛ با اجرای دوباره، IP بعدی انتخاب خواهد شد.');
+  await runExternalTests(targets, true, 1);
 
   const lines = String($('cleanIPs').value || '').split(/[\r\n,]+/).map(line => line.trim()).filter(Boolean);
   const originalIndex = new Map(lines.map((line, index) => [line.split('#')[0].trim().toLowerCase(), index]));
@@ -4259,14 +4455,10 @@ function renderUsers() {
   const allUsers = Array.isArray(globalSettings.users) ? globalSettings.users : [];
   const now = Date.now();
   const expiredUser = user => Number(user.expiresAt) > 0 && now >= Number(user.expiresAt);
-  const query = String($('userSearchInput')?.value || '').trim().toLocaleLowerCase();
-  const users = query ? allUsers.filter(u => [u.name, u.id].some(v => String(v || '').toLocaleLowerCase().includes(query))) : allUsers;
+  const users = allUsers;
   body.replaceChildren();
   if (!allUsers.length) {
     const tr=document.createElement('tr'), td=document.createElement('td'); td.colSpan=3; td.textContent='هنوز ساب‌کاربری تعریف نشده است؛ فرم بالا را تکمیل کنید.'; tr.appendChild(td); body.appendChild(tr); return;
-  }
-  if (!users.length) {
-    const tr=document.createElement('tr'), td=document.createElement('td'); td.colSpan=3; td.textContent='ساب‌کاربری با این عبارت پیدا نشد.'; tr.appendChild(td); body.appendChild(tr); return;
   }
   users.forEach(user => {
     const tr=document.createElement('tr');
@@ -4306,6 +4498,20 @@ function renderUsers() {
       state.textContent=user.enabled===false?'حساب غیرفعال است':expiredUser(user)?'اعتبار پایان یافته':quotaFull?'سهمیه تکمیل شده':'اشتراک در دسترس نیست';
       actions.appendChild(state);
     }
+    const details=document.createElement('div'); details.className='user-links-usage';
+    const linksTitle=document.createElement('strong'); linksTitle.className='user-links-title'; linksTitle.textContent='لینک‌های اشتراک'; details.appendChild(linksTitle);
+    const links=document.createElement('div'); links.className='user-link-list';
+    const token=encodeURIComponent(user.subToken || '');
+    const addLink=(label,path)=>{const a=document.createElement('a');a.href='/sub/'+token+'/'+path;a.target='_blank';a.rel='noopener';a.textContent=label;links.appendChild(a);};
+    if (user.subToken) { addLink('اشتراک Xray','xray'); addLink('Xray JSON','xray-json'); addLink('Sing-box','singbox'); }
+    else { const noLink=document.createElement('span'); noLink.className='table-subtext'; noLink.textContent='توکن اشتراک ثبت نشده است'; links.appendChild(noLink); }
+    details.appendChild(links);
+    const total=document.createElement('div'); total.className='user-total-usage';
+    const metric=(label,value)=>{const box=document.createElement('div');const title=document.createElement('span');title.textContent=label;const strong=document.createElement('strong');strong.textContent=value;box.append(title,strong);total.appendChild(box);};
+    metric('مصرف کل',fmtUserBytes(usedBytes));
+    metric('نشست‌ها',String(Math.max(0,Number(user.requestCount)||0)));
+    metric('اتصال هم‌زمان',String(Math.max(0,Number(user.activeConnections)||0)));
+    details.appendChild(total); actions.appendChild(details);
     tr.appendChild(actions); body.appendChild(tr);
   });
 }
@@ -4369,7 +4575,6 @@ $('userSaveBtn').addEventListener('click',async()=>{
 $('userClearBtn').addEventListener('click',clearUserForm);
 $('userNewBtn')?.addEventListener('click',()=>{clearUserForm();switchTab('sec-users');});
 $('userRefreshBtn').addEventListener('click',async()=>{try{const data=await api('/api/settings');globalSettings=data;fillForm(data);showStatus('اطلاعات کاربران به‌روزرسانی شد.');}catch(err){showStatus(err.message,true);}});
-$('userSearchInput')?.addEventListener('input',renderUsers);
 $('rotateTokenBtn')?.addEventListener('click', async () => {
   const message='توکن اشتراک اصلی، UUID و رمز Trojan اصلی عوض می‌شوند. لینک و کانفیگ قبلی دیگر قابل استفاده نخواهد بود و باید اطلاعات تازه را به کلاینت وارد کنید. ادامه می‌دهید؟';
   if(!confirm(message)) return;
@@ -4841,7 +5046,12 @@ async function requestExternalBatchWithRetry(batch) {
 
   const resultMap = new Map(payload.results.map(result => [portKey(result.host, result.port), result]));
   let limited = payload.results.filter(result => result.status === 'rate_limited');
-  // Retry only rate-limited rows after a cooldown, one at a time; preserve successful rows.
+  // Retry only short cooldowns automatically. Minute/hour quotas are surfaced
+  // to the operator instead of keeping the panel busy for a long time.
+  if (limited.some(result => Number(result.retryAfterMs) > 15000)) return { ...payload, results: batch.map(target => resultMap.get(portKey(target.host, target.port)) || ({
+    host: target.host, port: target.port, status: 'error', latency: null, successes: 0, nodes: 0,
+    error: 'پاسخ آزمون برای این هدف دریافت نشد.', reportUrl: null
+  })) };
   // The API's own 429 result is not treated as a closed port.
   if (limited.length) {
     await externalDelay(Math.max(5000, ...limited.map(result => Number(result.retryAfterMs) || 0)));
@@ -4886,10 +5096,16 @@ async function runExternalTests(requestedTargets = null, showCleanTable = true, 
     if (!unique.length) { showStatus('دامنه، Clean IP یا پورت قابل تست پیدا نشد.', true); return; }
 
     // Keep the existing per-click safety cap; rows beyond it are explicitly reported.
-    const maxTargetsPerRun = Number.isInteger(capOverride) && capOverride > 0 ? capOverride : (requestedTargets ? 1 : 3);
+    // Anonymous Check-Host quota is six API calls per ten seconds. A single
+    // target per click keeps POST + report polling below that ceiling.
+    const maxTargetsPerRun = 1;
     let selectedTargets;
-    if (requestedTargets) selectedTargets = unique.slice(0, maxTargetsPerRun);
-    else {
+    if (requestedTargets) {
+      if (unique.length > 1) {
+        selectedTargets = [unique[externalTestCursor % unique.length]];
+        externalTestCursor = (externalTestCursor + 1) % unique.length;
+      } else selectedTargets = unique.slice(0, 1);
+    } else {
       const count = Math.min(maxTargetsPerRun, unique.length);
       selectedTargets = Array.from({ length: count }, (_, index) => unique[(externalTestCursor + index) % unique.length]);
       externalTestCursor = unique.length ? (externalTestCursor + count) % unique.length : 0;
@@ -4905,7 +5121,7 @@ async function runExternalTests(requestedTargets = null, showCleanTable = true, 
 
     let completed = 0, failed = 0, pendingCount = 0, limitedCount = 0, stoppedForAuth = false;
     const failureDetails = [];
-    const batchSize = 3;
+    const batchSize = 1;
     for (let i = 0; i < selectedTargets.length; i += batchSize) {
       const batch = selectedTargets.slice(i, i + batchSize);
       let results = [];
