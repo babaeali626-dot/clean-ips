@@ -27,9 +27,12 @@ const DEFAULT_CLEAN_IP_SOURCE = "https://raw.githubusercontent.com/babaeali626-d
 const USER_USAGE_PREFIX = "panel-user-usage-v1:";
 const ADMIN_USAGE_KEY = "panel-admin-usage-v1";
 // KV allows one write per second per key. Traffic is therefore buffered in memory and
-// persisted only after 2 MB or every 30 s (and once more when a tunnel closes).
-const USER_TRAFFIC_FLUSH_BYTES = 2 * 1024 * 1024;
-const USER_TRAFFIC_FLUSH_INTERVAL_MS = 30000;
+// persisted only after 512 MB or every 5 minutes (and once more when a tunnel closes).
+const USER_TRAFFIC_FLUSH_BYTES = 512 * 1024 * 1024;
+const USER_TRAFFIC_FLUSH_INTERVAL_MS = 300000;
+// Isolate-level usage cache: handshakes read/update usage from RAM instead of hitting KV.
+const USAGE_CACHE_TTL_MS = 60 * 1000;
+const USAGE_CACHE_MAX_ENTRIES = 2000;
 const KV_MIN_WRITE_INTERVAL_MS = 1100;
 // Worker subrequest budget kept for DoH lookups inside one tunnel (hard platform cap: 50 on Free).
 const DNS_DOH_SUBREQUEST_LIMIT = 45;
@@ -66,6 +69,13 @@ const TCP_TEST_HISTORY_KEY = "panel-tcp-test-history-v1";
 const TCP_TEST_HISTORY_LIMIT = 500;
 const userActiveConnections = new Map();
 const userUsageLocks = new Map();
+// Short-lived (60 s) in-memory copy of the raw usage records, keyed by KV key.
+// Entry: { raw: <usage object | null>, expires: <ms> }
+const usageMemoryCache = new Map();
+// Pending/in-flight KV writes per usage key (coalesced: only the latest value is written).
+const usageWriteStates = new Map();
+// In-flight KV reads per usage key, so a cold/expired cache triggers one read, not one per handshake.
+const usageReadInflight = new Map();
 // Per-isolate byte ledger prevents concurrent tunnels in the same Worker isolate
 // from each spending the same stale KV balance.
 const userTrafficState = new Map();
@@ -319,7 +329,7 @@ export default {
               const currentSettings = await loadSettings(kv, env);
               const currentUser = (currentSettings.users || []).find(item => String(item.id) === id);
               if (!currentUser) throw new Error("کاربر پس از بازنشانی پیدا نشد.");
-              const usage = await getUserUsage(kv, currentUser);
+              const usage = await getUserUsage(kv, currentUser, { fresh: true });
               const now = Date.now();
               const nextUsage = { ...usage, usageBytes: 0, requestCount: 0, periodStartedAt: now };
               await saveUserUsage(kv, id, nextUsage);
@@ -1311,9 +1321,94 @@ function defaultUserUsage(user) {
   };
 }
 
-async function getUserUsage(kv, user) {
+// Returns undefined on a miss/expiry, otherwise the cached raw record (which may be null
+// when KV has no record for the key).
+function usageCacheGet(key) {
+  const entry = usageMemoryCache.get(key);
+  if (!entry) return undefined;
+  if (entry.expires <= Date.now()) { usageMemoryCache.delete(key); return undefined; }
+  return entry.raw;
+}
+
+function usageCacheSet(key, raw) {
+  usageMemoryCache.delete(key);
+  usageMemoryCache.set(key, { raw, expires: Date.now() + USAGE_CACHE_TTL_MS });
+  while (usageMemoryCache.size > USAGE_CACHE_MAX_ENTRIES) usageMemoryCache.delete(usageMemoryCache.keys().next().value);
+}
+
+function usageCacheDelete(key) { usageMemoryCache.delete(key); }
+
+// Waits for any queued/in-flight KV write of this key made by this isolate.
+async function waitForUsageWrite(key) {
+  const state = usageWriteStates.get(key);
+  if (state && state.running) { try { await state.running; } catch {} }
+}
+
+// Reads a raw usage record: RAM cache first, KV only on a miss. `fresh` skips the cache
+// (used by the periodic traffic flush / admin operations so that records written by other
+// isolates are never overwritten with a stale copy).
+async function readUsageRaw(kv, key, fresh = false) {
+  if (!fresh) {
+    const hit = usageCacheGet(key);
+    if (hit !== undefined) return hit;
+  } else {
+    await waitForUsageWrite(key);
+  }
+  let raw;
+  if (fresh) {
+    raw = readKvJson(await kv.get(key, { type: "json" }));
+  } else {
+    let pending = usageReadInflight.get(key);
+    if (!pending) {
+      pending = Promise.resolve(kv.get(key, { type: "json" })).finally(() => usageReadInflight.delete(key));
+      usageReadInflight.set(key, pending);
+    }
+    raw = readKvJson(await pending);
+  }
+  if (!fresh) {
+    // A local save may have landed while we were waiting for KV; it is newer than this read.
+    const again = usageCacheGet(key);
+    if (again !== undefined) return again;
+  }
+  if (!usageWriteStates.has(key)) usageCacheSet(key, raw);
+  return raw;
+}
+
+// Coalesced, paced KV write: concurrent callers share one in-flight writer that always
+// writes the newest payload, so parallel handshakes never exceed KV's 1 write/s/key limit.
+function persistUsagePayload(kv, key, payload) {
+  let state = usageWriteStates.get(key);
+  if (!state) { state = { payload: null, dirty: false, running: null }; usageWriteStates.set(key, state); }
+  state.payload = payload;
+  state.dirty = true;
+  if (!state.running) {
+    const st = state;
+    st.running = (async () => {
+      try {
+        while (st.dirty) {
+          await paceKvWrite(key);
+          const body = st.payload;
+          st.dirty = false;
+          await kv.put(key, body);
+          markKvWrite(key);
+        }
+      } finally {
+        st.running = null;
+        if (!st.dirty && usageWriteStates.get(key) === st) usageWriteStates.delete(key);
+      }
+    })();
+    st.running.catch(() => {});
+  }
+  return state.running;
+}
+
+async function getUserUsage(kv, user, options = {}) {
   if (!kv) return defaultUserUsage(user);
-  const raw = readKvJson(await kv.get(USER_USAGE_PREFIX + user.id, { type: "json" }));
+  const raw = await readUsageRaw(kv, USER_USAGE_PREFIX + user.id, options.fresh === true);
+  return normalizeUserUsage(raw, user);
+}
+
+function normalizeUserUsage(raw, user) {
   const base = defaultUserUsage(user);
   if (!raw) return base;
   const usage = {
@@ -1355,8 +1450,11 @@ async function getUserUsage(kv, user) {
 
 async function saveUserUsage(kv, userId, usage) {
   if (!kv) throw new Error("برای مدیریت کاربران باید KV متصل باشد.");
-  await kv.put(USER_USAGE_PREFIX + userId, JSON.stringify(usage));
-  markKvWrite(USER_USAGE_PREFIX + userId);
+  const key = USER_USAGE_PREFIX + userId;
+  const payload = JSON.stringify(usage);
+  // The RAM cache is updated synchronously (before any await) so parallel handshakes see it at once.
+  usageCacheSet(key, JSON.parse(payload));
+  await persistUsagePayload(kv, key, payload);
 }
 
 function normalizeAdminUsage(raw = {}) {
@@ -1371,16 +1469,17 @@ function normalizeAdminUsage(raw = {}) {
   };
 }
 
-async function getAdminUsage(kv) {
+async function getAdminUsage(kv, options = {}) {
   if (!kv) return normalizeAdminUsage();
-  const raw = readKvJson(await kv.get(ADMIN_USAGE_KEY, { type: "json" }));
+  const raw = await readUsageRaw(kv, ADMIN_USAGE_KEY, options.fresh === true);
   return normalizeAdminUsage(raw || {});
 }
 
 async function saveAdminUsage(kv, usage) {
   if (!kv) return;
-  await kv.put(ADMIN_USAGE_KEY, JSON.stringify(normalizeAdminUsage(usage)));
-  markKvWrite(ADMIN_USAGE_KEY);
+  const payload = JSON.stringify(normalizeAdminUsage(usage));
+  usageCacheSet(ADMIN_USAGE_KEY, JSON.parse(payload));
+  await persistUsagePayload(kv, ADMIN_USAGE_KEY, payload);
 }
 
 // Per-isolate write pacing/coalescing so that concurrent tunnels of the same account
@@ -1427,7 +1526,10 @@ function enqueueTrafficWrite(kv, accountId, bytes, dailyDeltas) {
 async function addAdminTraffic(kv, amount, dailyDeltas = null) {
   if (!kv || !Number.isFinite(amount) || amount <= 0) return null;
   return withUserUsageLock("default", async () => {
-    const usage = await getAdminUsage(kv);
+    // Flush path: pace first, then read straight from KV (not the RAM cache) so that
+    // updates written by other isolates are not overwritten by a stale cached copy.
+    await paceKvWrite(ADMIN_USAGE_KEY);
+    const usage = await getAdminUsage(kv, { fresh: true });
     const acceptedAmount = Math.floor(amount);
     usage.usageBytes += acceptedAmount;
     const deltas = dailyDeltas && typeof dailyDeltas === "object" ? dailyDeltas : { [utcUsageDayKey()]: acceptedAmount };
@@ -1439,7 +1541,6 @@ async function addAdminTraffic(kv, amount, dailyDeltas = null) {
       dailyTotal += bytes;
     }
     if (dailyTotal < acceptedAmount) addDailyUsage(usage, utcUsageDayKey(), 0, acceptedAmount - dailyTotal);
-    await paceKvWrite(ADMIN_USAGE_KEY);
     await saveAdminUsage(kv, usage);
     const local = userTrafficState.get("default");
     if (local && local.periodStartedAt === Number(usage.periodStartedAt || 0)) local.usageBytes = Math.max(local.usageBytes, usage.usageBytes);
@@ -1474,74 +1575,70 @@ function getUserAccessError(user, usage, now = Date.now()) {
   return "";
 }
 
-async function beginUserSession(kv, candidate) {
+async function beginUserSession(kv, candidate, ctx = null) {
   if (!candidate) throw new Error("اعتبارنامه نامعتبر است.");
+  // The handshake never waits for KV: usage comes from the isolate RAM cache, the updated
+  // counter is stored in the cache immediately and written to KV in the background.
+  // `candidate` was resolved from freshly loaded settings a moment ago in handleTunnel,
+  // so credentials / enabled flag / limits are already current (no second SETTINGS read).
+  const persistInBackground = pending => {
+    const guarded = pending.catch(err => console.warn("Session counter persistence failed:", String(err?.message || err).slice(0, 120)));
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(guarded);
+  };
   if (candidate.id === "default") {
     // The administrator is unlimited, but is still measured exactly like a user.
-    // Re-read credentials before accepting the tunnel to reject rotated secrets.
     if (kv) {
-      const latest = readKvJson(await kv.get(SETTINGS_KEY, { type: "json" }));
-      if (!latest) throw new Error("تنظیمات اصلی در دسترس نیست.");
-      if (candidate.uuid && String(latest.uuid || "").toLowerCase() !== String(candidate.uuid).toLowerCase()) {
-        throw new Error("UUID اصلی قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
-      }
-      if (candidate.trojanPassword && String(latest.trojanPassword || "") !== String(candidate.trojanPassword)) {
-        throw new Error("رمز Trojan اصلی قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
-      }
-      return withUserUsageLock("default", async () => {
-        const usage = await getAdminUsage(kv);
-        const trafficState = getLocalUserTrafficState("default", usage);
-        usage.usageBytes = Math.max(Number(usage.usageBytes) || 0, trafficState.usageBytes);
-        usage.requestCount++;
-        usage.lastConnectedAt = Date.now();
-        if (!usage.firstConnectedAt) usage.firstConnectedAt = Date.now();
-        addDailyUsage(usage, utcUsageDayKey(), 1, 0);
-        await saveAdminUsage(kv, usage);
-        userActiveConnections.set("default", (userActiveConnections.get("default") || 0) + 1);
-        return { user: candidate, usage, trafficState, tracked: true };
-      });
+      if (usageCacheGet(ADMIN_USAGE_KEY) === undefined) await readUsageRaw(kv, ADMIN_USAGE_KEY, false); // rare: cold cache
+      // No await between reading the cache and updating it: parallel handshakes cannot lose increments.
+      const usage = normalizeAdminUsage(usageCacheGet(ADMIN_USAGE_KEY) || {});
+      const trafficState = getLocalUserTrafficState("default", usage);
+      const now = Date.now();
+      usage.requestCount++;
+      usage.lastConnectedAt = now;
+      if (!usage.firstConnectedAt) usage.firstConnectedAt = now;
+      addDailyUsage(usage, utcUsageDayKey(now), 1, 0);
+      persistInBackground(saveAdminUsage(kv, usage));
+      userActiveConnections.set("default", (userActiveConnections.get("default") || 0) + 1);
+      return { user: candidate, usage, trafficState, tracked: true };
     }
     return { user: candidate, usage: normalizeAdminUsage(), trafficState: getLocalUserTrafficState("default", normalizeAdminUsage()), tracked: false };
   }
   if (!kv) throw new Error("مدیریت کاربر به KV نیاز دارد.");
   const id = String(candidate.id);
+  const key = USER_USAGE_PREFIX + id;
   const active = userActiveConnections.get(id) || 0;
   const limit = Math.max(0, Number(candidate.deviceLimit) || 0);
   if (limit > 0 && active >= limit) throw new Error("حد اتصال هم‌زمان این کاربر در این Worker پر شده است.");
   userActiveConnections.set(id, active + 1);
   try {
-    return await withUserUsageLock(id, async () => {
-      const latest = readKvJson(await kv.get(SETTINGS_KEY, { type: "json" }));
-      const liveUser = Array.isArray(latest?.users) ? latest.users.find(u => String(u.id) === id) : null;
-      if (!liveUser || liveUser.enabled === false) throw new Error("کاربر حذف یا غیرفعال شده است.");
-      if (candidate.uuid && String(liveUser.uuid || "").toLowerCase() !== String(candidate.uuid).toLowerCase()) throw new Error("اعتبارنامه قبلی کاربر منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
-      if (candidate.trojanPassword && String(liveUser.trojanPassword || "") !== String(candidate.trojanPassword)) throw new Error("رمز Trojan قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
-      const liveLimit = Math.max(0, Number(liveUser.deviceLimit) || 0);
-      const currentConnections = userActiveConnections.get(id) || 0;
-      if (liveLimit > 0 && currentConnections > liveLimit) throw new Error("حد اتصال هم‌زمان کاربر تغییر کرده و ظرفیت آن پر است.");
-      const usage = await getUserUsage(kv, liveUser);
-      const now = Date.now();
-      const resetDays = Math.max(0, Number(liveUser.resetPeriodDays) || 0);
-      if (resetDays > 0 && now - usage.periodStartedAt >= resetDays * 86400000) {
-        usage.usageBytes = 0; usage.requestCount = 0; usage.periodStartedAt = now;
-      }
-      if (liveUser.startOnFirstConnect && !usage.firstConnectedAt) {
-        usage.firstConnectedAt = now;
-        if (Number(liveUser.expireDays) > 0) usage.expiresAt = now + Number(liveUser.expireDays) * 86400000;
-      }
-      if (!liveUser.startOnFirstConnect && Number(liveUser.expireDays) > 0 && !usage.expiresAt) {
-        usage.expiresAt = (Number(liveUser.createdAt) || now) + Number(liveUser.expireDays) * 86400000;
-      }
-      const trafficState = getLocalUserTrafficState(id, usage);
-      usage.usageBytes = Math.max(Number(usage.usageBytes) || 0, trafficState.usageBytes);
-      const accessError = getUserAccessError(liveUser, usage, now);
-      if (accessError) throw new Error(accessError);
-      usage.requestCount++;
-      usage.lastConnectedAt = now;
-      addDailyUsage(usage, utcUsageDayKey(now), 1, 0);
-      await saveUserUsage(kv, id, usage);
-      return { user: liveUser, usage, trafficState, tracked: true };
-    });
+    if (usageCacheGet(key) === undefined) await readUsageRaw(kv, key, false); // rare: cold cache
+    const currentConnections = userActiveConnections.get(id) || 0;
+    if (limit > 0 && currentConnections > limit) throw new Error("حد اتصال هم‌زمان کاربر تغییر کرده و ظرفیت آن پر است.");
+    // Everything below is synchronous (no lock needed): status/quota validation straight from the cache.
+    const usage = normalizeUserUsage(usageCacheGet(key) || null, candidate);
+    const now = Date.now();
+    const resetDays = Math.max(0, Number(candidate.resetPeriodDays) || 0);
+    if (resetDays > 0 && now - usage.periodStartedAt >= resetDays * 86400000) {
+      usage.usageBytes = 0; usage.requestCount = 0; usage.periodStartedAt = now;
+    }
+    if (candidate.startOnFirstConnect && !usage.firstConnectedAt) {
+      usage.firstConnectedAt = now;
+      if (Number(candidate.expireDays) > 0) usage.expiresAt = now + Number(candidate.expireDays) * 86400000;
+    }
+    if (!candidate.startOnFirstConnect && Number(candidate.expireDays) > 0 && !usage.expiresAt) {
+      usage.expiresAt = (Number(candidate.createdAt) || now) + Number(candidate.expireDays) * 86400000;
+    }
+    const trafficState = getLocalUserTrafficState(id, usage);
+    // Quota is checked against max(stored, this isolate's live ledger) but only the stored
+    // figure is persisted: unflushed ledger bytes are added later by the traffic flush and
+    // must not be written twice (matters with the 512 MB / 5 min flush window).
+    const accessError = getUserAccessError(candidate, { ...usage, usageBytes: Math.max(Number(usage.usageBytes) || 0, trafficState.usageBytes) }, now);
+    if (accessError) throw new Error(accessError);
+    usage.requestCount++;
+    usage.lastConnectedAt = now;
+    addDailyUsage(usage, utcUsageDayKey(now), 1, 0);
+    persistInBackground(saveUserUsage(kv, id, usage));
+    return { user: candidate, usage, trafficState, tracked: true };
   } catch (err) {
     const current = userActiveConnections.get(id) || 0;
     if (current <= 1) userActiveConnections.delete(id); else userActiveConnections.set(id, current - 1);
@@ -1555,7 +1652,9 @@ async function addUserTraffic(kv, userId, amount, dailyDeltas = null) {
     const userSettings = readKvJson(await kv.get(SETTINGS_KEY, { type: "json" }));
     const user = Array.isArray(userSettings?.users) ? userSettings.users.find(u => String(u.id) === String(userId)) : null;
     if (!user) return null;
-    const usage = await getUserUsage(kv, user);
+    // Flush path: pace first, then read straight from KV (bypass RAM cache) to avoid clobbering other isolates' writes.
+    await paceKvWrite(USER_USAGE_PREFIX + userId);
+    const usage = await getUserUsage(kv, user, { fresh: true });
     const acceptedAmount = Math.floor(amount);
     usage.usageBytes += acceptedAmount;
     const deltas = dailyDeltas && typeof dailyDeltas === "object" ? dailyDeltas : { [utcUsageDayKey()]: acceptedAmount };
@@ -1567,7 +1666,6 @@ async function addUserTraffic(kv, userId, amount, dailyDeltas = null) {
       dailyTotal += bytes;
     }
     if (dailyTotal < acceptedAmount) addDailyUsage(usage, utcUsageDayKey(), 0, acceptedAmount - dailyTotal);
-    await paceKvWrite(USER_USAGE_PREFIX + userId);
     await saveUserUsage(kv, userId, usage);
     const local = userTrafficState.get(String(userId));
     if (local && local.periodStartedAt === Number(usage.periodStartedAt || 0)) local.usageBytes = Math.max(local.usageBytes, usage.usageBytes);
@@ -1584,7 +1682,7 @@ async function reconcileUserUsageConfigs(kv, previousUsers, nextUsers) {
   for (const user of next) {
     const id = String(user.id);
     await withUserUsageLock(id, async () => {
-      const raw = readKvJson(await kv.get(USER_USAGE_PREFIX + id, { type: "json" }));
+      const raw = await readUsageRaw(kv, USER_USAGE_PREFIX + id, true);
       const oldUser = previous.get(id);
       if (!raw) {
         const usage = defaultUserUsage(user);
@@ -1622,7 +1720,11 @@ async function reconcileUserUsageConfigs(kv, previousUsers, nextUsers) {
     for (const oldUser of previous.values()) {
       const id = String(oldUser.id);
       if (!nextIds.has(id)) {
-        try { await kv.delete(USER_USAGE_PREFIX + id); }
+        try {
+          await waitForUsageWrite(USER_USAGE_PREFIX + id);
+          await kv.delete(USER_USAGE_PREFIX + id);
+          usageCacheDelete(USER_USAGE_PREFIX + id);
+        }
         catch (err) { console.warn("Unable to remove orphaned user usage:", String(err?.message || err).slice(0, 100)); }
       }
     }
@@ -2710,7 +2812,7 @@ async function handleTunnel(request, env, kv, kind, ctx) {
         ? findUserByCredential(authSettings, "vless", parsed.uuid)
         : findUserByCredential(authSettings, "trojanHash", parsed.passwordHash);
       if (!candidate) throw new Error("auth");
-      const session = await beginUserSession(kv, candidate);
+      const session = await beginUserSession(kv, candidate, ctx);
       activeUser = session.user;
       userUsageAtStart = session.usage;
       userTrafficLedger = session.trafficState || null;
