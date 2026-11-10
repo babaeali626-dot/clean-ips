@@ -1,4 +1,4 @@
-// BUILD_ID: cf-worker-zeus-hybrid-d1-kv-exitnodes-shadowsocks-cpu-v1-20261110
+// BUILD_ID: cf-worker-zeus-hybrid-d1-kv-exitnodes-placement-streamcpu-telegram-proxy-tab-v5-20261110
 // Enhanced with ZEUS-inspired features + Exact Vision UI Dashboard Redesign:
 // - Multi-user structure (users[] with traffic/expire/device/request limits, startOnFirstConnect, resetPeriod)
 // - Fragment profiles for operators (hamrah, irancell, rightel, mokhaberat, gaming, custom)
@@ -22,6 +22,15 @@ const trojanHashCache = new Map();
 let credentialIndexCache = null;
 const MAX_EXIT_NODES = 8;
 const MAX_EXIT_ENDPOINTS = 8;
+const UPSTREAM_BUNDLE_TARGET_BYTES = 512 * 1024;
+const UPSTREAM_BUNDLE_MAX_BYTES = 512 * 1024;
+const UPSTREAM_BUNDLE_DELAY_MS = 3;
+const DOWNSTREAM_MIN_BUFFER_BYTES = 64 * 1024;
+const DOWNSTREAM_MAX_BUFFER_BYTES = 1024 * 1024;
+const DOWNSTREAM_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
+const DOWNSTREAM_BACKPRESSURE_RESUME_BYTES = 2 * 1024 * 1024;
+const DOWNSTREAM_FLUSH_DELAY_MS = 2;
+const PLACEMENT_PROVIDERS = new Set(["aws", "gcp", "azure"]);
 const SHADOWSOCKS_METHODS = new Set(["aes-256-gcm", "aes-128-gcm"]);
 const SS_MASTER_KEY_CACHE = new Map();
 const SS_MASTER_KEY_CACHE_MAX = 256;
@@ -203,6 +212,7 @@ const DEFAULTS = {
   trafficByteTrackingEnabled: false,
   shadowsocksEnabled: false,
   shadowsocksMethod: "aes-256-gcm",
+  workerPlacement: { mode: "smart" },
   exitNodes: [],
   users: [],
   proxies: [],
@@ -298,6 +308,9 @@ export default {
         }
         return await handleSubscription(request, env, kv, url);
       }
+      if (path.startsWith("/telegram/") && request.method === "GET") {
+        return await handleTelegramLandingPage(request, env, kv, url);
+      }
       if (path === "/api/setup-status" && request.method === "GET") {
         const configured = await isSetupDone(kv, env);
         return json({ configured });
@@ -313,6 +326,23 @@ export default {
         if (request.method !== "GET" && !sameOrigin(request, url)) return json({ error: "Bad Origin", code: "ERR_BAD_ORIGIN" }, 403);
 
         if (path === "/api/ping-ip" && request.method === "POST") return await handlePingIp(request);
+        if (path === "/api/telegram-proxies/test-active" && request.method === "POST") {
+          const settings = await loadSettings(kv, env);
+          const nodes = getActiveExitNodes(settings).filter(node => node.kind === "socks5");
+          const results = await mapWithConcurrency(nodes, 4, async node => ({
+            id: node.id, name: node.name, country: node.country, ...await testTelegramSocks5Proxy(node.uri)
+          }));
+          return json({ results });
+        }
+        if (path === "/api/telegram-proxies/sync" && request.method === "POST") {
+          try {
+            const body = await readJsonLimited(request, 8192);
+            const result = await fetchAndTestTelegramProxySources(body.sources);
+            return json(result);
+          } catch (err) {
+            return json({ error: String(err?.message || "دریافت یا آزمایش منابع پروکسی تلگرام ناموفق بود").slice(0, 240), code: "ERR_TELEGRAM_PROXY_SYNC" }, 400);
+          }
+        }
         if (path === "/api/external-ping" && request.method === "POST") return await handleExternalPing(request, kv, env, url);
         if (path === "/api/cleanips/sync" && request.method === "POST") {
           if (!kv) return json({ error: "KV Binding یافت نشد؛ ذخیره و همگام‌سازی Clean IP ممکن نیست.", code: "ERR_KV_MISSING" }, 503);
@@ -325,6 +355,16 @@ export default {
             return json({ ok: true, count: synced.count, sources: synced.sources, settings: publicSettings(settings, url) });
           } catch (err) {
             return json({ error: String(err && err.message || "همگام‌سازی Clean IP ناموفق بود").slice(0, 220), code: "ERR_CLEANIP_SYNC" }, 502);
+          }
+        }
+        if (path === "/api/placement/apply" && request.method === "POST") {
+          try {
+            const body = await readJsonLimited(request, 2048);
+            const placement = validateWorkerPlacement(body.workerPlacement || body);
+            const result = await applyCloudflareWorkerPlacement(env, placement);
+            return json({ ok: true, placement, status: result?.result?.placement || result?.result || null });
+          } catch (err) {
+            return json({ error: String(err?.message || "اعمال محل اجرای Worker ناموفق بود").slice(0, 260), code: "ERR_PLACEMENT_APPLY" }, 502);
           }
         }
         if (path === "/api/settings" && request.method === "GET") {
@@ -485,6 +525,220 @@ export default {
     })());
   }
 };
+
+// -------------------- Telegram SOCKS5 proxy helpers --------------------
+const TELEGRAM_PROXY_TEST_TARGET = "149.154.167.51";
+const TELEGRAM_PROXY_SOURCE_HOSTS = new Set([
+  "raw.githubusercontent.com", "gist.githubusercontent.com", "pastebin.com", "www.pastebin.com", "github.com"
+]);
+const TELEGRAM_PROXY_SOURCE_MAX_BYTES = 256 * 1024;
+const TELEGRAM_PROXY_SOURCE_MAX_COUNT = 5;
+const TELEGRAM_PROXY_CANDIDATE_MAX = 40;
+
+function buildTelegramProxyDetails(node, origin = "") {
+  if (!node || node.enabled === false || node.kind !== "socks5") return null;
+  let proxy;
+  try { proxy = parseExitProxyUri(node.uri); } catch { return null; }
+  if (proxy.kind !== "socks5") return null;
+  const server = String(proxy.hostname || "").replace(/^\[|\]$/g, "");
+  if (!server || !Number.isInteger(proxy.port) || proxy.port < 1) return null;
+  const params = new URLSearchParams();
+  params.set("server", server);
+  params.set("port", String(proxy.port));
+  if (proxy.username) params.set("user", proxy.username);
+  if (proxy.password) params.set("pass", proxy.password);
+  const query = params.toString();
+  return {
+    id: String(node.id), name: String(node.name || "Telegram SOCKS5"), country: String(node.country || "UN"),
+    server, port: proxy.port, tgUrl: "tg://socks?" + query, webUrl: "https://t.me/socks?" + query,
+    workerUrl: String(origin || "").replace(/\/$/, "") + "/telegram/" + encodeURIComponent(String(node.id))
+  };
+}
+
+function buildTelegramProxyInventory(settings, origin = "") {
+  return getActiveExitNodes(settings).map(node => buildTelegramProxyDetails(node, origin)).filter(Boolean);
+}
+
+function htmlEscape(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+async function handleTelegramLandingPage(request, env, kv, url) {
+  if (!(await hasSession(request, kv, env))) {
+    return new Response("برای مشاهده لینک اتصال، ابتدا وارد پنل مدیریت شوید.", {
+      status: 401, headers: securityHeaders({ "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" })
+    });
+  }
+  let id = "";
+  try { id = decodeURIComponent(url.pathname.slice("/telegram/".length)); } catch {}
+  if (!id || id.length > 64 || !/^[A-Za-z0-9_-]+$/.test(id)) return new Response("Not found", { status: 404 });
+  const settings = await loadSettings(kv, env);
+  const node = getActiveExitNodes(settings).find(item => String(item.id) === id);
+  const details = node ? buildTelegramProxyDetails(node, url.origin) : null;
+  if (!details) return new Response("Telegram SOCKS5 proxy not found", { status: 404 });
+  const tg = htmlEscape(details.tgUrl), web = htmlEscape(details.webUrl);
+  const html = `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>اتصال تلگرام - ${htmlEscape(details.name)}</title><style>body{margin:0;background:#080d1a;color:#e8f0ff;font:16px Vazirmatn,system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}.card{width:min(520px,calc(100% - 36px));box-sizing:border-box;padding:28px;border:1px solid #28405d;border-radius:22px;background:linear-gradient(145deg,#151c31,#0b1222);box-shadow:0 20px 60px #0008}h1{font-size:22px;margin:0 0 12px}p{color:#9eafc8;line-height:1.9}.btn{display:block;text-align:center;text-decoration:none;margin-top:12px;padding:13px;border-radius:12px;background:#229ed9;color:white;font-weight:700}.secondary{background:#18283d;border:1px solid #38516e}</style></head><body><main class="card"><h1>اتصال به پروکسی تلگرام</h1><p>${htmlEscape(details.name)} · ${htmlEscape(details.country)}<br><span dir="ltr">${htmlEscape(details.server)}:${details.port}</span></p><a class="btn" href="${tg}">باز کردن مستقیم در Telegram</a><a class="btn secondary" href="${web}">باز کردن صفحه رسمی t.me/socks</a><p>در صورت نصب بودن تلگرام، گزینه اول را انتخاب کنید. این صفحه فقط لینک پراکسی SOCKS5 ذخیره‌شده در پنل را باز می‌کند.</p></main></body></html>`;
+  return new Response(html, { headers: securityHeaders({ "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }) });
+}
+
+function isSafePublicTelegramProxyHost(host) {
+  const value = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
+  if (!value || value === "localhost" || value.endsWith(".localhost") || value.endsWith(".local") || value.endsWith(".internal") || value.endsWith(".test") || value.endsWith(".example") || value.endsWith(".invalid") || value.endsWith(".onion")) return false;
+  if (isIPv4Text(value)) {
+    const reserved = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4"];
+    return !reserved.some(cidr => ipInCidr(value, cidr));
+  }
+  if (isIPv6Text(value)) {
+    const reserved = ["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8", "2001:db8::/32"];
+    return !reserved.some(cidr => ipInCidr(value, cidr));
+  }
+  return isDomainName(value);
+}
+
+function normalizeTelegramProxySourceLine(line) {
+  let value = String(line || "").trim().replace(/&amp;/gi, "&").replace(/^[\s"'`]+|[\s"'`,;)}\]]+$/g, "");
+  if (!value || value.startsWith("#") || value.startsWith("//")) return "";
+  const normalized = normalizeTelegramProxy(value);
+  if (/^(?:socks5?|tg):\/\//i.test(normalized)) return normalized;
+  // Common raw lists also publish host:port or host:port:user:pass records.
+  let m = /^\[([^\]]+)\]:(\d{1,5})(?::([^:]*):(.+))?$/.exec(value);
+  if (!m) m = /^([^:\s]+):(\d{1,5})(?::([^:]*):(.+))?$/.exec(value);
+  if (!m) return "";
+  const server = m[1], port = Number(m[2]), user = m[3] || "", pass = m[4] || "";
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return "";
+  const host = server.includes(":") ? "[" + server.replace(/^\[|\]$/g, "") + "]" : server;
+  const auth = (user || pass) ? encodeURIComponent(user) + ":" + encodeURIComponent(pass) + "@" : "";
+  return "socks5://" + auth + host + ":" + port;
+}
+
+function extractTelegramProxyUris(sourceText) {
+  const text = String(sourceText || "").replace(/&amp;/gi, "&");
+  const found = [];
+  const add = value => { const normalized = normalizeTelegramProxySourceLine(value); if (normalized) found.push(normalized); };
+  // Parse JSON feeds in addition to one-URI-per-line text lists.
+  try {
+    const parsed = JSON.parse(text);
+    const rows = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.proxies) ? parsed.proxies : (Array.isArray(parsed?.data) ? parsed.data : []));
+    for (const row of rows.slice(0, TELEGRAM_PROXY_CANDIDATE_MAX * 2)) {
+      if (typeof row === "string") add(row);
+      else if (row && typeof row === "object") {
+        const direct = row.uri || row.url || row.link || row.proxy || row.socks5;
+        if (direct) add(direct);
+        else if ((row.server || row.host || row.ip) && row.port) {
+          const host = String(row.server || row.host || row.ip);
+          const user = String(row.user || row.username || ""), pass = String(row.pass || row.password || "");
+          const authority = (user || pass) ? encodeURIComponent(user) + ":" + encodeURIComponent(pass) + "@" : "";
+          add("socks5://" + authority + (host.includes(":") && !host.startsWith("[") ? "[" + host + "]" : host) + ":" + Number(row.port));
+        }
+      }
+    }
+  } catch {}
+  const uriPattern = /(?:tg:\/\/socks\?[^\s"'<>]+|https?:\/\/t\.me\/socks\?[^\s"'<>]+|socks5?:\/\/[^\s"'<>]+)/gi;
+  for (const match of text.matchAll(uriPattern)) add(match[0]);
+  for (const line of text.split(/[\r\n]+/)) add(line.split("#", 1)[0]);
+  return [...new Set(found)].slice(0, TELEGRAM_PROXY_CANDIDATE_MAX);
+}
+
+async function testTelegramSocks5Proxy(proxyUri) {
+  let socket, reader, writer, timer;
+  const started = Date.now();
+  try {
+    const proxy = parseExitProxyUri(proxyUri);
+    if (proxy.kind !== "socks5") throw new Error("فقط SOCKS5 برای Telegram پشتیبانی می‌شود.");
+    if (!isSafePublicTelegramProxyHost(proxy.hostname)) throw new Error("آدرس پراکسی عمومی معتبر نیست.");
+    socket = connect({ hostname: proxy.hostname, port: proxy.port }, { secureTransport: "off", allowHalfOpen: true });
+    await Promise.race([socket.opened, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("اتصال به پراکسی timeout شد")), 4500); })]);
+    if (timer) { clearTimeout(timer); timer = null; }
+    reader = socket.readable.getReader(); writer = socket.writable.getWriter();
+    const useAuth = !!(proxy.username || proxy.password);
+    await writer.write(new Uint8Array(useAuth ? [5, 1, 2] : [5, 1, 0]));
+    const buffered = makeBufferedSocketReader(reader);
+    const method = await buffered.readExact(2, 4500);
+    if (method[0] !== 5 || method[1] === 255) throw new Error("روش احراز هویت SOCKS5 پذیرفته نشد.");
+    if (method[1] === 2) {
+      const user = enc.encode(proxy.username), pass = enc.encode(proxy.password);
+      if (!user.length || user.length > 255 || pass.length > 255) throw new Error("نام کاربری/رمز عبور SOCKS5 نامعتبر است.");
+      await writer.write(new Uint8Array([1, user.length, ...user, pass.length, ...pass]));
+      const auth = await buffered.readExact(2, 4500);
+      if (auth[0] !== 1 || auth[1] !== 0) throw new Error("احراز هویت SOCKS5 ناموفق بود.");
+    } else if (method[1] !== 0 || useAuth) throw new Error("پراکسی روش احراز هویت تنظیم‌شده را نپذیرفت.");
+    await writer.write(concatChunks([new Uint8Array([5, 1, 0]), encodeSocks5Address(TELEGRAM_PROXY_TEST_TARGET, 443)]));
+    const head = await buffered.readExact(4, 4500);
+    if (head[0] !== 5 || head[1] !== 0) throw new Error("اتصال SOCKS5 به مقصد تلگرام برقرار نشد (کد " + head[1] + ").");
+    if (head[3] === 1) await buffered.readExact(4, 4500);
+    else if (head[3] === 3) { const length = (await buffered.readExact(1, 4500))[0]; await buffered.readExact(length, 4500); }
+    else if (head[3] === 4) await buffered.readExact(16, 4500);
+    else throw new Error("پاسخ SOCKS5 دارای ATYP نامعتبر است.");
+    await buffered.readExact(2, 4500);
+    return { status: "ok", latency: Date.now() - started, message: "SOCKS5 به مقصد TCP/443 تلگرام متصل شد." };
+  } catch (error) {
+    return { status: "error", latency: -1, message: String(error?.message || error).slice(0, 160) };
+  } finally {
+    if (timer) clearTimeout(timer);
+    try { writer?.releaseLock(); } catch {}
+    try { reader?.releaseLock(); } catch {}
+    try { await socket?.close?.(); } catch {}
+  }
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const input = Array.isArray(items) ? items : [];
+  const results = new Array(input.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, limit), input.length) }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= input.length) return;
+      try { results[index] = await mapper(input[index], index); }
+      catch (error) { results[index] = { status: "error", message: String(error?.message || error).slice(0, 160) }; }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function fetchAndTestTelegramProxySources(rawSources) {
+  const sources = [...new Set((Array.isArray(rawSources) ? rawSources : String(rawSources || "").split(/[\r\n]+/))
+    .map(value => String(value || "").trim()).filter(Boolean))];
+  if (!sources.length || sources.length > TELEGRAM_PROXY_SOURCE_MAX_COUNT) throw new Error("بین ۱ تا ۵ آدرس منبع HTTPS وارد کنید.");
+  const allUris = [];
+  for (const source of sources) {
+    let url;
+    try { url = new URL(source); } catch { throw new Error("آدرس منبع نامعتبر است: " + source.slice(0, 100)); }
+    if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443") || !TELEGRAM_PROXY_SOURCE_HOSTS.has(url.hostname.toLowerCase())) {
+      throw new Error("منبع باید HTTPS و از raw.githubusercontent.com، gist.githubusercontent.com یا Pastebin/GitHub باشد.");
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 7000);
+    try {
+      const response = await fetch(url.toString(), { method: "GET", redirect: "error", signal: controller.signal,
+        headers: { "accept": "text/plain, application/json, text/*;q=0.9" } });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const length = Number(response.headers.get("content-length") || 0);
+      if (length > TELEGRAM_PROXY_SOURCE_MAX_BYTES) throw new Error("حجم منبع بیش از ۲۵۶ کیلوبایت است.");
+      const text = await response.text();
+      if (enc.encode(text).byteLength > TELEGRAM_PROXY_SOURCE_MAX_BYTES) throw new Error("حجم منبع بیش از ۲۵۶ کیلوبایت است.");
+      allUris.push(...extractTelegramProxyUris(text));
+    } catch (error) {
+      throw new Error("دریافت منبع " + url.hostname + " ناموفق بود: " + String(error?.message || error).slice(0, 140));
+    } finally { clearTimeout(timeout); }
+  }
+  const unique = [...new Set(allUris)].slice(0, TELEGRAM_PROXY_CANDIDATE_MAX);
+  const parsed = [];
+  const seen = new Set();
+  for (const uri of unique) {
+    try {
+      const proxy = parseExitProxyUri(uri);
+      if (proxy.kind !== "socks5" || !isSafePublicTelegramProxyHost(proxy.hostname)) continue;
+      const key = [proxy.hostname.toLowerCase(), proxy.port, proxy.username, proxy.password].join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      parsed.push({ uri, host: proxy.hostname, port: proxy.port, name: "Telegram " + proxy.hostname.replace(/^\[|\]$/g, ""), country: "UN" });
+    } catch {}
+  }
+  const tested = await mapWithConcurrency(parsed, 4, async item => ({ ...item, ...(await testTelegramSocks5Proxy(item.uri)) }));
+  return { sources: sources.length, found: parsed.length, results: tested };
+}
 
 // -------------------- Ping & Clean IP API --------------------
 const CLOUDFLARE_EDGE_CIDRS = [
@@ -1515,18 +1769,46 @@ async function saveSettings(kv, env, settings) {
     };
     const users = Array.isArray(settings.users) ? settings.users.slice(0, 50) : [];
     const exits = validateExitNodes(Array.isArray(settings.exitNodes) ? settings.exitNodes : []);
-    const statements = [
-      PANEL_DB.prepare("INSERT OR REPLACE INTO panel_meta (key, value) VALUES ('core', ?1)").bind(JSON.stringify(core)),
-      PANEL_DB.prepare("DELETE FROM panel_users"),
-      PANEL_DB.prepare("DELETE FROM panel_exit_nodes")
-    ];
-    for (const user of users) statements.push(PANEL_DB.prepare(
-      "INSERT INTO panel_users (id, name, enabled, data_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+    // Keep each D1 transaction small. Upsert desired rows first, then remove
+    // stale rows only after every write batch has completed successfully.
+    // This avoids large delete-and-reinsert transactions and is retry-safe.
+    await PANEL_DB.batch([
+      PANEL_DB.prepare("INSERT OR REPLACE INTO panel_meta (key, value) VALUES ('core', ?1)").bind(JSON.stringify(core))
+    ]);
+
+    const rowWrites = [];
+    for (const user of users) rowWrites.push(PANEL_DB.prepare(
+      "INSERT INTO panel_users (id, name, enabled, data_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) " +
+      "ON CONFLICT(id) DO UPDATE SET name=excluded.name, enabled=excluded.enabled, data_json=excluded.data_json, updated_at=excluded.updated_at"
     ).bind(String(user.id), String(user.name || "user"), user.enabled === false ? 0 : 1, JSON.stringify(user), now));
-    for (const node of exits) statements.push(PANEL_DB.prepare(
-      "INSERT INTO panel_exit_nodes (id, country, name, kind, data_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    for (const node of exits) rowWrites.push(PANEL_DB.prepare(
+      "INSERT INTO panel_exit_nodes (id, country, name, kind, data_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) " +
+      "ON CONFLICT(id) DO UPDATE SET country=excluded.country, name=excluded.name, kind=excluded.kind, data_json=excluded.data_json, updated_at=excluded.updated_at"
     ).bind(node.id, node.country, node.name, node.kind, JSON.stringify(node), now));
-    await PANEL_DB.batch(statements);
+
+    const D1_WRITE_BATCH_SIZE = 20;
+    for (let offset = 0; offset < rowWrites.length; offset += D1_WRITE_BATCH_SIZE) {
+      await PANEL_DB.batch(rowWrites.slice(offset, offset + D1_WRITE_BATCH_SIZE));
+    }
+
+    const desiredUserIds = users.map(user => String(user.id));
+    const desiredExitIds = exits.map(node => String(node.id));
+    const cleanupStatements = [];
+    if (desiredUserIds.length) {
+      cleanupStatements.push(PANEL_DB.prepare(
+        "DELETE FROM panel_users WHERE id NOT IN (" + desiredUserIds.map(() => "?").join(",") + ")"
+      ).bind(...desiredUserIds));
+    } else {
+      cleanupStatements.push(PANEL_DB.prepare("DELETE FROM panel_users"));
+    }
+    if (desiredExitIds.length) {
+      cleanupStatements.push(PANEL_DB.prepare(
+        "DELETE FROM panel_exit_nodes WHERE id NOT IN (" + desiredExitIds.map(() => "?").join(",") + ")"
+      ).bind(...desiredExitIds));
+    } else {
+      cleanupStatements.push(PANEL_DB.prepare("DELETE FROM panel_exit_nodes"));
+    }
+    await PANEL_DB.batch(cleanupStatements);
 
     const kvSettings = { ...settings };
     for (const key of ["users", "exitNodes", "passwordHash", "sessionSecret", "uuid", "trojanPassword", "subToken"]) delete kvSettings[key];
@@ -2058,6 +2340,41 @@ async function reconcileUserUsageConfigs(kv, previousUsers, nextUsers) {
   }
 }
 
+function normalizeTelegramProxy(rawUri) {
+  const original = String(rawUri == null ? "" : rawUri);
+  const input = original.trim().replace(/&amp;/gi, "&");
+  const match = /^(?:tg:\/\/socks|https?:\/\/t\.me\/socks|t\.me\/socks)\/?(?:\?([^#]*))?(?:#.*)?$/i.exec(input);
+  if (!match || match[1] === undefined) return original;
+
+  // URLSearchParams performs exactly one standards-compliant decode. Do not call
+  // decodeURIComponent on these values again: doing so corrupts literal '%' data.
+  let params;
+  try { params = new URLSearchParams(match[1]); } catch { return original; }
+  const serverValue = String(params.get("server") || "").trim();
+  const portText = String(params.get("port") || "").trim();
+  const username = String(params.get("user") || "");
+  const password = String(params.get("pass") || "");
+  if (!serverValue || !/^\d{1,5}$/.test(portText)) return original;
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return original;
+
+  // Accept bracketed or accidentally multiply-bracketed IPv6 input, normalize it
+  // to the single bracket pair required in a URI authority.
+  const server = serverValue.replace(/^\[+/, "").replace(/\]+$/, "");
+  if (!server || /[\s\/?#@\\]/.test(server)) return original;
+  let host = server;
+  if (server.includes(":")) {
+    try { new URL("http://[" + server + "]/" ); } catch { return original; }
+    host = "[" + server + "]";
+  } else {
+    if (!/^[a-z0-9.-]+$/i.test(server) || server.startsWith(".") || server.endsWith(".") || server.includes("..")) return original;
+  }
+  const auth = (username !== "" || password !== "")
+    ? encodeURIComponent(username) + ":" + encodeURIComponent(password) + "@"
+    : "";
+  return "socks5://" + auth + host + ":" + port;
+}
+
 function validateExitNodes(value) {
   if (!Array.isArray(value)) throw new Error("فهرست Exit Node باید آرایه باشد.");
   if (value.length > MAX_EXIT_NODES) throw new Error(`حداکثر ${MAX_EXIT_NODES} Exit Node مجاز است.`);
@@ -2067,7 +2384,7 @@ function validateExitNodes(value) {
     const id = String(item.id || crypto.randomUUID()).trim().replace(/[^A-Za-z0-9_-]/g, "").slice(0, 48);
     const name = String(item.name || `Exit ${index + 1}`).trim().slice(0, 48);
     const country = String(item.country || "UN").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "").slice(0, 8) || "UN";
-    const uri = String(item.uri || "").trim();
+    const uri = normalizeTelegramProxy(String(item.uri || "").trim()).trim();
     if (!id || ids.has(id)) throw new Error(`شناسه Exit Node در ردیف ${index + 1} نامعتبر یا تکراری است.`);
     if (!name || /[\r\n<>]/.test(name)) throw new Error(`نام Exit Node در ردیف ${index + 1} نامعتبر است.`);
     let parsed;
@@ -2076,12 +2393,12 @@ function validateExitNodes(value) {
     const kind = protocol === "socks5:" || protocol === "socks:" ? "socks5" : protocol === "http:" ? "http" : "";
     const port = Number(parsed.port || (kind === "socks5" ? 1080 : kind === "http" ? 8080 : 0));
     if (!kind || !parsed.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error(`Exit Node «${name}» باید socks5:// یا http:// با پورت معتبر باشد.`);
+      throw new Error(`Exit Node «${name}» باید socks5://، socks://، http:// یا لینک Telegram SOCKS با server و port معتبر باشد.`);
     }
-    if (parsed.hash || parsed.search || (parsed.pathname && parsed.pathname !== "/")) throw new Error(`آدرس Exit Node «${name}» نباید Path یا Query داشته باشد.`);
     if (parsed.username.length > 255 || parsed.password.length > 255) throw new Error(`اطلاعات احراز هویت Exit Node «${name}» بیش از حد طولانی است.`);
-    try { decodeURIComponent(parsed.username); decodeURIComponent(parsed.password); }
-    catch { throw new Error(`کدگذاری نام کاربری یا رمز Exit Node «${name}» نامعتبر است.`); }
+    const decodedUser = safeDecodeUriComponent(parsed.username || "");
+    const decodedPass = safeDecodeUriComponent(parsed.password || "");
+    if (decodedUser.length > 255 || decodedPass.length > 255) throw new Error(`اطلاعات احراز هویت Exit Node «${name}» بیش از حد طولانی است.`);
     ids.add(id);
     return { id, name, country, kind, uri, enabled: item.enabled !== false };
   });
@@ -2089,6 +2406,47 @@ function validateExitNodes(value) {
 
 function getActiveExitNodes(settings) {
   return (Array.isArray(settings?.exitNodes) ? settings.exitNodes : []).filter(node => node && node.enabled !== false);
+}
+
+function validateWorkerPlacement(value) {
+  const item = value && typeof value === "object" ? value : {};
+  const mode = String(item.mode || "smart").trim().toLowerCase();
+  if (mode === "smart") return { mode: "smart" };
+  if (mode !== "specific") throw new Error("حالت محل اجرای Worker نامعتبر است؛ Smart یا Specific را انتخاب کنید.");
+  const provider = String(item.provider || "").trim().toLowerCase();
+  const regionId = String(item.region || "").trim().toLowerCase();
+  if (!PLACEMENT_PROVIDERS.has(provider)) throw new Error("ارائه‌دهنده Region نامعتبر است؛ AWS، GCP یا Azure را انتخاب کنید.");
+  if (!/^[a-z0-9-]{2,64}$/.test(regionId)) throw new Error("شناسه Region نامعتبر است.");
+  return { mode: "specific", provider, region: regionId, target: provider + ":" + regionId };
+}
+
+function cloudflarePlacementPayload(value) {
+  const placement = validateWorkerPlacement(value);
+  return placement.mode === "smart" ? { mode: "smart" } : { region: placement.target };
+}
+
+async function applyCloudflareWorkerPlacement(env, value) {
+  const accountId = String(env.CF_ACCOUNT_ID || "").trim();
+  const apiToken = String(env.CF_API_TOKEN || "").trim();
+  const scriptName = String(env.CF_WORKER_NAME || "").trim();
+  if (!accountId || !apiToken || !scriptName) {
+    throw new Error("برای اعمال واقعی Placement باید سه Secret/Variable با نام‌های CF_ACCOUNT_ID، CF_API_TOKEN و CF_WORKER_NAME در تنظیمات Worker تعریف شوند.");
+  }
+  if (!/^[a-f0-9]{32}$/i.test(accountId)) throw new Error("CF_ACCOUNT_ID باید شناسه ۳۲ کاراکتری حساب Cloudflare باشد.");
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(scriptName)) throw new Error("CF_WORKER_NAME نام Worker معتبری نیست.");
+  const url = "https://api.cloudflare.com/client/v4/accounts/" + encodeURIComponent(accountId) + "/workers/scripts/" + encodeURIComponent(scriptName) + "/script-settings";
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + apiToken, "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ placement: cloudflarePlacementPayload(value) })
+  });
+  let result = null;
+  try { result = await response.json(); } catch {}
+  if (!response.ok || result?.success === false) {
+    const apiMessage = Array.isArray(result?.errors) ? result.errors.map(error => error?.message).filter(Boolean).join("; ") : "";
+    throw new Error("Cloudflare Placement API خطا داد: " + (apiMessage || ("HTTP " + response.status)));
+  }
+  return result;
 }
 
 function validateSettings(body, env) {
@@ -2132,6 +2490,7 @@ function validateSettings(body, env) {
     trafficByteTrackingEnabled: body.trafficByteTrackingEnabled === true,
     shadowsocksEnabled: body.shadowsocksEnabled === true,
     shadowsocksMethod: String(body.shadowsocksMethod || "aes-256-gcm").trim().toLowerCase(),
+    workerPlacement: validateWorkerPlacement(body.workerPlacement),
     exitNodes: Array.isArray(body.exitNodes) ? body.exitNodes : [],
     users: Array.isArray(body.users) ? body.users : [],
     proxies: Array.isArray(body.proxies) ? body.proxies : [],
@@ -2204,7 +2563,8 @@ function publicSettings(s, requestUrl) {
   delete exportSettings.passwordHash;
   delete exportSettings.sessionSecret;
   return { ...exportSettings, tlsPorts: TLS_PORTS, nonTlsPorts: PLAIN_PORTS,
-    extraTlsPorts: safeStoredPortList(s.extraTlsPorts), extraNonTlsPorts: safeStoredPortList(s.extraNonTlsPorts), links };
+    extraTlsPorts: safeStoredPortList(s.extraTlsPorts), extraNonTlsPorts: safeStoredPortList(s.extraNonTlsPorts), links,
+    telegramProxies: buildTelegramProxyInventory(s, requestUrl.origin) };
 }
 
 async function fallbackToken(env) {
@@ -2813,6 +3173,16 @@ function wsPathFor(settings, proto, withEarlyDataQuery = true, exitId = "") {
   if (exitId) params.push("exit=" + encodeURIComponent(exitId));
   return "/" + String(proto).toLowerCase() + (params.length ? "?" + params.join("&") : "");
 }
+function ensureWsPathExitId(path, exitId) {
+  if (!exitId) return String(path || "/");
+  const value = String(path || "/");
+  const splitAt = value.indexOf("?");
+  const pathname = splitAt < 0 ? value : value.slice(0, splitAt);
+  const query = splitAt < 0 ? "" : value.slice(splitAt + 1);
+  const params = new URLSearchParams(query);
+  params.set("exit", String(exitId));
+  return pathname + "?" + params.toString();
+}
 
 function shadowsocksWsPath(settings, exitId = "") {
   const token = encodeURIComponent(String(settings.subToken || ""));
@@ -2894,7 +3264,7 @@ function makeXrayConfig(settings, host) {
   for (const o of outboundsData) {
     const stream = {
       network: "ws", security: o.isTls ? "tls" : "none",
-      wsSettings: { path: wsPathFor(settings, o.proto, true, o.exitId), headers: { Host: sni } }
+      wsSettings: { path: ensureWsPathExitId(wsPathFor(settings, o.proto, true, ""), o.exitId), headers: { Host: sni } }
     };
     if (o.isTls) {
       stream.tlsSettings = { serverName: sni, allowInsecure: false, fingerprint: normalizeFingerprint(settings.fingerprint), alpn: ["http/1.1"] };
@@ -2910,10 +3280,10 @@ function makeXrayConfig(settings, host) {
   }
   const ssPassword = String(settings.shadowsocksPassword || settings.uuid || "");
   for (const item of generateShadowsocksOutboundsData(settings, endpoints)) {
-    const path = shadowsocksWsPath(settings, item.exitId);
+    const path = ensureWsPathExitId(shadowsocksWsPath(settings), item.exitId);
     const streamSettings = {
       network: "ws", security: item.isTls ? "tls" : "none",
-      wsSettings: { path, headers: { Host: sni } }
+      wsSettings: { path: ensureWsPathExitId(path, item.exitId), headers: { Host: sni } }
     };
     if (item.isTls) {
       streamSettings.tlsSettings = { serverName: sni, allowInsecure: false, fingerprint: normalizeFingerprint(settings.fingerprint), alpn: ["http/1.1"] };
@@ -2999,7 +3369,9 @@ function makeSingBoxConfig(settings, host) {
     return config;
   };
 
-  const transport = path => {
+  const transport = (path, exitId = "") => {
+    // Exit Node selection is carried in the WS path so the Worker receives ?exit=<id>.
+    path = ensureWsPathExitId(path, exitId);
     // Early data travels in the Sec-WebSocket-Protocol header (Xray-compatible),
     // so the path stays clean; max_early_data matches the "?ed=" value in URI/Xray outputs.
     const t = { type: "ws", path, headers: { Host: sni } };
@@ -3010,9 +3382,9 @@ function makeSingBoxConfig(settings, host) {
   for (const o of outboundsData) {
     tags.push(o.tag);
     if (o.proto === "VLESS") {
-      outbounds.push({ type: "vless", tag: o.tag, server: o.address, server_port: o.port, uuid: settings.uuid, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "vless", false, o.exitId)) });
+      outbounds.push({ type: "vless", tag: o.tag, server: o.address, server_port: o.port, uuid: settings.uuid, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "vless", false, ""), o.exitId) });
     } else {
-      outbounds.push({ type: "trojan", tag: o.tag, server: o.address, server_port: o.port, password: settings.trojanPassword, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "trojan", false, o.exitId)) });
+      outbounds.push({ type: "trojan", tag: o.tag, server: o.address, server_port: o.port, password: settings.trojanPassword, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "trojan", false, ""), o.exitId) });
     }
   }
   const ssPassword = String(settings.shadowsocksPassword || settings.uuid || "");
@@ -3212,11 +3584,38 @@ async function shadowsocksDecrypt(key, nonce, ciphertext) {
 }
 
 function parseShadowsocksAddress(bytes) {
-  const address = parseTrojanAddress(bytes, 0);
-  if (address.next + 2 > bytes.length) throw new Error("truncated Shadowsocks destination port");
-  const port = (bytes[address.next] << 8) | bytes[address.next + 1];
+  if (!(bytes instanceof Uint8Array)) throw new Error("invalid Shadowsocks destination address");
+  if (bytes.length < 1) return { incomplete: true };
+  let p = 1;
+  const type = bytes[0];
+  let host = "";
+  if (type === 1) {
+    if (bytes.length < p + 4) return { incomplete: true };
+    host = Array.from(bytes.subarray(p, p + 4)).join(".");
+    if (!isIPv4Text(host)) throw new Error("invalid Shadowsocks IPv4 address");
+    p += 4;
+  } else if (type === 3) {
+    if (bytes.length < p + 1) return { incomplete: true };
+    const length = bytes[p++];
+    if (length < 1) throw new Error("invalid Shadowsocks domain length");
+    if (bytes.length < p + length) return { incomplete: true };
+    host = dec.decode(bytes.subarray(p, p + length));
+    if (!isDomainName(host) && !isIPv4Text(host)) throw new Error("invalid Shadowsocks domain address");
+    p += length;
+  } else if (type === 4) {
+    if (bytes.length < p + 16) return { incomplete: true };
+    const groups = [];
+    for (let i = 0; i < 16; i += 2) groups.push(((bytes[p + i] << 8) | bytes[p + i + 1]).toString(16));
+    host = groups.join(":");
+    if (!isIPv6Text(host)) throw new Error("invalid Shadowsocks IPv6 address");
+    p += 16;
+  } else {
+    throw new Error("unsupported Shadowsocks address type");
+  }
+  if (bytes.length < p + 2) return { incomplete: true };
+  const port = (bytes[p] << 8) | bytes[p + 1];
   if (!port) throw new Error("invalid Shadowsocks destination port");
-  return { host: address.host, port, data: bytes.slice(address.next + 2) };
+  return { host, port, data: bytes.slice(p + 2), headerLength: p + 2 };
 }
 
 async function encryptShadowsocksStreamChunk(key, nonce, payload) {
@@ -3251,13 +3650,18 @@ async function handleShadowsocksTunnel(request, env, kv, subscriptionToken, ctx,
 
   const pair = new WebSocketPair();
   const client = pair[0], server = pair[1];
+  try { server.binaryType = "arraybuffer"; } catch {}
   server.accept({ allowHalfOpen: true });
   let finished = false, initialized = false, sessionStarted = false;
   let activeUser = null, activeSettings = settings, userUsageAtStart = null, userTrafficLedger = null;
   let userSessionBytes = 0, userSessionPersistedBytes = 0, userUsageFlushTimer = null;
   let userTrafficPersistChain = Promise.resolve(), remote = null, remoteWriter = null;
   const userSessionDailyBytes = new Map();
-  const inputState = { buffer: new Uint8Array(0), saltReady: false, cipherKey: null, nonce: new Uint8Array(12), expectedLength: null };
+  const inputState = { saltReady: false, cipherKey: null, nonce: new Uint8Array(12), expectedLength: null };
+  let pendingShadowsocksAddress = new Uint8Array(0);
+  const encryptedInputQueue = createByteQueue(256 * 1024, 16 * 1024);
+  let ssUpstreamQueue = null;
+  let ssDownstreamSender = null;
   let responseCipherKey = null, responseNonce = new Uint8Array(12);
 
   const queueUserTrafficFlush = (force = false) => {
@@ -3284,13 +3688,22 @@ async function handleShadowsocksTunnel(request, env, kv, subscriptionToken, ctx,
     return Promise.resolve();
   };
 
+  let shutdownPromise = null;
   const closeAll = () => {
-    if (finished) return userTrafficPersistChain;
+    if (finished) return shutdownPromise || userTrafficPersistChain;
     finished = true;
+    if (ssDownstreamSender) ssDownstreamSender.cancel();
+    shutdownPromise = Promise.resolve().then(async () => {
+      if (ssUpstreamQueue) {
+        try { await ssUpstreamQueue.drain(); } catch {}
+        ssUpstreamQueue.cancel();
+      }
+      try { if (remoteWriter) await remoteWriter.close(); } catch {}
+      try { remote?.close?.(); } catch {}
+      return releaseUserSession();
+    });
     try { server.close(); } catch {}
-    try { if (remoteWriter) remoteWriter.close().catch(() => {}); } catch {}
-    try { remote?.close?.(); } catch {}
-    return releaseUserSession();
+    return shutdownPromise;
   };
 
   const recordTraffic = amount => {
@@ -3311,15 +3724,17 @@ async function handleShadowsocksTunnel(request, env, kv, subscriptionToken, ctx,
   };
 
   const startRemotePump = async readable => {
-    const reader = readable.getReader();
+    const reader = createWorkerReadableReader(readable, 64 * 1024);
+    ssDownstreamSender = createShadowsocksDownstreamSender(server, responseCipherKey, responseNonce, () => finished);
     try {
       while (!finished) {
         const item = await reader.read();
         if (item.done) break;
         if (!item.value?.byteLength) continue;
         if (!recordTraffic(item.value.byteLength)) return;
-        await sendShadowsocksEncrypted(server, responseCipherKey, responseNonce, item.value);
+        await ssDownstreamSender.enqueue(item.value);
       }
+      if (!finished) await ssDownstreamSender.flush();
     } catch (error) {
       console.warn("Shadowsocks remote stream ended:", String(error?.message || error).slice(0, 100));
     } finally { try { reader.releaseLock(); } catch {} }
@@ -3337,13 +3752,11 @@ async function handleShadowsocksTunnel(request, env, kv, subscriptionToken, ctx,
       registerUserConnection(activeUser.id || "default", closeAll);
       sessionStarted = true;
     }
-    if (inputState.buffer.length + bytes.length > 256 * 1024) throw new Error("Shadowsocks input buffer limit exceeded");
-    inputState.buffer = concatChunks([inputState.buffer, bytes]);
+    encryptedInputQueue.append(bytes);
 
     if (!inputState.saltReady) {
-      if (inputState.buffer.length < keyLength) return;
-      const salt = inputState.buffer.slice(0, keyLength);
-      inputState.buffer = inputState.buffer.slice(keyLength);
+      if (encryptedInputQueue.available < keyLength) return;
+      const salt = encryptedInputQueue.take(keyLength);
       inputState.cipherKey = await deriveShadowsocksSubkey(userPassword, method, salt);
       inputState.nonce = new Uint8Array(12);
       inputState.saltReady = true;
@@ -3351,9 +3764,8 @@ async function handleShadowsocksTunnel(request, env, kv, subscriptionToken, ctx,
 
     while (!finished) {
       if (inputState.expectedLength === null) {
-        if (inputState.buffer.length < 18) return;
-        const encryptedLength = inputState.buffer.slice(0, 18);
-        inputState.buffer = inputState.buffer.slice(18);
+        if (encryptedInputQueue.available < 18) return;
+        const encryptedLength = encryptedInputQueue.take(18);
         const plainLength = await shadowsocksDecrypt(inputState.cipherKey, inputState.nonce, encryptedLength);
         incrementShadowsocksNonce(inputState.nonce);
         if (plainLength.length !== 2) throw new Error("invalid Shadowsocks encrypted length");
@@ -3361,9 +3773,8 @@ async function handleShadowsocksTunnel(request, env, kv, subscriptionToken, ctx,
         if (inputState.expectedLength < 1 || inputState.expectedLength > 0x3fff) throw new Error("Shadowsocks chunk size is invalid");
       }
       const frameLength = inputState.expectedLength + 16;
-      if (inputState.buffer.length < frameLength) return;
-      const encryptedPayload = inputState.buffer.slice(0, frameLength);
-      inputState.buffer = inputState.buffer.slice(frameLength);
+      if (encryptedInputQueue.available < frameLength) return;
+      const encryptedPayload = encryptedInputQueue.take(frameLength);
       const payload = await shadowsocksDecrypt(inputState.cipherKey, inputState.nonce, encryptedPayload);
       incrementShadowsocksNonce(inputState.nonce);
       inputState.expectedLength = null;
@@ -3371,11 +3782,21 @@ async function handleShadowsocksTunnel(request, env, kv, subscriptionToken, ctx,
       if (!recordTraffic(payload.length)) return;
 
       if (!initialized) {
-        const destination = parseShadowsocksAddress(payload);
+        pendingShadowsocksAddress = concatChunks([pendingShadowsocksAddress, payload]);
+        const destination = parseShadowsocksAddress(pendingShadowsocksAddress);
+        if (destination.incomplete) {
+          if (pendingShadowsocksAddress.length > 259) throw new Error("Shadowsocks destination header is too large");
+          continue;
+        }
+        pendingShadowsocksAddress = new Uint8Array(0);
         if (!isAllowedDestinationPort(destination.port, env)) throw new Error("port not allowed");
         remote = await openOutbound(activeSettings, destination.host, destination.port, destination.data, -1, preferredExitId);
         if (finished) { try { remote.close(); } catch {} return; }
         remoteWriter = remote.writable.getWriter();
+        ssUpstreamQueue = createChunkCoalescer(bytes => remoteWriter.write(bytes), {
+          targetBytes: UPSTREAM_BUNDLE_TARGET_BYTES, maxBytes: UPSTREAM_BUNDLE_MAX_BYTES,
+          delayMs: UPSTREAM_BUNDLE_DELAY_MS, onError: () => { void closeAll(); }
+        });
         const responseSalt = crypto.getRandomValues(new Uint8Array(keyLength));
         responseCipherKey = await deriveShadowsocksSubkey(userPassword, method, responseSalt);
         responseNonce = new Uint8Array(12);
@@ -3384,7 +3805,7 @@ async function handleShadowsocksTunnel(request, env, kv, subscriptionToken, ctx,
         void startRemotePump(remote.readable);
       } else {
         if (!remoteWriter) throw new Error("Shadowsocks remote stream is not ready");
-        await remoteWriter.write(payload);
+        await ssUpstreamQueue.enqueue(payload);
       }
     }
   };
@@ -3414,10 +3835,12 @@ async function handleTunnel(request, env, kv, kind, ctx, preferredExitId = "") {
   const earlyDataProtocol = getEarlyDataProtocolForResponse(earlyDataHeader, earlyBytes);
   const pair = new WebSocketPair();
   const client = pair[0], server = pair[1];
+  try { server.binaryType = "arraybuffer"; } catch {}
   server.accept({ allowHalfOpen: true });
 
   let initialized = false, finished = false, inboundQueue = Promise.resolve();
   let udp = null, dest = null, remote = null, remoteWriter = null, generation = 0;
+  let upstreamQueue = null;
   let receivedAny = false, switching = null;
   let initialWritesBuffer = [], initialWritesSize = 0, bufferOverflow = false;
   let activeUser = null, userUsageAtStart = null, userTrafficLedger = null, userSessionBytes = 0, userSessionPersistedBytes = 0, sessionReleased = false;
@@ -3453,14 +3876,22 @@ async function handleTunnel(request, env, kv, kind, ctx, preferredExitId = "") {
     return releasePromise || Promise.resolve();
   };
 
+  let shutdownPromise = null;
   const closeAll = () => {
-    if (finished) return releasePromise || Promise.resolve();
+    if (finished) return shutdownPromise || releasePromise || Promise.resolve();
     finished = true;
-    try { server.close(); } catch {}
-    try { if (remoteWriter) remoteWriter.close().catch(() => {}); } catch {}
-    try { if (remote && remote.close) remote.close(); } catch {}
     initialWritesBuffer = [];
-    return releaseUserSession();
+    shutdownPromise = Promise.resolve().then(async () => {
+      if (upstreamQueue) {
+        try { await upstreamQueue.drain(); } catch {}
+        upstreamQueue.cancel();
+      }
+      try { if (remoteWriter) await remoteWriter.close(); } catch {}
+      try { if (remote && remote.close) remote.close(); } catch {}
+      return releaseUserSession();
+    });
+    try { server.close(); } catch {}
+    return shutdownPromise;
   };
 
   const recordTraffic = amount => {
@@ -3494,7 +3925,7 @@ async function handleTunnel(request, env, kv, kind, ctx, preferredExitId = "") {
     initialWritesBuffer.push(bytes); initialWritesSize += bytes.length;
   };
 
-  const routesAfterCurrent = () => remote && Number.isInteger(remote.routeIndex) && remote.routeIndex < buildOutboundRoutes(settings, preferredExitId).length - 1;
+  const routesAfterCurrent = () => remote && Number.isInteger(remote.routeIndex) && remote.routeIndex < buildOutboundRoutes(activeSettings, preferredExitId).length - 1;
   const canFallback = () => !finished && !!dest && !receivedAny && !bufferOverflow && routesAfterCurrent();
 
   const startFallback = () => {
@@ -3504,7 +3935,7 @@ async function handleTunnel(request, env, kv, kind, ctx, preferredExitId = "") {
       let next = null;
       try {
         const sentCount = initialWritesBuffer.length;
-        next = await openOutbound(settings, dest.host, dest.port, concatChunks(initialWritesBuffer), remote.routeIndex, preferredExitId);
+        next = await openOutbound(activeSettings, dest.host, dest.port, concatChunks(initialWritesBuffer), remote.routeIndex, preferredExitId);
         if (finished) { try { next.close(); } catch {} return false; }
         const nextWriter = next.writable.getWriter();
         for (let i = sentCount; i < initialWritesBuffer.length; i++) {
@@ -3532,11 +3963,20 @@ async function handleTunnel(request, env, kv, kind, ctx, preferredExitId = "") {
     closeAll
   };
 
-  const writeRemote = async bytes => {
-    rememberWrite(bytes);
-    if (switching) { await switching; return; }
+  const writeRemoteRaw = async bytes => {
+    if (switching) await switching;
     try { await remoteWriter.write(bytes); }
     catch (err) { if (canFallback() && await startFallback()) return; throw err; }
+  };
+  upstreamQueue = createChunkCoalescer(writeRemoteRaw, {
+    targetBytes: UPSTREAM_BUNDLE_TARGET_BYTES,
+    maxBytes: UPSTREAM_BUNDLE_MAX_BYTES,
+    delayMs: UPSTREAM_BUNDLE_DELAY_MS,
+    onError: () => { void closeAll(); }
+  });
+  const writeRemote = bytes => {
+    rememberWrite(bytes);
+    return upstreamQueue.enqueue(bytes);
   };
 
   const startTcp = async parsed => {
@@ -3546,7 +3986,7 @@ async function handleTunnel(request, env, kv, kind, ctx, preferredExitId = "") {
     // Acknowledge the VLESS request right away so the client is not left waiting
     // (and the socket does not stall) while the outbound connection is opened.
     if (kind === "vless" && !finished) server.send(new Uint8Array([parsed.version, 0]));
-    const r = await openOutbound(settings, parsed.host, parsed.port, parsed.data, -1, preferredExitId);
+    const r = await openOutbound(activeSettings, parsed.host, parsed.port, parsed.data, -1, preferredExitId);
     if (finished) { try { r.close(); } catch {} return; }
     remote = r; remoteWriter = r.writable.getWriter();
     generation++;
@@ -3635,29 +4075,238 @@ function decodeEarlyData(header) {
 }
 
 function concatChunks(chunks) {
+  if (!chunks || !chunks.length) return new Uint8Array(0);
+  if (chunks.length === 1) return chunks[0];
   const out = new Uint8Array(chunks.reduce((s, c) => s + c.length, 0));
   let p = 0; for (const c of chunks) { out.set(c, p); p += c.length; }
   return out;
 }
 
-async function pumpRemote(readable, ws, hooks, gen) {
-  let receivedAny = false;
-  try {
-    const reader = readable.getReader();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (!value || !value.byteLength) continue;
-      if (hooks.isStale(gen)) return;
-      if (!hooks.onRemoteBytes(value.byteLength)) return;
-      if (!receivedAny) { receivedAny = true; hooks.onFirstByte(); }
-      if (ws.readyState !== WebSocket.OPEN) break;
-      ws.send(value);
+// Bounded, timer-assisted coalescing. It limits queue growth and preserves stream order.
+function createChunkCoalescer(write, options = {}) {
+  const targetBytes = Math.max(1, Number(options.targetBytes) || UPSTREAM_BUNDLE_TARGET_BYTES);
+  const maxBytes = Math.max(targetBytes, Number(options.maxBytes) || UPSTREAM_BUNDLE_MAX_BYTES);
+  const batchLimit = Math.min(targetBytes, maxBytes);
+  const delayMs = Math.max(1, Number(options.delayMs) || UPSTREAM_BUNDLE_DELAY_MS);
+  const onError = typeof options.onError === "function" ? options.onError : null;
+  let chunks = [], size = 0, timer = null, tail = Promise.resolve(), closed = false;
+  let failure = null;
+  const clearTimer = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const flush = () => {
+    clearTimer();
+    if (failure) return Promise.reject(failure);
+    if (!size) return tail;
+    const batch = concatChunks(chunks);
+    chunks = []; size = 0;
+    const job = tail.then(() => {
+      if (closed) throw new Error("stream queue closed");
+      return write(batch);
+    });
+    tail = job.catch(error => {
+      failure = error;
+      if (onError) { try { onError(error); } catch {} }
+    });
+    return job;
+  };
+  const enqueue = async chunk => {
+    if (closed) throw new Error("stream queue closed");
+    if (failure) throw failure;
+    if (!chunk || !chunk.byteLength) return;
+    // Split oversized frames so the queue itself never retains an unbounded
+    // single WebSocket message while waiting for the timer/remote writer.
+    let offset = 0;
+    while (offset < chunk.byteLength) {
+      if (closed) throw new Error("stream queue closed");
+      if (failure) throw failure;
+      const room = Math.max(1, batchLimit - size);
+      const count = Math.min(room, chunk.byteLength - offset);
+      chunks.push(chunk.subarray(offset, offset + count));
+      size += count; offset += count;
+      if (size >= batchLimit) await flush();
     }
-  } catch {}
+    if (size && !timer) timer = setTimeout(() => { timer = null; void flush().catch(() => {}); }, delayMs);
+  };
+  const drain = async () => { await flush(); await tail; if (failure) throw failure; };
+  const cancel = () => { closed = true; clearTimer(); chunks = []; size = 0; };
+  return { enqueue, flush, drain, cancel, get pendingBytes() { return size; } };
+}
+
+// Compactable byte queue: avoids concatenating and slicing the entire Shadowsocks
+// handshake buffer for every WebSocket message. Memory grows only when needed.
+function createByteQueue(maxCapacity = 256 * 1024, initialCapacity = 16 * 1024) {
+  const max = Math.max(1, Number(maxCapacity) || 256 * 1024);
+  let buffer = new Uint8Array(Math.min(max, Math.max(1024, initialCapacity)));
+  let head = 0, tail = 0;
+  const available = () => tail - head;
+  const append = chunk => {
+    if (!chunk || !chunk.byteLength) return;
+    const current = available();
+    if (current + chunk.byteLength > max) throw new Error("Shadowsocks input buffer limit exceeded");
+    if (buffer.length - tail < chunk.byteLength && head > 0) {
+      buffer.copyWithin(0, head, tail); tail -= head; head = 0;
+    }
+    const needed = tail + chunk.byteLength;
+    if (needed > buffer.length) {
+      let capacity = buffer.length;
+      while (capacity < needed) capacity = Math.min(max, Math.max(capacity * 2, needed));
+      const grown = new Uint8Array(capacity);
+      grown.set(buffer.subarray(head, tail));
+      tail -= head; head = 0; buffer = grown;
+    }
+    buffer.set(chunk, tail); tail += chunk.byteLength;
+  };
+  const take = length => {
+    const count = Number(length);
+    if (!Number.isInteger(count) || count < 0 || count > available()) throw new Error("byte queue underflow");
+    // Return a view instead of allocating/copying every frame. Message handling
+    // is serialized; the next append/compaction occurs after the caller has
+    // finished its awaited decrypt operation on this view.
+    const result = buffer.subarray(head, head + count);
+    head += count;
+    if (head === tail) { head = 0; tail = 0; }
+    return result;
+  };
+  return { append, take, get available() { return available(); } };
+}
+
+function waitForBackpressure(ws, isStopped = () => false) {
+  if (typeof ws?.bufferedAmount !== "number") return Promise.resolve();
+  return (async () => {
+    let value = Number(ws.bufferedAmount) || 0;
+    if (value <= DOWNSTREAM_BACKPRESSURE_BYTES) return;
+    const started = Date.now();
+    while (value > DOWNSTREAM_BACKPRESSURE_RESUME_BYTES) {
+      if (isStopped() || ws.readyState !== WebSocket.OPEN) throw new Error("WebSocket closed during downstream backpressure");
+      if (Date.now() - started > 30000) throw new Error("WebSocket downstream remained backpressured");
+      await new Promise(resolve => setTimeout(resolve, 5));
+      value = Number(ws.bufferedAmount) || 0;
+    }
+  })();
+}
+
+function adjustSmartBuffer(ws, current) {
+  const amount = typeof ws?.bufferedAmount === "number" ? Number(ws.bufferedAmount) || 0 : 0;
+  if (amount > 2 * 1024 * 1024) return Math.max(DOWNSTREAM_MIN_BUFFER_BYTES, Math.floor(current / 2));
+  if (amount < 512 * 1024) return Math.min(DOWNSTREAM_MAX_BUFFER_BYTES, Math.max(current + DOWNSTREAM_MIN_BUFFER_BYTES, current * 2));
+  return current;
+}
+
+function createDownstreamSender(ws, isStopped = () => false) {
+  let targetBytes = DOWNSTREAM_MIN_BUFFER_BYTES;
+  let chunks = [], size = 0, timer = null, tail = Promise.resolve(), failure = null, closed = false;
+  const clearTimer = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const flush = () => {
+    clearTimer();
+    if (failure) return Promise.reject(failure);
+    if (!size) return tail;
+    const payload = concatChunks(chunks); chunks = []; size = 0;
+    const job = tail.then(async () => {
+      if (closed || isStopped() || ws.readyState !== WebSocket.OPEN) throw new Error("downstream WebSocket is closed");
+      await waitForBackpressure(ws, isStopped);
+      if (closed || isStopped() || ws.readyState !== WebSocket.OPEN) throw new Error("downstream WebSocket is closed");
+      ws.send(payload);
+      targetBytes = adjustSmartBuffer(ws, targetBytes);
+    });
+    tail = job.catch(error => { failure = error; });
+    return job;
+  };
+  const enqueue = chunk => {
+    if (closed) return Promise.reject(new Error("downstream sender closed"));
+    if (failure) return Promise.reject(failure);
+    if (!chunk || !chunk.byteLength) return Promise.resolve();
+    chunks.push(chunk); size += chunk.byteLength;
+    if (size >= targetBytes || size >= DOWNSTREAM_MAX_BUFFER_BYTES) return flush();
+    if (!timer) timer = setTimeout(() => { timer = null; void flush().catch(() => {}); }, DOWNSTREAM_FLUSH_DELAY_MS);
+    return Promise.resolve();
+  };
+  const drain = async () => { await flush(); await tail; if (failure) throw failure; };
+  const cancel = () => { closed = true; clearTimer(); chunks = []; size = 0; };
+  return { enqueue, flush, drain, cancel };
+}
+
+function createWorkerReadableReader(readable, bufferSize = 64 * 1024) {
+  try {
+    const reader = readable.getReader({ mode: "byob" });
+    let buffer = new Uint8Array(bufferSize);
+    return {
+      async read() {
+        const result = await reader.read(buffer);
+        if (!result.done) {
+          const returnedBuffer = result.value?.buffer;
+          buffer = returnedBuffer && returnedBuffer.byteLength >= 1024
+            ? new Uint8Array(returnedBuffer)
+            : new Uint8Array(bufferSize);
+        }
+        return result;
+      },
+      releaseLock() { try { reader.releaseLock(); } catch {} },
+      byob: true
+    };
+  } catch {
+    const reader = readable.getReader();
+    return { read: () => reader.read(), releaseLock() { try { reader.releaseLock(); } catch {} }, byob: false };
+  }
+}
+
+function createShadowsocksDownstreamSender(ws, key, nonce, isStopped = () => false) {
+  const frameBuffer = new Uint8Array(0x3fff);
+  let used = 0, timer = null, tail = Promise.resolve(), failure = null, closed = false;
+  const clearTimer = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const flush = () => {
+    clearTimer();
+    if (failure) return Promise.reject(failure);
+    if (!used) return tail;
+    const payload = frameBuffer.slice(0, used); used = 0;
+    const job = tail.then(async () => {
+      if (closed || isStopped() || ws.readyState !== WebSocket.OPEN) throw new Error("Shadowsocks downstream WebSocket is closed");
+      await sendShadowsocksEncrypted(ws, key, nonce, payload);
+    });
+    tail = job.catch(error => { failure = error; });
+    return job;
+  };
+  const enqueue = async data => {
+    if (closed) throw new Error("Shadowsocks downstream sender closed");
+    if (failure) throw failure;
+    let offset = 0;
+    while (offset < data.byteLength) {
+      const count = Math.min(frameBuffer.length - used, data.byteLength - offset);
+      frameBuffer.set(data.subarray(offset, offset + count), used);
+      used += count; offset += count;
+      if (used === frameBuffer.length) await flush();
+    }
+    if (used && !timer) timer = setTimeout(() => { timer = null; void flush().catch(() => {}); }, DOWNSTREAM_FLUSH_DELAY_MS);
+  };
+  const cancel = () => { closed = true; clearTimer(); used = 0; };
+  return { enqueue, flush, cancel };
+}
+
+async function pumpRemote(readable, ws, hooks, gen) {
+  let receivedAny = false, pipeFailed = false;
+  const sender = createDownstreamSender(ws, () => hooks.isStale(gen));
+  const sink = new WritableStream({
+    async write(value) {
+      if (hooks.isStale(gen)) throw new Error("stale outbound stream");
+      if (!value || !value.byteLength) return;
+      if (!hooks.onRemoteBytes(value.byteLength)) throw new Error("traffic quota reached");
+      if (!receivedAny) { receivedAny = true; hooks.onFirstByte(); }
+      if (ws.readyState !== WebSocket.OPEN) throw new Error("downstream WebSocket is not open");
+      await sender.enqueue(value);
+    },
+    async close() { await sender.flush(); },
+    abort() { sender.cancel(); }
+  });
+  try { await readable.pipeTo(sink); }
+  catch { pipeFailed = true; }
+  if (pipeFailed && receivedAny && !hooks.isStale(gen)) { try { await sender.flush(); } catch {} }
+  else if (pipeFailed && !receivedAny) sender.cancel();
   if (!receivedAny) { let recovered = false; try { recovered = await hooks.fallback(gen); } catch {} if (recovered) return; }
   if (hooks.isStale(gen)) return;
   hooks.closeAll();
+}
+
+function isTelegramDatacenterIp(host) {
+  const value = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
+  return /^(?:149\.154\.|91\.108\.|185\.76\.151\.|2001:b28:f23[dcef]:|2001:67c:4e8:)/i.test(value);
 }
 
 function buildOutboundRoutes(settings, preferredExitId = "") {
@@ -3681,8 +4330,21 @@ async function openOutbound(settings, host, port, initialData, afterRouteIndex =
   const routes = buildOutboundRoutes(settings, preferredExitId);
   let lastError = null;
   const startIndex = Number.isInteger(Number(afterRouteIndex)) ? Number(afterRouteIndex) + 1 : 0;
+  const directIndex = routes.findIndex(route => route.type === "direct");
+  const telegramDirect = Number(port) === 443 && isTelegramDatacenterIp(host);
+  // Telegram DC IPs on TCP/443 are forwarded immediately, without waiting for any
+  // SNI/domain sniffing. This Worker does not otherwise sniff TLS; the destination
+  // IP is already supplied by the inbound protocol. If direct egress fails, regular
+  // configured routes remain available as fallback.
+  if (telegramDirect && Number(afterRouteIndex) < directIndex) {
+    try {
+      const direct = await openDirect(host, port, initialData);
+      return { ...direct, routeIndex: directIndex < 0 ? routes.length - 1 : directIndex, routeType: "telegram-direct", viaProxyIP: false };
+    } catch (err) { lastError = err; }
+  }
   for (let index = Math.max(0, startIndex); index < routes.length; index++) {
     const route = routes[index];
+    if (telegramDirect && route.type === "direct") continue;
     try {
       let tunnel;
       if (route.type === "chain") tunnel = await openChainedWebSocket(route.value, host, port, initialData);
@@ -3779,17 +4441,19 @@ function socketReadableWithPrefix(prefix, readable) {
 }
 
 function safeDecodeUriComponent(value) {
-  try { return decodeURIComponent(String(value || "")); }
-  catch { throw new Error("invalid percent-encoding in Exit Node credentials"); }
+  const raw = String(value || "");
+  try { return decodeURIComponent(raw); }
+  catch { return raw; }
 }
 
 function parseExitProxyUri(uri) {
-  const u = new URL(String(uri));
+  const normalizedUri = normalizeTelegramProxy(uri);
+  const u = new URL(String(normalizedUri));
   const protocol = u.protocol.toLowerCase();
   if (!(["socks5:", "socks:", "http:"].includes(protocol))) throw new Error("unsupported Exit Node protocol");
   return {
     kind: protocol === "http:" ? "http" : "socks5",
-    hostname: u.hostname,
+    hostname: String(u.hostname || "").replace(/^\[|\]$/g, ""),
     port: Number(u.port || (protocol === "http:" ? 8080 : 1080)),
     username: safeDecodeUriComponent(u.username || ""),
     password: safeDecodeUriComponent(u.password || "")
@@ -4179,7 +4843,14 @@ function fakeLandingResponse() {
 const FAKE_LANDING_HTML = String.raw`<!doctype html>
 <html lang="en" dir="ltr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Botwise — Notes on AI &amp; Telegram Chatbots</title>
 <meta name="description" content="A small blog about AI assistants and building helpful chatbots on Telegram.">
-<style>:root{color-scheme:light;--ink:#1b2735;--muted:#5f6f82;--line:#e3e9f0;--paper:#fff;--bg:#f5f8fc;--accent:#2a8bd1}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.7}.wrap{width:min(920px,calc(100% - 32px));margin:auto}.hero{padding:56px 0 36px;background:linear-gradient(135deg,#e6f2fb,#f5f8fc)}.brand{font-size:14px;font-weight:700;color:var(--accent);letter-spacing:.04em;text-transform:uppercase}.hero h1{font-size:clamp(28px,5vw,44px);line-height:1.25;margin:10px 0 12px}.hero p{max-width:660px;color:var(--muted);margin:0;font-size:17px}nav{display:flex;gap:20px;flex-wrap:wrap;padding:14px 0;border-bottom:1px solid var(--line);font-size:14px;color:var(--muted)}main{padding:30px 0 54px}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:22px}.card h2{font-size:19px;line-height:1.35;margin:10px 0 8px}.card p{margin:0;color:var(--muted);font-size:15px}.tag{display:inline-block;background:#e9f3fb;border-radius:99px;padding:3px 10px;font-size:12px;color:var(--accent)}footer{border-top:1px solid var(--line);padding:20px 0 30px;color:var(--muted);font-size:13px}@media(max-width:620px){.cards{grid-template-columns:1fr}}</style></head>
+<style>:root{color-scheme:light;--ink:#1b2735;--muted:#5f6f82;--line:#e3e9f0;--paper:#fff;--bg:#f5f8fc;--accent:#2a8bd1}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.7}.wrap{width:min(920px,calc(100% - 32px));margin:auto}.hero{padding:56px 0 36px;background:linear-gradient(135deg,#e6f2fb,#f5f8fc)}.brand{font-size:14px;font-weight:700;color:var(--accent);letter-spacing:.04em;text-transform:uppercase}.hero h1{font-size:clamp(28px,5vw,44px);line-height:1.25;margin:10px 0 12px}.hero p{max-width:660px;color:var(--muted);margin:0;font-size:17px}nav{display:flex;gap:20px;flex-wrap:wrap;padding:14px 0;border-bottom:1px solid var(--line);font-size:14px;color:var(--muted)}main{padding:30px 0 54px}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:22px}.card h2{font-size:19px;line-height:1.35;margin:10px 0 8px}.card p{margin:0;color:var(--muted);font-size:15px}.tag{display:inline-block;background:#e9f3fb;border-radius:99px;padding:3px 10px;font-size:12px;color:var(--accent)}footer{border-top:1px solid var(--line);padding:20px 0 30px;color:var(--muted);font-size:13px}@media(max-width:620px){.cards{grid-template-columns:1fr}}
+.placement-region-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px;max-height:310px;overflow:auto;padding:8px;border:1px solid rgba(90,130,190,.22);border-radius:14px;background:rgba(5,12,25,.36)}
+.placement-region-option{display:flex;flex-direction:column;align-items:flex-start;gap:3px;text-align:left;direction:ltr;min-height:58px;padding:10px 12px;border:1px solid rgba(90,130,190,.24);border-radius:11px;background:rgba(17,26,48,.62);color:inherit;cursor:pointer}
+.placement-region-option small{opacity:.68;font-size:11px;direction:rtl}
+.placement-region-option.active{border-color:#10c4e4;box-shadow:0 0 0 1px rgba(16,196,228,.3);background:rgba(11,83,108,.28)}
+.placement-provider.active{border-color:#10c4e4;color:#27c9e7;background:rgba(10,117,145,.16)}
+@media(max-width:640px){.placement-region-list{grid-template-columns:1fr 1fr;max-height:260px}.placement-region-option{min-width:0}}
+</style></head>
 <body><header class="hero"><div class="wrap"><div class="brand">Botwise</div><h1>Practical notes on AI and Telegram chatbots</h1><p>AI assistants are changing how we search, write and get things done. Telegram, with its open Bot API, is one of the easiest places to put them to work. This blog collects short, hands-on notes for curious beginners and builders.</p></div></header><div class="wrap"><nav><span>Home</span><span>Articles</span><span>About</span><span>Contact</span></nav></div><main class="wrap"><div class="cards"><article class="card"><span class="tag">AI Basics</span><h2>What is an AI chatbot, really?</h2><p>Modern chatbots rely on large language models that predict useful text from the context you give them. Here is a plain-English look at what they can do well, and where they still need a human in the loop.</p></article><article class="card"><span class="tag">Telegram</span><h2>Why Telegram is a great home for bots</h2><p>Telegram bots are free to create through BotFather, work on every device, and support buttons, inline queries, files and payments, so a small idea can reach people quickly.</p></article><article class="card"><span class="tag">Getting Started</span><h2>Your first Telegram bot in an afternoon</h2><p>Create a bot token, choose between long polling and webhooks, and answer your first message. We walk through the core ideas without the jargon.</p></article><article class="card"><span class="tag">Good Practice</span><h2>Designing helpful, respectful chatbots</h2><p>Clear commands, honest answers, sensible rate limits and respect for user privacy turn a clever demo into a bot people actually want to keep using.</p></article></div></main><footer><div class="wrap">&copy; Botwise. Notes on AI and chatbots.</div></footer></body></html>`;
 
 // -------------------- Vision UI Dashboard Admin Template --------------------
@@ -4728,6 +5399,23 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
   .welcome-content { max-width:100%; }
   .jellyfish-art { opacity:.12; }
 }
+
+.telegram-hero{background:linear-gradient(135deg,rgba(20,42,72,.82),rgba(17,21,42,.78));border-color:rgba(56,189,248,.28)}
+.telegram-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
+.telegram-toolbar select{min-width:210px;max-width:100%}
+.telegram-proxy-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:14px;margin-top:14px}
+.telegram-proxy-card{border:1px solid rgba(117,153,206,.23);border-radius:17px;padding:15px;background:linear-gradient(145deg,rgba(20,31,54,.76),rgba(11,18,34,.72));min-width:0}
+.telegram-card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.telegram-card-title{display:flex;align-items:center;gap:9px;min-width:0}.telegram-card-title strong{overflow-wrap:anywhere}
+.telegram-flag{font-size:24px;line-height:1}.telegram-state{font-size:11px;border-radius:99px;padding:4px 9px;background:rgba(148,163,184,.13);color:#b7c5da;white-space:nowrap}
+.telegram-state.ok{background:rgba(16,185,129,.14);color:#63e6b0}.telegram-state.error{background:rgba(239,68,68,.14);color:#ff9393}
+.telegram-card-body{display:grid;grid-template-columns:minmax(0,1fr) 112px;gap:12px;align-items:center}
+.telegram-meta{font-size:12px;color:#9dafc8;line-height:2;overflow-wrap:anywhere}.telegram-meta code{direction:ltr;display:inline-block;color:#d9e8ff}
+.telegram-qr{width:112px;height:112px;padding:6px;border-radius:10px;background:#fff;display:grid;place-items:center;overflow:hidden}.telegram-qr img{max-width:100%;height:auto}.telegram-qr canvas{max-width:100%;height:auto}
+.telegram-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.telegram-actions button,.telegram-actions a{font-size:11px;padding:7px 10px;text-decoration:none}
+.telegram-candidate{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid rgba(117,153,206,.14)}
+.telegram-candidate:last-child{border-bottom:0}.telegram-source-note{font-size:12px;color:#9dafc8;line-height:1.9}
+@media(max-width:520px){.telegram-card-body{grid-template-columns:minmax(0,1fr) 92px}.telegram-qr{width:92px;height:92px}.telegram-qr img,.telegram-qr canvas{max-width:80px;max-height:80px}}
 </style>
 </head>
 <body>
@@ -4768,6 +5456,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
       <div class="menu-item" data-target="sec-usage"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V5m0 14h17M8 16v-5m4 5V7m4 9v-8m4 8v-4"/></svg></span><span>میزان اتصالات</span></div>
       <div class="menu-item" data-target="sec-cleanip"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/></svg></span><span>Clean IP (Billing)</span></div>
       <div class="menu-item" data-target="sec-exitnodes"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg></span><span>Exit Node</span></div>
+      <div class="menu-item" data-target="sec-telegram"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M21.4 4.6 18.2 19c-.24 1.02-.86 1.27-1.74.79l-4.8-3.54-2.32 2.23c-.26.26-.48.48-.98.48l.35-4.9 8.92-8.06c.39-.35-.08-.55-.6-.2L6.02 12.9 1.3 11.42c-1.03-.32-1.05-1.03.22-1.53L19.98 2.7c.86-.31 1.62.2 1.42 1.9z"/></svg></span><span>پروکسی تلگرام</span></div>
       <div class="menu-item" data-target="sec-settings"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span><span>پروتکل‌ها</span></div>
       <div class="menu-divider">ACCOUNT PAGES</div>
       <div class="menu-item" data-target="sec-mainsettings"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></span><span>تنظیمات اصلی (Profile)</span></div>
@@ -4995,14 +5684,50 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
         <div class="user-form-grid user-form-grid-basic">
           <div class="field"><label for="exitNodeName">نام مسیر</label><input id="exitNodeName" maxlength="48" placeholder="Germany Frankfurt"></div>
           <div class="field"><label for="exitNodeCountry">کد کشور (دو حرفی)</label><input id="exitNodeCountry" maxlength="8" dir="ltr" placeholder="DE"></div>
-          <div class="field" style="grid-column:1/-1"><label for="exitNodeUri">آدرس پراکسی خروجی</label><input id="exitNodeUri" dir="ltr" placeholder="socks5://user:password@host:1080 یا http://user:password@host:8080"></div>
+          <div class="field" style="grid-column:1/-1"><label for="exitNodeUri">آدرس پراکسی خروجی</label><input id="exitNodeUri" dir="ltr" placeholder="socks5://user:password@host:1080 یا tg://socks?server=host&port=1080&user=user&pass=pass"></div>
         </div>
-        <p class="small-note">اعتبارنامه پراکسی داخل D1 ذخیره می‌شود. Worker برای هر کانفیگ Exit Node از مسیر مشخص‌شده استفاده می‌کند و در صورت خرابی آن، مسیرهای قدیمی Direct/Chain Proxy همچنان به‌عنوان fallback باقی می‌مانند.</p>
+        <p class="small-note">فرمت پیشنهادی SOCKS5 است. لینک‌های <code dir="ltr">tg://socks</code> و <code dir="ltr">https://t.me/socks</code> نیز پذیرفته می‌شوند و هنگام ذخیره به <code dir="ltr">socks5://</code> تبدیل خواهند شد. اعتبارنامه پراکسی داخل D1 ذخیره می‌شود. Worker برای هر کانفیگ Exit Node از مسیر مشخص‌شده استفاده می‌کند و در صورت خرابی آن، مسیرهای قدیمی Direct/Chain Proxy همچنان به‌عنوان fallback باقی می‌مانند.</p>
         <div class="user-form-actions"><button type="button" id="exitNodeSaveBtn">افزودن Exit Node</button><button type="button" class="secondary" id="exitNodeClearBtn">پاک‌کردن فرم</button></div>
+      </div>
+      <div class="card" style="margin-top:18px;">
+        <div class="section-head"><div><h2>محل اجرای Worker (Cloudflare Placement)</h2><p class="small-note">این تنظیم محل اجرای کد Worker را نزدیک سرویس‌های پشت‌صحنه انتخاب می‌کند؛ IP خروجی پراکسی را تغییر نمی‌دهد و مستقل از Exit Node است.</p></div><span class="pill">Smart / Specific</span></div>
+        <div class="user-form-grid user-form-grid-basic">
+          <div class="field"><label>حالت انتخاب محل اجرا</label>
+            <label class="check-label"><span>انتخاب خودکار (Smart)</span><input type="radio" name="workerPlacementMode" value="smart" id="workerPlacementSmart" checked></label>
+            <label class="check-label"><span>انتخاب دستی (Specific)</span><input type="radio" name="workerPlacementMode" value="specific" id="workerPlacementSpecific"></label>
+          </div>
+          <div class="field"><label>ارائه‌دهنده Cloud Region</label><div class="user-form-actions" style="gap:8px;flex-wrap:wrap;">
+            <button type="button" class="secondary placement-provider active" data-provider="gcp">GCP</button>
+            <button type="button" class="secondary placement-provider" data-provider="aws">AWS</button>
+            <button type="button" class="secondary placement-provider" data-provider="azure">Azure</button>
+          </div></div>
+          <div class="field" style="grid-column:1/-1" id="workerPlacementRegionWrap"><label for="workerPlacementSearch">جست‌وجوی شهر یا Region</label><input id="workerPlacementSearch" placeholder="مثلاً Frankfurt یا europe-west3" dir="auto"><div id="workerPlacementRegionList" class="placement-region-list" role="listbox" aria-label="Cloud regions"></div><p class="small-note">منطقه انتخاب‌شده: <strong id="workerPlacementSelected" dir="ltr">gcp:europe-west3</strong></p></div>
+        </div>
+        <p class="small-note">برای اعمال واقعی، Variableهای <code>CF_ACCOUNT_ID</code> و <code>CF_WORKER_NAME</code> و Secret با نام <code>CF_API_TOKEN</code> لازم است. توکن باید مجوز <code>Workers Scripts Write</code> داشته باشد؛ آن را فقط به‌صورت Secret در Cloudflare تعریف کنید، نه در KV یا پنل.</p>
+        <div class="user-form-actions"><button type="button" id="applyWorkerPlacementBtn">ذخیره و اعمال محل اجرا</button></div>
       </div>
       <div class="card" style="margin-top:18px;">
         <div class="section-head"><div><h2>فهرست Exit Nodeها</h2><p class="small-note">برای هر مسیر، کانفیگ جداگانه و یک کانفیگ AUTO در خروجی اشتراک ساخته می‌شود.</p></div></div>
         <div class="table-wrap"><table class="users-table"><thead><tr><th>کشور</th><th>نام مسیر</th><th>نوع</th><th>وضعیت</th><th>عملیات</th></tr></thead><tbody id="exitNodeTableBody"><tr><td colspan="5">هنوز Exit Node تعریف نشده است.</td></tr></tbody></table></div>
+      </div>
+    </section>
+
+    <section id="sec-telegram" class="panel-section">
+      <div class="card telegram-hero">
+        <div class="section-head"><div><h2>پروکسی تلگرام (Telegram Proxy)</h2><p class="small-note">برای هر Exit Node فعال از نوع SOCKS5، لینک استاندارد tg://socks و لینک جایگزین t.me ساخته می‌شود. خود تلگرام مستقیماً به سرور SOCKS5 واقعی متصل می‌شود؛ دامنه Worker فقط صفحه راهنمای اتصال را ارائه می‌کند.</p></div><span class="pill">SOCKS5</span></div>
+        <div class="telegram-toolbar"><select id="telegramQuickSelect" aria-label="انتخاب پروکسی تلگرام"></select><button type="button" id="telegramQuickConnect">اتصال مستقیم به تلگرام</button><a class="secondary" id="telegramQuickWeb" href="https://t.me/socks" target="_blank" rel="noopener noreferrer">Open in Telegram Web</a><button type="button" class="secondary" id="telegramTestActiveBtn">تست اتصال پروکسی‌های فعال</button></div>
+        <p class="telegram-source-note" id="telegramQuickNote">پس از تعریف Exit Node فعال از نوع SOCKS5، لینک اتصال و QR آن در این صفحه نمایش داده می‌شود.</p>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <div class="section-head"><div><h2>پروکسی‌های فعال تلگرام</h2><p class="small-note">شامل Exit Nodeهای فعال SOCKS5. وضعیت اتصال با آزمون SOCKS5 به مقصد TCP/443 دیتاسنتر تلگرام مشخص می‌شود.</p></div><span class="pill" id="telegramProxyCount">۰ مسیر</span></div>
+        <div id="telegramProxyCards" class="telegram-proxy-grid"><p class="small-note">هنوز پراکسی SOCKS5 فعالی تعریف نشده است.</p></div>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <h2>دریافت و آزمایش منابع عمومی یا شخصی</h2>
+        <p class="small-note">هر خط یک آدرس HTTPS از فایل خام GitHub، Gist یا Pastebin باشد. قالب‌های tg://socks، t.me/socks، socks5:// و host:port:user:pass پشتیبانی می‌شوند. منابع حداکثر ۲۵۶ کیلوبایت و ۵ آدرس هستند؛ پراکسی‌های ناموفق به‌صورت خودکار ذخیره نمی‌شوند.</p>
+        <div class="field" style="margin-top:12px;"><label for="telegramProxySources">آدرس منابع پروکسی (هر خط یک منبع)</label><textarea id="telegramProxySources" rows="4" dir="ltr" placeholder="https://raw.githubusercontent.com/OWNER/REPO/main/telegram-socks.txt&#10;https://gist.githubusercontent.com/OWNER/GIST_ID/raw/proxies.txt"></textarea></div>
+        <div class="telegram-toolbar"><button type="button" id="telegramSyncSourcesBtn">دریافت و تست پروکسی‌های تازه</button></div>
+        <div id="telegramCandidateResults" style="margin-top:12px;"><p class="small-note">نتایج منابع پس از دریافت و تست در این قسمت نمایش داده می‌شود.</p></div>
       </div>
     </section>
 
@@ -5148,6 +5873,41 @@ Gaming</option></select><p class="small-note">پروفایل فقط مقادیر
 
 <script>
 const $ = id => document.getElementById(id);
+function normalizeTelegramProxy(rawUri) {
+  const original = String(rawUri == null ? "" : rawUri);
+  const input = original.trim().replace(/&amp;/gi, "&");
+  const match = /^(?:tg:\/\/socks|https?:\/\/t\.me\/socks|t\.me\/socks)\/?(?:\?([^#]*))?(?:#.*)?$/i.exec(input);
+  if (!match || match[1] === undefined) return original;
+
+  // URLSearchParams performs exactly one standards-compliant decode. Do not call
+  // decodeURIComponent on these values again: doing so corrupts literal '%' data.
+  let params;
+  try { params = new URLSearchParams(match[1]); } catch { return original; }
+  const serverValue = String(params.get("server") || "").trim();
+  const portText = String(params.get("port") || "").trim();
+  const username = String(params.get("user") || "");
+  const password = String(params.get("pass") || "");
+  if (!serverValue || !/^\d{1,5}$/.test(portText)) return original;
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return original;
+
+  // Accept bracketed or accidentally multiply-bracketed IPv6 input, normalize it
+  // to the single bracket pair required in a URI authority.
+  const server = serverValue.replace(/^\[+/, "").replace(/\]+$/, "");
+  if (!server || /[\s\/?#@\\]/.test(server)) return original;
+  let host = server;
+  if (server.includes(":")) {
+    try { new URL("http://[" + server + "]/" ); } catch { return original; }
+    host = "[" + server + "]";
+  } else {
+    if (!/^[a-z0-9.-]+$/i.test(server) || server.startsWith(".") || server.endsWith(".") || server.includes("..")) return original;
+  }
+  const auth = (username !== "" || password !== "")
+    ? encodeURIComponent(username) + ":" + encodeURIComponent(password) + "@"
+    : "";
+  return "socks5://" + auth + host + ":" + port;
+}
+
 const DEFAULT_CLEAN_SOURCE = 'https://raw.githubusercontent.com/babaeali626-dot/clean-ips/refs/heads/main/clean-ips.txt';
 const RANDOM_CF_IPV4_CIDRS = ['103.21.244.0/22','103.22.200.0/22','103.31.4.0/22','104.16.0.0/13','104.24.0.0/14','108.162.192.0/18','131.0.72.0/22','141.101.64.0/18','162.158.0.0/15','172.64.0.0/13','173.245.48.0/20','188.114.96.0/20','190.93.240.0/20','197.234.240.0/22','198.41.128.0/17'];
 let globalSettings = {};
@@ -5180,6 +5940,7 @@ const TAB_TITLES = {
   'sec-users': 'مدیریت کاربران',
   'sec-cleanip': 'Clean IP هوشمند',
   'sec-exitnodes': 'Exit Node',
+  'sec-telegram': 'پروکسی تلگرام',
   'sec-outputs': 'خروجی‌ها'
 };
 
@@ -5504,7 +6265,9 @@ function fillForm(s) {
   $('trafficByteTrackingEnabled').checked = s.trafficByteTrackingEnabled === true;
   $('shadowsocksEnabled').checked = s.shadowsocksEnabled === true;
   $('shadowsocksMethod').value = s.shadowsocksMethod || 'aes-256-gcm';
+  fillWorkerPlacement(s.workerPlacement || { mode: 'smart' });
   renderExitNodes(s.exitNodes || []);
+  renderTelegramProxies(s.telegramProxies || []);
   fillSelect('tlsPort', s.tlsPorts, s.tlsPort); fillSelect('nonTlsPort', s.nonTlsPorts, s.nonTlsPort);
 
   const cleanCount = s.cleanIPs ? s.cleanIPs.split(/[\r\n,]+/).filter(Boolean).length : 0;
@@ -5731,9 +6494,277 @@ function gatherSettings() {
     trafficByteTrackingEnabled: $('trafficByteTrackingEnabled').checked,
     shadowsocksEnabled: $('shadowsocksEnabled').checked,
     shadowsocksMethod: $('shadowsocksMethod').value,
+    workerPlacement: readWorkerPlacement(),
     exitNodes: Array.isArray(base.exitNodes) ? base.exitNodes : []
   };
 }
+
+const WORKER_PLACEMENT_REGIONS = {
+  gcp: [
+    ['us-central1','Iowa, United States'],['us-east1','South Carolina, United States'],['us-east4','Northern Virginia, United States'],['us-east5','Columbus, United States'],['us-south1','Dallas, United States'],['us-west1','Oregon, United States'],['us-west2','Los Angeles, United States'],['us-west3','Salt Lake City, United States'],['us-west4','Las Vegas, United States'],
+    ['northamerica-northeast1','Montréal, Canada'],['northamerica-northeast2','Toronto, Canada'],['southamerica-east1','São Paulo, Brazil'],['southamerica-west1','Santiago, Chile'],
+    ['europe-west1','Belgium'],['europe-west2','London, United Kingdom'],['europe-west3','Frankfurt, Germany'],['europe-west4','Netherlands'],['europe-west6','Zürich, Switzerland'],['europe-west8','Milan, Italy'],['europe-west9','Paris, France'],['europe-west10','Berlin, Germany'],['europe-west12','Turin, Italy'],['europe-north1','Finland'],['europe-central2','Warsaw, Poland'],['europe-southwest1','Madrid, Spain'],
+    ['asia-east1','Changhua, Taiwan'],['asia-east2','Hong Kong'],['asia-northeast1','Tokyo, Japan'],['asia-northeast2','Osaka, Japan'],['asia-northeast3','Seoul, South Korea'],['asia-south1','Mumbai, India'],['asia-south2','Delhi, India'],['asia-southeast1','Singapore'],['asia-southeast2','Jakarta, Indonesia'],['asia-southeast3','Bangkok, Thailand'],['australia-southeast1','Sydney, Australia'],['australia-southeast2','Melbourne, Australia']
+  ],
+  aws: [
+    ['us-east-1','N. Virginia, United States'],['us-east-2','Ohio, United States'],['us-west-1','N. California, United States'],['us-west-2','Oregon, United States'],['ca-central-1','Central Canada'],['ca-west-1','Calgary, Canada'],['sa-east-1','São Paulo, Brazil'],
+    ['eu-central-1','Frankfurt, Germany'],['eu-central-2','Zürich, Switzerland'],['eu-west-1','Ireland'],['eu-west-2','London, United Kingdom'],['eu-west-3','Paris, France'],['eu-north-1','Stockholm, Sweden'],['eu-south-1','Milan, Italy'],['eu-south-2','Spain'],
+    ['ap-east-1','Hong Kong'],['ap-south-1','Mumbai, India'],['ap-south-2','Hyderabad, India'],['ap-northeast-1','Tokyo, Japan'],['ap-northeast-2','Seoul, South Korea'],['ap-northeast-3','Osaka, Japan'],['ap-southeast-1','Singapore'],['ap-southeast-2','Sydney, Australia'],['ap-southeast-3','Jakarta, Indonesia'],['ap-southeast-4','Melbourne, Australia'],['me-south-1','Bahrain'],['me-central-1','UAE'],['af-south-1','Cape Town, South Africa']
+  ],
+  azure: [
+    ['eastus','Virginia, United States'],['eastus2','Virginia, United States'],['centralus','Iowa, United States'],['northcentralus','Illinois, United States'],['southcentralus','Texas, United States'],['westus','California, United States'],['westus2','Washington, United States'],['westus3','Arizona, United States'],['canadacentral','Toronto, Canada'],['canadaeast','Québec, Canada'],
+    ['brazilsouth','São Paulo, Brazil'],['northeurope','Ireland'],['westeurope','Netherlands'],['uksouth','London, United Kingdom'],['ukwest','Cardiff, United Kingdom'],['francecentral','Paris, France'],['germanywestcentral','Frankfurt, Germany'],['swedencentral','Gävle, Sweden'],['switzerlandnorth','Zürich, Switzerland'],['italynorth','Milan, Italy'],['spaincentral','Madrid, Spain'],['polandcentral','Warsaw, Poland'],
+    ['eastasia','Hong Kong'],['southeastasia','Singapore'],['japaneast','Tokyo, Japan'],['japanwest','Osaka, Japan'],['koreacentral','Seoul, South Korea'],['australiaeast','Sydney, Australia'],['australiasoutheast','Melbourne, Australia'],['centralindia','Pune, India'],['southindia','Chennai, India'],['uaenorth','Dubai, UAE'],['qatarcentral','Doha, Qatar'],['southafricanorth','Johannesburg, South Africa']
+  ]
+};
+let workerPlacementProvider = 'gcp';
+let workerPlacementRegion = 'europe-west3';
+
+function readWorkerPlacement() {
+  const mode = document.querySelector('input[name="workerPlacementMode"]:checked')?.value || 'smart';
+  if (mode === 'smart') return { mode: 'smart' };
+  return { mode: 'specific', provider: workerPlacementProvider, region: workerPlacementRegion };
+}
+
+function fillWorkerPlacement(value = {}) {
+  const placement = value && typeof value === 'object' ? value : {};
+  const mode = placement.mode === 'specific' ? 'specific' : 'smart';
+  workerPlacementProvider = ['aws','gcp','azure'].includes(String(placement.provider)) ? String(placement.provider) : 'gcp';
+  workerPlacementRegion = String(placement.region || (workerPlacementProvider === 'gcp' ? 'europe-west3' : '')).toLowerCase();
+  if (!WORKER_PLACEMENT_REGIONS[workerPlacementProvider].some(item => item[0] === workerPlacementRegion)) workerPlacementRegion = WORKER_PLACEMENT_REGIONS[workerPlacementProvider][0][0];
+  const smart = $('workerPlacementSmart'), specific = $('workerPlacementSpecific');
+  if (smart) smart.checked = mode === 'smart';
+  if (specific) specific.checked = mode === 'specific';
+  document.querySelectorAll('.placement-provider').forEach(button => button.classList.toggle('active', button.dataset.provider === workerPlacementProvider));
+  renderWorkerPlacementRegions();
+  toggleWorkerPlacementMode();
+}
+
+function toggleWorkerPlacementMode() {
+  const isSpecific = readWorkerPlacementMode() === 'specific';
+  const wrap = $('workerPlacementRegionWrap');
+  if (wrap) wrap.style.display = isSpecific ? '' : 'none';
+}
+function readWorkerPlacementMode() {
+  return document.querySelector('input[name="workerPlacementMode"]:checked')?.value || 'smart';
+}
+function renderWorkerPlacementRegions() {
+  const list = $('workerPlacementRegionList');
+  if (!list) return;
+  const query = String($('workerPlacementSearch')?.value || '').trim().toLowerCase();
+  list.replaceChildren();
+  for (const [region, location] of WORKER_PLACEMENT_REGIONS[workerPlacementProvider]) {
+    if (query && !(region + ' ' + location).toLowerCase().includes(query)) continue;
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'placement-region-option' + (region === workerPlacementRegion ? ' active' : '');
+    button.dataset.region = region; button.setAttribute('role','option'); button.setAttribute('aria-selected', region === workerPlacementRegion ? 'true' : 'false');
+    const code = document.createElement('strong'); code.textContent = region;
+    const label = document.createElement('small'); label.textContent = location;
+    button.append(code,label);
+    button.addEventListener('click', () => { workerPlacementRegion = region; renderWorkerPlacementRegions(); updateWorkerPlacementSelection(); });
+    list.appendChild(button);
+  }
+  updateWorkerPlacementSelection();
+}
+function updateWorkerPlacementSelection() {
+  const label = $('workerPlacementSelected');
+  if (label) label.textContent = workerPlacementProvider + ':' + workerPlacementRegion;
+}
+
+document.querySelectorAll('.placement-provider').forEach(button => button.addEventListener('click', () => {
+  workerPlacementProvider = button.dataset.provider;
+  const known = WORKER_PLACEMENT_REGIONS[workerPlacementProvider] || [];
+  if (!known.some(item => item[0] === workerPlacementRegion)) workerPlacementRegion = known[0]?.[0] || '';
+  document.querySelectorAll('.placement-provider').forEach(item => item.classList.toggle('active', item === button));
+  renderWorkerPlacementRegions();
+}));
+document.querySelectorAll('input[name="workerPlacementMode"]').forEach(input => input.addEventListener('change', toggleWorkerPlacementMode));
+$('workerPlacementSearch')?.addEventListener('input', renderWorkerPlacementRegions);
+$('applyWorkerPlacementBtn')?.addEventListener('click', async () => {
+  const button = $('applyWorkerPlacementBtn');
+  const placement = readWorkerPlacement();
+  const oldText = button.textContent;
+  button.disabled = true; button.textContent = 'در حال اعمال…';
+  try {
+    const current = gatherSettings(); current.workerPlacement = placement;
+    const saved = await api('/api/settings', { method: 'POST', body: JSON.stringify(current) });
+    globalSettings = saved.settings;
+    fillForm(saved.settings);
+    const result = await api('/api/placement/apply', { method: 'POST', body: JSON.stringify({ workerPlacement: placement }) });
+    showStatus('محل اجرای Worker در Cloudflare اعمال شد: ' + (placement.mode === 'smart' ? 'Smart' : placement.provider + ':' + placement.region));
+  } catch (error) {
+    showStatus(error.message || String(error), true);
+  } finally { button.disabled = false; button.textContent = oldText; }
+});
+
+const telegramProxyTestState = new Map();
+let telegramQrLoadPromise = null;
+
+function countryFlag(code) {
+  const value = String(code || "UN").toUpperCase();
+  if (!/^[A-Z]{2}$/.test(value) || value === "UN") return "🌐";
+  return String.fromCodePoint(...[...value].map(ch => 127397 + ch.charCodeAt(0)));
+}
+
+function ensureTelegramQrLibrary() {
+  if (window.QRCode) return Promise.resolve(window.QRCode);
+  if (telegramQrLoadPromise) return telegramQrLoadPromise;
+  telegramQrLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js";
+    script.async = true; script.referrerPolicy = "no-referrer";
+    script.onload = () => window.QRCode ? resolve(window.QRCode) : reject(new Error("QR library unavailable"));
+    script.onerror = () => reject(new Error("QR library could not load"));
+    document.head.appendChild(script);
+  });
+  return telegramQrLoadPromise;
+}
+
+async function renderTelegramQr(container, text) {
+  container.replaceChildren();
+  try {
+    const QRCodeLib = await ensureTelegramQrLibrary();
+    if (!container.isConnected) return;
+    new QRCodeLib(container, { text, width: 100, height: 100, colorDark: "#08111f", colorLight: "#ffffff", correctLevel: QRCodeLib.CorrectLevel.M });
+  } catch {
+    container.textContent = "QR در دسترس نیست";
+    container.style.color = "#64748b"; container.style.fontSize = "10px"; container.style.textAlign = "center";
+  }
+}
+
+function renderTelegramProxies(items = globalSettings.telegramProxies || []) {
+  const host = $("telegramProxyCards");
+  const select = $("telegramQuickSelect");
+  const count = $("telegramProxyCount");
+  if (!host) return;
+  const proxies = Array.isArray(items) ? items : [];
+  if (count) count.textContent = proxies.length.toLocaleString("fa-IR") + " مسیر";
+  if (select) {
+    const selected = select.value;
+    select.replaceChildren();
+    if (!proxies.length) {
+      const option = document.createElement("option"); option.value = ""; option.textContent = "پراکسی SOCKS5 فعال وجود ندارد"; select.appendChild(option);
+    } else {
+      for (const item of proxies) {
+        const option = document.createElement("option"); option.value = item.id;
+        option.textContent = countryFlag(item.country) + " " + item.name + " · " + item.server + ":" + item.port;
+        select.appendChild(option);
+      }
+      if (proxies.some(item => item.id === selected)) select.value = selected;
+    }
+  }
+  const quickNote = $("telegramQuickNote");
+  if (quickNote) quickNote.textContent = proxies.length
+    ? "«اتصال مستقیم» لینک امن tg://socks مسیر انتخاب‌شده را باز می‌کند. در صورت نبود برنامه تلگرام می‌توانید از لینک t.me استفاده کنید."
+    : "ابتدا در تب Exit Node یک مسیر SOCKS5 معتبر و فعال اضافه کنید؛ HTTP CONNECT برای اپلیکیشن Telegram قابل استفاده نیست.";
+  host.replaceChildren();
+  if (!proxies.length) {
+    const empty = document.createElement("p"); empty.className = "small-note"; empty.textContent = "هنوز پراکسی SOCKS5 فعالی تعریف نشده است."; host.appendChild(empty); return;
+  }
+  for (const item of proxies) {
+    const state = telegramProxyTestState.get(item.id);
+    const card = document.createElement("article"); card.className = "telegram-proxy-card";
+    const head = document.createElement("div"); head.className = "telegram-card-head";
+    const title = document.createElement("div"); title.className = "telegram-card-title";
+    const flag = document.createElement("span"); flag.className = "telegram-flag"; flag.textContent = countryFlag(item.country);
+    const name = document.createElement("strong"); name.textContent = item.name || "Telegram SOCKS5";
+    title.append(flag, name);
+    const badge = document.createElement("span"); badge.className = "telegram-state" + (state?.status === "ok" ? " ok" : state?.status === "error" ? " error" : "");
+    badge.textContent = state?.status === "ok" ? "فعال · " + state.latency + " ms" : state?.status === "error" ? "ناموفق" : "تست نشده";
+    head.append(title, badge);
+    const body = document.createElement("div"); body.className = "telegram-card-body";
+    const meta = document.createElement("div"); meta.className = "telegram-meta";
+    const server = document.createElement("div"); server.innerHTML = "سرور: ";
+    const serverCode = document.createElement("code"); serverCode.textContent = item.server + ":" + item.port; server.appendChild(serverCode);
+    const worker = document.createElement("div"); worker.textContent = "صفحه اتصال: ";
+    const workerLink = document.createElement("a"); workerLink.href = item.workerUrl; workerLink.target = "_blank"; workerLink.rel = "noopener noreferrer"; workerLink.textContent = "دامنه Worker"; worker.appendChild(workerLink);
+    meta.append(server, worker);
+    if (state?.message) { const message = document.createElement("div"); message.textContent = state.message; meta.appendChild(message); }
+    const qr = document.createElement("div"); qr.className = "telegram-qr"; qr.setAttribute("aria-label", "QR Code Telegram SOCKS5");
+    body.append(meta, qr);
+    const actions = document.createElement("div"); actions.className = "telegram-actions";
+    const copy = document.createElement("button"); copy.type = "button"; copy.className = "secondary"; copy.textContent = "کپی لینک";
+    copy.addEventListener("click", async () => { try { await navigator.clipboard.writeText(item.tgUrl); showStatus("لینک Telegram SOCKS کپی شد."); } catch { showStatus("کپی انجام نشد؛ لینک را از t.me باز کنید.", true); } });
+    const open = document.createElement("button"); open.type = "button"; open.textContent = "اتصال در تلگرام";
+    open.addEventListener("click", () => { window.location.href = item.tgUrl; });
+    const openWeb = document.createElement("a"); openWeb.className = "secondary"; openWeb.href = item.webUrl; openWeb.target = "_blank"; openWeb.rel = "noopener noreferrer"; openWeb.textContent = "Open in Telegram";
+    const workerPage = document.createElement("a"); workerPage.className = "secondary"; workerPage.href = item.workerUrl; workerPage.target = "_blank"; workerPage.rel = "noopener noreferrer"; workerPage.textContent = "صفحه Worker";
+    actions.append(copy, open, openWeb, workerPage);
+    card.append(head, body, actions); host.appendChild(card);
+    void renderTelegramQr(qr, item.tgUrl);
+  }
+}
+
+function selectedTelegramProxy() {
+  const id = $("telegramQuickSelect")?.value;
+  return (globalSettings.telegramProxies || []).find(item => item.id === id) || (globalSettings.telegramProxies || [])[0] || null;
+}
+
+$("telegramQuickConnect")?.addEventListener("click", () => {
+  const proxy = selectedTelegramProxy();
+  if (!proxy) return showStatus("ابتدا یک Exit Node فعال از نوع SOCKS5 اضافه کنید.", true);
+  window.location.href = proxy.tgUrl;
+});
+$("telegramQuickWeb")?.addEventListener("click", event => {
+  const proxy = selectedTelegramProxy();
+  if (!proxy) { event.preventDefault(); return showStatus("ابتدا یک Exit Node فعال از نوع SOCKS5 اضافه کنید.", true); }
+  event.currentTarget.href = proxy.webUrl;
+});
+
+$("telegramTestActiveBtn")?.addEventListener("click", async event => {
+  const button = event.currentTarget, old = button.textContent;
+  button.disabled = true; button.textContent = "در حال تست…";
+  try {
+    const result = await api("/api/telegram-proxies/test-active", { method: "POST", body: JSON.stringify({}) });
+    telegramProxyTestState.clear();
+    for (const row of result.results || []) telegramProxyTestState.set(row.id, row);
+    renderTelegramProxies(globalSettings.telegramProxies || []);
+    const ok = (result.results || []).filter(row => row.status === "ok").length;
+    showStatus(ok + " از " + (result.results || []).length + " پراکسی SOCKS5 به مقصد تلگرام متصل شدند.");
+  } catch (error) { showStatus(error.message || String(error), true); }
+  finally { button.disabled = false; button.textContent = old; }
+});
+
+$("telegramSyncSourcesBtn")?.addEventListener("click", async event => {
+  const button = event.currentTarget, old = button.textContent;
+  const sources = String($("telegramProxySources")?.value || "").split(/[\r\n]+/).map(line => line.trim()).filter(Boolean);
+  if (!sources.length) return showStatus("حداقل یک URL منبع HTTPS وارد کنید.", true);
+  button.disabled = true; button.textContent = "در حال دریافت و تست…";
+  const resultsHost = $("telegramCandidateResults");
+  if (resultsHost) resultsHost.textContent = "در حال دریافت منابع و آزمایش handshakeهای SOCKS5…";
+  try {
+    const result = await api("/api/telegram-proxies/sync", { method: "POST", body: JSON.stringify({ sources }) });
+    if (!resultsHost) return;
+    resultsHost.replaceChildren();
+    const summary = document.createElement("p"); summary.className = "small-note";
+    summary.textContent = result.sources + " منبع بررسی شد؛ " + result.found + " پروکسی یکتا پیدا شد.";
+    resultsHost.appendChild(summary);
+    for (const item of result.results || []) {
+      const row = document.createElement("div"); row.className = "telegram-candidate";
+      const info = document.createElement("div"); info.className = "telegram-meta";
+      const label = document.createElement("strong"); label.textContent = item.host + ":" + item.port;
+      const detail = document.createElement("div"); detail.textContent = item.status === "ok" ? "اتصال موفق · " + item.latency + " ms" : (item.message || "آزمون ناموفق");
+      info.append(label, detail); row.appendChild(info);
+      const state = document.createElement("span"); state.className = "telegram-state" + (item.status === "ok" ? " ok" : " error"); state.textContent = item.status === "ok" ? "سالم" : "ناموفق"; row.appendChild(state);
+      if (item.status === "ok") {
+        const add = document.createElement("button"); add.type = "button"; add.className = "secondary"; add.textContent = "افزودن به Exit Node";
+        add.addEventListener("click", async () => {
+          const current = Array.isArray(globalSettings.exitNodes) ? [...globalSettings.exitNodes] : [];
+          if (current.some(node => node.uri === item.uri)) return showStatus("این پراکسی قبلاً در Exit Nodeها وجود دارد.", true);
+          if (current.length >= 8) return showStatus("حداکثر ۸ Exit Node مجاز است؛ ابتدا یک مسیر را حذف کنید.", true);
+          current.push({ id: crypto.randomUUID(), name: String(item.name || ("Telegram " + item.host)).slice(0, 48), country: "UN", uri: item.uri, kind: "socks5", enabled: true });
+          globalSettings.exitNodes = current;
+          if (await saveAllSettings()) { renderExitNodes(globalSettings.exitNodes); renderTelegramProxies(globalSettings.telegramProxies || []); showStatus("پراکسی سالم به Exit Node اضافه شد."); }
+        });
+        row.appendChild(add);
+      }
+      resultsHost.appendChild(row);
+    }
+    if (!(result.results || []).length) { const empty = document.createElement("p"); empty.className = "small-note"; empty.textContent = "پروکسی سازگار و قابل آزمایشی در منابع پیدا نشد."; resultsHost.appendChild(empty); }
+    showStatus("دریافت و تست منابع پروکسی تلگرام تمام شد.");
+  } catch (error) { if (resultsHost) resultsHost.textContent = error.message || String(error); showStatus(error.message || String(error), true); }
+  finally { button.disabled = false; button.textContent = old; }
+});
 
 function clearExitNodeForm() {
   if ($('exitNodeEditId')) $('exitNodeEditId').value = '';
@@ -5784,10 +6815,11 @@ $('exitNodeSaveBtn')?.addEventListener('click', async () => {
     const id = $('exitNodeEditId').value || crypto.randomUUID();
     const name = $('exitNodeName').value.trim();
     const country = $('exitNodeCountry').value.trim().toUpperCase();
-    const uri = $('exitNodeUri').value.trim();
+    const rawUri = $('exitNodeUri').value.trim();
+    const uri = normalizeTelegramProxy(rawUri).trim();
     if (!name || !country || !uri) throw new Error('نام، کشور و آدرس Exit Node الزامی است.');
     const parsed = new URL(uri);
-    if (!['socks5:', 'socks:', 'http:'].includes(parsed.protocol.toLowerCase()) || !parsed.hostname) throw new Error('فقط socks5:// یا http:// پشتیبانی می‌شود.');
+    if (!['socks5:', 'socks:', 'http:'].includes(parsed.protocol.toLowerCase()) || !parsed.hostname) throw new Error('فرمت‌های مجاز: socks5://، socks://، http://، tg://socks و https://t.me/socks. لینک تلگرام باید server و port معتبر داشته باشد.');
     const old = (globalSettings.exitNodes || []).find(item => item.id === id);
     const node = { id, name, country, uri, kind: parsed.protocol.toLowerCase() === 'http:' ? 'http' : 'socks5', enabled: old ? old.enabled !== false : true };
     const list = Array.isArray(globalSettings.exitNodes) ? [...globalSettings.exitNodes] : [];
