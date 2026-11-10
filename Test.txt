@@ -1,4 +1,4 @@
-// BUILD_ID: cf-worker-zeus-usage-revoke-v8-20261104-iran-tcp-ech-dns-kv-fixes
+// BUILD_ID: cf-worker-zeus-hybrid-d1-kv-exitnodes-shadowsocks-cpu-v1-20261110
 // Enhanced with ZEUS-inspired features + Exact Vision UI Dashboard Redesign:
 // - Multi-user structure (users[] with traffic/expire/device/request limits, startOnFirstConnect, resetPeriod)
 // - Fragment profiles for operators (hamrah, irancell, rightel, mokhaberat, gaming, custom)
@@ -10,6 +10,24 @@
 import { connect } from "cloudflare:sockets";
 
 const SETTINGS_KEY = "panel-settings-v3";
+// Hybrid persistence: D1 is authoritative for identities, user records and Exit Nodes;
+// KV remains the fast store for general profile settings, Clean IPs and hot usage ledgers.
+let PANEL_DB = null;
+let panelSchemaPromise = null;
+let panelSettingsCache = null;
+let panelSettingsRevision = 1;
+const PANEL_SETTINGS_CACHE_TTL_MS = 3500;
+const TROJAN_HASH_CACHE_MAX = 2048;
+const trojanHashCache = new Map();
+let credentialIndexCache = null;
+const MAX_EXIT_NODES = 8;
+const MAX_EXIT_ENDPOINTS = 8;
+const SHADOWSOCKS_METHODS = new Set(["aes-256-gcm", "aes-128-gcm"]);
+const SS_MASTER_KEY_CACHE = new Map();
+const SS_MASTER_KEY_CACHE_MAX = 256;
+const SUBSCRIPTION_URI_CACHE = new Map();
+const SUBSCRIPTION_URI_CACHE_TTL_MS = 12000;
+const SUBSCRIPTION_URI_CACHE_MAX = 80;
 const TLS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
 const PLAIN_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
 const enc = new TextEncoder();
@@ -27,16 +45,55 @@ const DEFAULT_CLEAN_IP_SOURCE = "https://raw.githubusercontent.com/babaeali626-d
 const USER_USAGE_PREFIX = "panel-user-usage-v1:";
 const ADMIN_USAGE_KEY = "panel-admin-usage-v1";
 // KV allows one write per second per key. Traffic is therefore buffered in memory and
-// persisted only after 2 MB or every 30 s (and once more when a tunnel closes).
-const USER_TRAFFIC_FLUSH_BYTES = 2 * 1024 * 1024;
-const USER_TRAFFIC_FLUSH_INTERVAL_MS = 30000;
+// persisted only after 1 GB or every 6 minutes (and once more when a tunnel closes).
+const USER_TRAFFIC_FLUSH_BYTES = 1024 * 1024 * 1024;
+const USER_TRAFFIC_FLUSH_INTERVAL_MS = 6 * 60 * 1000;
+// Isolate-level usage cache: handshakes read/update usage from RAM instead of hitting KV.
+const USAGE_CACHE_TTL_MS = 60 * 1000;
+const USAGE_CACHE_MAX_ENTRIES = 2000;
 const KV_MIN_WRITE_INTERVAL_MS = 1100;
 // Worker subrequest budget kept for DoH lookups inside one tunnel (hard platform cap: 50 on Free).
 const DNS_DOH_SUBREQUEST_LIMIT = 45;
+// Isolate-level DoH answer cache: identical queries are answered locally instead of
+// spending a subrequest. Keyed by the query bytes without the 2-byte transaction ID.
+const DOH_CACHE_TTL_MS = 4 * 60 * 1000;
+const DOH_CACHE_MAX_ENTRIES = 1000;
+const DOH_CACHE_MAX_QUERY_BYTES = 512;
+const dohDnsCache = new Map();
+function dohCacheKey(packet, dohUrl) {
+  if (!packet || packet.length < 12 || packet.length > DOH_CACHE_MAX_QUERY_BYTES) return null;
+  let bin = "";
+  for (let i = 2; i < packet.length; i++) bin += String.fromCharCode(packet[i]);
+  return String(dohUrl || DEFAULT_DOH_URL) + "|" + bin;
+}
+function dohCacheGet(key) {
+  const hit = dohDnsCache.get(key);
+  if (!hit) return null;
+  if (hit.expires <= Date.now()) { dohDnsCache.delete(key); return null; }
+  return hit.answer.slice();
+}
+function dohCachePut(key, answer) {
+  // Cache only clean, complete answers: NOERROR, at least one answer record, not truncated.
+  if (!key || answer.length < 12 || (answer[2] & 0x02) || (answer[3] & 0x0f) !== 0 || ((answer[6] << 8) | answer[7]) === 0) return;
+  const now = Date.now();
+  dohDnsCache.delete(key);
+  if (dohDnsCache.size >= DOH_CACHE_MAX_ENTRIES) {
+    for (const [k, v] of dohDnsCache) if (v.expires <= now) dohDnsCache.delete(k);
+    while (dohDnsCache.size >= DOH_CACHE_MAX_ENTRIES) dohDnsCache.delete(dohDnsCache.keys().next().value);
+  }
+  dohDnsCache.set(key, { answer: answer.slice(), expires: now + DOH_CACHE_TTL_MS });
+}
 const TCP_TEST_HISTORY_KEY = "panel-tcp-test-history-v1";
 const TCP_TEST_HISTORY_LIMIT = 500;
 const userActiveConnections = new Map();
 const userUsageLocks = new Map();
+// Short-lived (60 s) in-memory copy of the raw usage records, keyed by KV key.
+// Entry: { raw: <usage object | null>, expires: <ms> }
+const usageMemoryCache = new Map();
+// Pending/in-flight KV writes per usage key (coalesced: only the latest value is written).
+const usageWriteStates = new Map();
+// In-flight KV reads per usage key, so a cold/expired cache triggers one read, not one per handshake.
+const usageReadInflight = new Map();
 // Per-isolate byte ledger prevents concurrent tunnels in the same Worker isolate
 // from each spending the same stale KV balance.
 const userTrafficState = new Map();
@@ -143,6 +200,10 @@ const DEFAULTS = {
   subToken: "",
   clientIpRestrictionEnabled: false,
   allowedClientIps: "",
+  trafficByteTrackingEnabled: false,
+  shadowsocksEnabled: false,
+  shadowsocksMethod: "aes-256-gcm",
+  exitNodes: [],
   users: [],
   proxies: [],
   chainProxies: []
@@ -167,6 +228,38 @@ function applyFragmentProfile(settings) {
   return settings;
 }
 
+function getD1Binding(env) {
+  const db = env && env.DB;
+  return db && typeof db.prepare === "function" && typeof db.batch === "function" ? db : null;
+}
+
+async function ensurePanelD1Schema() {
+  if (!PANEL_DB) return;
+  if (!panelSchemaPromise) {
+    panelSchemaPromise = (async () => {
+      await PANEL_DB.batch([
+        PANEL_DB.prepare("CREATE TABLE IF NOT EXISTS panel_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"),
+        PANEL_DB.prepare("CREATE TABLE IF NOT EXISTS panel_users (id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, data_json TEXT NOT NULL, updated_at INTEGER NOT NULL)"),
+        PANEL_DB.prepare("CREATE INDEX IF NOT EXISTS idx_panel_users_name ON panel_users(name)"),
+        PANEL_DB.prepare("CREATE TABLE IF NOT EXISTS panel_exit_nodes (id TEXT PRIMARY KEY, country TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, data_json TEXT NOT NULL, updated_at INTEGER NOT NULL)"),
+        PANEL_DB.prepare("CREATE INDEX IF NOT EXISTS idx_panel_exit_nodes_country ON panel_exit_nodes(country)")
+      ]);
+    })().catch(error => { panelSchemaPromise = null; throw error; });
+  }
+  await panelSchemaPromise;
+}
+
+function parseStoredJson(value, fallback = null) {
+  if (typeof value === "string") { try { return JSON.parse(value); } catch { return fallback; } }
+  return value && typeof value === "object" ? value : fallback;
+}
+
+async function readD1Meta(key) {
+  if (!PANEL_DB) return null;
+  const row = await PANEL_DB.prepare("SELECT value FROM panel_meta WHERE key = ?1").bind(String(key)).first();
+  return row ? parseStoredJson(row.value, null) : null;
+}
+
 async function getKvBinding(env) {
   const isKv = value => value && typeof value.get === "function" && typeof value.put === "function";
   for (const name of ["SETTINGS", "PANEL_KV", "KV"]) if (isKv(env[name])) return env[name];
@@ -179,6 +272,7 @@ export default {
     try {
       const url = new URL(request.url);
       const path = url.pathname;
+      PANEL_DB = getD1Binding(env);
       const kv = await getKvBinding(env);
 
       if (path === "/healthz") {
@@ -189,7 +283,14 @@ export default {
         if (!(await checkClientIpRestriction(request, env, kv))) {
           return json({ error: "Access Denied", code: "ERR_IP_RESTRICTED" }, 403);
         }
-        return await handleTunnel(request, env, kv, path.slice(1), ctx);
+        return await handleTunnel(request, env, kv, path.slice(1), ctx, url.searchParams.get("exit") || "");
+      }
+      if (path.startsWith("/ss/")) {
+        if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return fakeLandingResponse();
+        if (!(await checkClientIpRestriction(request, env, kv))) return json({ error: "Access Denied", code: "ERR_IP_RESTRICTED" }, 403);
+        let token = "";
+        try { token = decodeURIComponent(path.slice(4)); } catch { return new Response("Not found", { status: 404 }); }
+        return await handleShadowsocksTunnel(request, env, kv, token, ctx, url.searchParams.get("exit") || "");
       }
       if (path.startsWith("/sub/")) {
         if (!(await checkClientIpRestriction(request, env, kv))) {
@@ -290,7 +391,7 @@ export default {
               const currentSettings = await loadSettings(kv, env);
               const currentUser = (currentSettings.users || []).find(item => String(item.id) === id);
               if (!currentUser) throw new Error("کاربر پس از بازنشانی پیدا نشد.");
-              const usage = await getUserUsage(kv, currentUser);
+              const usage = await getUserUsage(kv, currentUser, { fresh: true });
               const now = Date.now();
               const nextUsage = { ...usage, usageBytes: 0, requestCount: 0, periodStartedAt: now };
               await saveUserUsage(kv, id, nextUsage);
@@ -366,6 +467,7 @@ export default {
     }
   },
   async scheduled(controller, env, ctx) {
+    PANEL_DB = getD1Binding(env);
     ctx.waitUntil((async () => {
       try {
         const kv = await getKvBinding(env);
@@ -444,20 +546,29 @@ async function handlePingIp(request) {
   } catch {
     return json({ error: "یکی از آدرس‌ها نامعتبر است.", code: "ERR_VALIDATION" }, 400);
   }
-  const results = await Promise.all(normalized.map(async ip => {
-    if (isCloudflareEdgeIp(ip)) {
-      return { ip, status: "unsupported", latency: -1, code: "ERR_CF_IP_SOCKET_BLOCKED",
-        message: "Cloudflare Workers cannot open outbound TCP sockets to Cloudflare edge IP ranges." };
+  const results = new Array(normalized.length);
+  let cursor = 0;
+  const workerCount = Math.min(6, normalized.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= normalized.length) return;
+      const ip = normalized[index];
+      if (isCloudflareEdgeIp(ip)) {
+        results[index] = { ip, status: "unsupported", latency: -1, code: "ERR_CF_IP_SOCKET_BLOCKED",
+          message: "Cloudflare Workers cannot open outbound TCP sockets to Cloudflare edge IP ranges." };
+        continue;
+      }
+      const start = Date.now(); let socket, timer;
+      try {
+        socket = connect({ hostname: ip, port: 443 }, { secureTransport: "off", allowHalfOpen: true });
+        await Promise.race([socket.opened, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), 2500); })]);
+        results[index] = { ip, status: "ok", latency: Date.now() - start };
+      } catch (err) {
+        const message = String(err && err.message || err || "TCP connection failed").slice(0, 180);
+        results[index] = { ip, status: "error", latency: -1, message };
+      } finally { if (timer) clearTimeout(timer); try { socket?.close(); } catch {} }
     }
-    const start = Date.now(); let socket, timer;
-    try {
-      socket = connect({ hostname: ip, port: 443 }, { secureTransport: "off", allowHalfOpen: true });
-      await Promise.race([socket.opened, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), 2500); })]);
-      return { ip, status: "ok", latency: Date.now() - start };
-    } catch (err) {
-      const message = String(err && err.message || err || "TCP connection failed").slice(0, 180);
-      return { ip, status: "error", latency: -1, message };
-    } finally { if (timer) clearTimeout(timer); try { socket?.close(); } catch {} }
   }));
   return json({ results });
 }
@@ -465,6 +576,9 @@ async function handlePingIp(request) {
 const MAX_EXTERNAL_PING_TARGETS = 1;
 const CHECK_HOST_API = "https://api.check-host.cc";
 const CHECK_HOST_WEB = "https://check-host.cc";
+// Primary, stable provider: the official check-host.net API (the .cc API stays as automatic fallback).
+const CHECK_HOST_NET_API = "https://check-host.net";
+const CHECK_HOST_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 async function fetchJsonWithTimeout(url, timeoutMs = 4500, init = {}) {
   const controller = new AbortController();
@@ -472,7 +586,7 @@ async function fetchJsonWithTimeout(url, timeoutMs = 4500, init = {}) {
   try {
     const response = await fetch(url, {
       ...init,
-      headers: { Accept: "application/json", ...(init.headers || {}) },
+      headers: { "User-Agent": CHECK_HOST_USER_AGENT, "Accept": "application/json", ...(init.headers || {}) },
       signal: controller.signal
     });
     const text = await response.text();
@@ -493,6 +607,10 @@ function shortExternalError(data, bodyText, fallback) {
 const CHECK_HOST_IRAN_NODES = [
   "ir1.node.check-host.net", "ir2.node.check-host.net", "ir3.node.check-host.net",
   "ir4.node.check-host.net", "ir5.node.check-host.net", "ir6.node.check-host.net"
+];
+// Explicit Iranian nodes sent to check-host.net's /check-tcp endpoint.
+const CHECK_HOST_NET_IRAN_NODES = [
+  "ir1.node.check-host.net", "ir2.node.check-host.net", "ir3.node.check-host.net", "ir4.node.check-host.net"
 ];
 
 // True only for Check-Host probe nodes located in Iran: country code "ir",
@@ -545,6 +663,7 @@ function parseCheckHostCheck(check) {
     if (rawStatus === undefined || rawStatus === null || String(rawStatus).trim() === "") {
       if (check.error || check.errortext) rawStatus = 0;
       else if (rawLatency !== null && Number.isFinite(Number(rawLatency))) rawStatus = 1;
+      else if (check.address) rawStatus = 1;
     }
   } else {
     rawStatus = check;
@@ -560,15 +679,144 @@ function parseCheckHostCheck(check) {
   return { state: "pending", latency: null, error: "" };
 }
 
+// Official check-host.net flow: GET /check-tcp -> request_id, then GET /check-result/<id>.
+// Result per node: [{ time: 0.045, address: "..." }] | [{ error: "..." }] | null (pending).
+// Returns { startFailed: true, error } when the test could not be started (caller falls back to the legacy API).
+async function checkHostNetTcp(host, port) {
+  const target = (isIPv6Text(host) ? "[" + host + "]" : host) + ":" + Number(port);
+  const hostParam = encodeURIComponent(target);
+  const isValidStart = r => !!(r?.response?.ok && r?.data && typeof r.data === "object" && r.data.request_id
+    && r.data.nodes && typeof r.data.nodes === "object" && Object.keys(r.data.nodes).length > 0);
+  const startUrls = [
+    `${CHECK_HOST_NET_API}/check-tcp?host=${hostParam}` + CHECK_HOST_NET_IRAN_NODES.map(n => "&node=" + encodeURIComponent(n)).join(""),
+    `${CHECK_HOST_NET_API}/check-tcp?host=${hostParam}&max_nodes=10`
+  ];
+  let started = null, lastError = "";
+  for (const url of startUrls) {
+    try {
+      const attempt = await fetchJsonWithTimeout(url, 7000);
+      if (isValidStart(attempt)) { started = attempt; break; }
+      const httpStatus = Number(attempt?.response?.status) || 0;
+      lastError = `HTTP ${httpStatus || "بدون پاسخ"}: ${shortExternalError(attempt?.data, attempt?.bodyText, "پاسخ معتبر برای شروع آزمون دریافت نشد.")}`;
+      if (httpStatus === 429) break;
+    } catch (error) {
+      lastError = (error && error.name === "AbortError") ? "مهلت ارتباط تمام شد." : String(error?.message || error).slice(0, 120);
+    }
+  }
+  if (!started) return { startFailed: true, error: lastError };
+
+  const requestId = String(started.data.request_id);
+  const nodeInfo = started.data.nodes;
+  const reportUrl = typeof started.data.permanent_link === "string" && started.data.permanent_link.startsWith(CHECK_HOST_NET_API + "/")
+    ? started.data.permanent_link
+    : (/^[A-Za-z0-9]{4,40}$/.test(requestId) ? `${CHECK_HOST_NET_API}/check-report/${requestId}` : null);
+  const infoFor = name => {
+    const v = nodeInfo[name];
+    if (Array.isArray(v)) return { countryCode: v[0], country: v[1], city: v[2], isp: v[4] };
+    return v && typeof v === "object" ? v : {};
+  };
+  const allNames = Object.keys(nodeInfo);
+  const iranNames = allNames.filter(name => isIranCheckHostNode(name, infoFor(name)));
+
+  let resultMap = null, lastPollError = "";
+  for (const delay of [2000, 2000, 2500, 3000]) {
+    await sleep(delay);
+    let poll;
+    try {
+      poll = await fetchJsonWithTimeout(`${CHECK_HOST_NET_API}/check-result/${encodeURIComponent(requestId)}`, 3500);
+    } catch (error) {
+      lastPollError = String(error?.message || error).slice(0, 100);
+      continue;
+    }
+    if (!poll.response.ok || !poll.data || typeof poll.data !== "object" || Array.isArray(poll.data)) {
+      lastPollError = `HTTP ${poll.response.status}`;
+      continue;
+    }
+    resultMap = poll.data;
+    // Stop once every Iranian node (or, when no Iranian node was assigned, every node) has reported.
+    const watch = iranNames.length ? iranNames : allNames;
+    if (watch.every(name => externalChecksArray(resultMap[name]).length > 0)) break;
+  }
+
+  if (!resultMap) {
+    return { host, port, status: "pending", latency: null, successes: 0, nodes: 0, iranNodes: iranNames.length,
+      error: lastPollError ? `آزمون ساخته شد اما گزارش هنوز در دسترس نیست (${lastPollError}).` : "آزمون ساخته شد؛ گزارش گره‌ها هنوز آماده نیست.",
+      reportUrl, providerMethod: "GET" };
+  }
+
+  // Iranian nodes first; with no active Iranian node, report the responding nodes (by name) so the test is never left without a result.
+  let usedNames = iranNames;
+  let nonIranFallback = false;
+  if (!iranNames.length) {
+    nonIranFallback = true;
+    usedNames = allNames.filter(name => externalChecksArray(resultMap[name]).length > 0);
+    if (!usedNames.length) usedNames = allNames;
+  }
+
+  const times = [];
+  let successfulNodes = 0, failed = 0, pending = 0;
+  const nodeResults = usedNames.map(name => {
+    const info = infoFor(name);
+    const city = [info.city || info.country || "گره نامشخص", name].filter(Boolean).join(" — ");
+    const checks = externalChecksArray(resultMap[name]);
+    if (!checks.length) { pending++; return { node: name, city, status: "pending", latency: null }; }
+    const parsed = parseCheckHostCheck(checks[0]);
+    if (parsed.state === "ok") {
+      successfulNodes++;
+      if (parsed.latency !== null) times.push(parsed.latency);
+      return { node: name, city, status: "ok", latency: parsed.latency };
+    }
+    if (parsed.state === "pending") { pending++; return { node: name, city, status: "pending", latency: null }; }
+    failed++;
+    return { node: name, city, status: "error", latency: null, error: String(parsed.error || "اتصال TCP برقرار نشد").slice(0, 160) };
+  });
+  const avg = times.length ? Math.round(times.reduce((a, b) => a + b, 0) / times.length) : null;
+  const status = successfulNodes > 0 ? "ok" : pending > 0 ? "pending" : "error";
+  const fallbackNote = nonIranFallback
+    ? `هیچ گرهٔ فعال ایرانی در این آزمون نبود؛ نتیجه از سایر گره‌ها (${usedNames.slice(0, 6).join("، ")}) گزارش شده است و نمایندهٔ دید داخل ایران نیست.`
+    : "";
+  let error = null;
+  if (status === "error") {
+    const reasons = nodeResults.filter(node => node.status === "error" && node.error).slice(0, 3).map(node => node.city + ": " + node.error);
+    error = (nonIranFallback ? fallbackNote + " " : "") + (nonIranFallback ? "هیچ‌یک از گره‌های پاسخ‌دهنده" : "هیچ‌یک از گره‌های ایرانی پاسخ‌دهنده")
+      + " اتصال TCP برقرار نکردند." + (reasons.length ? " جزئیات: " + reasons.join("؛ ") : "");
+  } else if (status === "pending") {
+    error = (nonIranFallback ? fallbackNote + " " : "") + "برخی گره‌ها هنوز پاسخ نداده‌اند؛ نامشخص به‌معنای بسته‌بودن پورت نیست.";
+  } else if (nonIranFallback) {
+    error = fallbackNote;
+  }
+  return {
+    host, port, status, latency: avg, successes: successfulNodes, nodes: usedNames.length, iranNodes: nonIranFallback ? 0 : usedNames.length,
+    minLatency: times.length ? Math.min(...times) : null,
+    maxLatency: times.length ? Math.max(...times) : null,
+    error, reportUrl, failedNodes: failed, pendingNodes: pending, nodeResults, providerMethod: "GET"
+  };
+}
+
+// Primary: check-host.net. Fallback (only if check-host.net cannot start the test): legacy api.check-host.cc.
 async function checkHostExternalTcp(host, port, dispatchDelayMs = 0, env = {}) {
+  if (dispatchDelayMs > 0) await sleep(dispatchDelayMs);
+  let netResult;
+  try {
+    netResult = await checkHostNetTcp(host, port);
+  } catch (err) {
+    netResult = { startFailed: true, error: (err && err.name === "AbortError") ? "مهلت ارتباط تمام شد." : String(err?.message || err).slice(0, 120) };
+  }
+  if (netResult && !netResult.startFailed) return netResult;
+  const legacy = await checkHostLegacyTcp(host, port, env);
+  if (legacy && legacy.status === "error" && netResult?.error) {
+    legacy.error = `check-host.net: ${netResult.error} | ${legacy.error || ""}`.slice(0, 400);
+  }
+  return legacy;
+}
+// Legacy provider (api.check-host.cc). Used only as an automatic fallback when check-host.net cannot start a test.
+async function checkHostLegacyTcp(host, port, env = {}) {
   const apiKey = String(env?.CHECK_HOST_API_KEY || "").trim();
   const headers = { "content-type": "application/json" };
   if (apiKey) headers.Authorization = "Bearer " + apiKey;
   const isValidStart = result => !!(result?.response?.ok && result?.data?.success === true && result?.data?.uuid);
   const retryDelay = response => Math.min(15000, Math.max(1000, Number(response?.headers?.get("retry-after") || 5) * 1000));
   try {
-    if (dispatchDelayMs > 0) await sleep(dispatchDelayMs);
-
     // /usage is explicitly outside Check-Host's rate limiter. Check that one
     // start plus possible fallback and report polling fit the current budget.
     try {
@@ -757,7 +1005,7 @@ function normalizeTcpTestHistoryEntry(item) {
     failedNodes: Math.max(0, Math.floor(Number(item.failedNodes) || 0)),
     pendingNodes: Math.max(0, Math.floor(Number(item.pendingNodes) || 0)),
     error: String(item.error || "").slice(0, 180),
-    reportUrl: typeof item.reportUrl === "string" && item.reportUrl.startsWith(CHECK_HOST_WEB + "/report/") ? item.reportUrl : null,
+    reportUrl: typeof item.reportUrl === "string" && (item.reportUrl.startsWith("https://check-host.net/") || item.reportUrl.startsWith("https://check-host.cc/")) ? item.reportUrl : null,
     providerMethod: ["POST", "GET", "preflight"].includes(item.providerMethod) ? item.providerMethod : "unknown",
     nodeResults: Array.isArray(item.nodeResults) ? item.nodeResults.slice(0, 80).map(node => ({
       node: String(node.node || "").slice(0, 100), city: String(node.city || "").slice(0, 120),
@@ -801,10 +1049,6 @@ async function handleExternalPing(request, kv, env, requestUrl) {
   if (!body || !Array.isArray(body.targets) || body.targets.length < 1 || body.targets.length > MAX_EXTERNAL_PING_TARGETS) {
     return json({ error: `فهرست آزمون باید بین ۱ تا ${MAX_EXTERNAL_PING_TARGETS} هدف داشته باشد.`, code: "ERR_VALIDATION" }, 400);
   }
-  const settings = await loadSettings(kv, env);
-  const defaultHost = cleanHost(settings.publicHost) || requestUrl.hostname;
-  const allowedHosts = new Set(getEndpoints(settings, defaultHost).map(item => String(item.address).toLowerCase()));
-  const allowedPorts = new Set([...getConfiguredPorts(settings, true), ...getConfiguredPorts(settings, false)]);
   const targets = [], seen = new Set();
   try {
     for (const target of body.targets) {
@@ -812,9 +1056,9 @@ async function handleExternalPing(request, kv, env, requestUrl) {
       const hp = parseHostPort(rawHost, 443);
       if (hp.hasPort) throw new Error("پورت باید در فیلد جداگانه وارد شود");
       const host = hp.host.toLowerCase();
-      const port = Number(target.port);
-      if (!allowedHosts.has(host)) throw new Error("فقط دامنه ثابت و Clean IPهای ذخیره‌شده قابل آزمون هستند");
-      if (!Number.isInteger(port) || !allowedPorts.has(port)) throw new Error("این پورت در تنظیمات فعال نیست");
+      const port = Number(target?.port);
+      if (!isIPv4Text(host) && !isIPv6Text(host) && !isDomainName(host)) throw new Error("آدرس IP یا دامنهٔ نامعتبر است");
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("پورت باید عددی بین ۱ تا ۶۵۵۳۵ باشد");
       const key = `${host}|${port}`;
       if (!seen.has(key)) { seen.add(key); targets.push({ host, port }); }
     }
@@ -829,7 +1073,7 @@ async function handleExternalPing(request, kv, env, requestUrl) {
   const stampedResults = await appendTcpTestHistory(kv, results);
   const byKey = new Map(stampedResults.map(item => [`${item.host}|${item.port}`, item]));
   const resultsWithTime = results.map(item => ({ ...item, checkedAt: byKey.get(`${item.host}|${item.port}`)?.checkedAt || Date.now() }));
-  return json({ provider: "Check-Host.cc", note: "نتایج فقط از گره‌های ایرانی Check-Host.cc محاسبه می‌شوند؛ گره‌های خارجی نادیده گرفته می‌شوند. این گره‌ها نمایندهٔ همهٔ اپراتورها یا مسیر دقیق کاربر نیستند.", results: resultsWithTime });
+  return json({ provider: "Check-Host.net", note: "نتایج در اولویت از گره‌های ایرانی Check-Host محاسبه می‌شوند؛ در صورت نبودن گرهٔ فعال ایرانی، نتیجهٔ سایر گره‌های پاسخ‌دهنده به‌همراه نام گره برگردانده می‌شود. این گره‌ها نمایندهٔ همهٔ اپراتورها یا مسیر دقیق کاربر نیستند.", results: resultsWithTime });
 }
 
 // -------------------- Session & Setup Helpers --------------------
@@ -850,8 +1094,14 @@ async function handleSetup(request, kv, env, url) {
   if (!username || username.length < 3) return json({ error: "نام کاربری نامعتبر است", code: "ERR_USERNAME_INVALID" }, 400);
   if (!password || password.length < 6) return json({ error: "رمز عبور ضعیف است", code: "ERR_PASSWORD_INVALID" }, 400);
 
-  const checkAgain = await kv.get(SETTINGS_KEY, "json");
-  if (checkAgain && checkAgain.passwordHash) return json({ error: "Setup completed by another request", code: "ERR_SETUP_DONE" }, 400);
+  if (PANEL_DB) {
+    await ensurePanelD1Schema();
+    const savedCore = await readD1Meta("core");
+    if (savedCore?.passwordHash) return json({ error: "Setup completed by another request", code: "ERR_SETUP_DONE" }, 400);
+  } else {
+    const checkAgain = parseStoredJson(await kv.get(SETTINGS_KEY, { type: "json" }), null);
+    if (checkAgain?.passwordHash) return json({ error: "Setup completed by another request", code: "ERR_SETUP_DONE" }, 400);
+  }
 
   const passwordHash = await hashPassword(password);
   const sessionSecret = await generateSecureToken();
@@ -1120,7 +1370,7 @@ function generateSecureRandomString(length = 16) {
 // -------------------- Settings & KV Management --------------------
 const LEGACY_SETTINGS_KEYS = ["panel-settings-v2", "panel-settings-v1", "panel-settings", "settings"];
 
-async function loadSettings(kv, env) {
+async function loadSettings(kv, env = {}) {
   const defaults = {
     ...DEFAULTS, uuid: String(env.UUID || ""), trojanPassword: String(env.TR_PASS || ""),
     proxyIP: String(env.PROXY_IP || ""), tlsPort: parsePort(env.TLS_PORT, 443),
@@ -1133,46 +1383,161 @@ async function loadSettings(kv, env) {
     logLevel: "warning", echEnabled: false, customBypass: "", subToken: String(env.SUB_TOKEN || "")
   };
   if (!kv) return { ...defaults, subToken: defaults.subToken || await fallbackToken(env) };
-  let stored = await kv.get(SETTINGS_KEY, "json");
+
+  const now = Date.now();
+  if (panelSettingsCache && panelSettingsCache.dbMode === !!PANEL_DB && panelSettingsCache.expiresAt > now) {
+    const cached = panelSettingsCache;
+    return { ...defaults, ...cached.config, ...cached.core, users: cached.users, exitNodes: cached.exitNodes,
+      tlsPort: parsePort(cached.config.tlsPort, defaults.tlsPort),
+      nonTlsPort: parsePort(cached.config.nonTlsPort, defaults.nonTlsPort),
+      extraTlsPorts: safeStoredPortList(cached.config.extraTlsPorts),
+      extraNonTlsPorts: safeStoredPortList(cached.config.extraNonTlsPorts),
+      subToken: String(cached.core.subToken || defaults.subToken || await fallbackToken(env)) };
+  }
+
+  let stored = parseStoredJson(await kv.get(SETTINGS_KEY, { type: "json" }), null);
   if (!stored || typeof stored !== "object") {
     for (const oldKey of LEGACY_SETTINGS_KEYS) {
       try {
-        const old = await kv.get(oldKey, "json");
+        const old = parseStoredJson(await kv.get(oldKey, { type: "json" }), null);
         if (old && typeof old === "object") {
-          stored = old;
-          await kv.put(SETTINGS_KEY, JSON.stringify({ ...DEFAULTS, ...old }));
+          stored = { ...DEFAULTS, ...old };
+          await kv.put(SETTINGS_KEY, JSON.stringify(stored));
           break;
         }
       } catch {}
     }
   }
-  if (stored && typeof stored === "object") {
-    return { ...defaults, ...stored,
-      tlsPort: parsePort(stored.tlsPort, defaults.tlsPort),
-      nonTlsPort: parsePort(stored.nonTlsPort, defaults.nonTlsPort),
-      extraTlsPorts: safeStoredPortList(stored.extraTlsPorts),
-      extraNonTlsPorts: safeStoredPortList(stored.extraNonTlsPorts),
-      remoteDns: safeDohUrl(stored.remoteDns || DEFAULT_REMOTE_DNS),
-      localDns: safeStoredDns(stored.localDns || "localhost", "localhost"),
-      antiSanctionDns: safeStoredDns(stored.antiSanctionDns || "", ""),
-      fakeDnsEnabled: stored.fakeDnsEnabled === true, ipv6Enabled: stored.ipv6Enabled !== false,
-      logLevel: normalizeLogLevel(stored.logLevel), echEnabled: stored.echEnabled === true,
-      fragmentProfile: String(stored.fragmentProfile || "custom"),
-      fingerprint: normalizeFingerprint(stored.fingerprint),
-      echConfigList: String(stored.echConfigList || ""),
-      users: Array.isArray(stored.users) ? stored.users : [],
-      proxies: Array.isArray(stored.proxies) ? stored.proxies : [],
-      chainProxies: Array.isArray(stored.chainProxies) ? stored.chainProxies : [],
-      customBypass: safeCustomBypass(stored.customBypass || ""),
-      cleanIpSources: normalizeCleanIpSources(stored.cleanIpSources || defaults.cleanIpSources || DEFAULT_CLEAN_IP_SOURCE),
-      subToken: String(stored.subToken || defaults.subToken || await fallbackToken(env)) };
+  stored = stored && typeof stored === "object" ? stored : {};
+
+  let core = {
+    username: String(stored.username || defaults.username),
+    passwordHash: String(stored.passwordHash || ""),
+    sessionSecret: String(stored.sessionSecret || ""),
+    uuid: String(stored.uuid || defaults.uuid || ""),
+    trojanPassword: String(stored.trojanPassword || defaults.trojanPassword || ""),
+    subToken: String(stored.subToken || defaults.subToken || ""),
+    vlessEnabled: stored.vlessEnabled !== false,
+    trojanEnabled: stored.trojanEnabled !== false
+  };
+  let users = Array.isArray(stored.users) ? stored.users : [];
+  let exitNodes = Array.isArray(stored.exitNodes) ? stored.exitNodes : [];
+
+  if (PANEL_DB) {
+    await ensurePanelD1Schema();
+    const nowMs = Date.now();
+    const coreRow = await PANEL_DB.prepare("SELECT value FROM panel_meta WHERE key = 'core'").first();
+    // One-time, additive migration from the original all-KV settings record.
+    // INSERT OR IGNORE makes simultaneous first requests safe across Worker isolates.
+    const migration = [];
+    if (!coreRow) migration.push(PANEL_DB.prepare("INSERT OR IGNORE INTO panel_meta (key, value) VALUES ('core', ?1)").bind(JSON.stringify(core)));
+    if (users.length) {
+      for (const user of users.slice(0, 50)) migration.push(PANEL_DB.prepare(
+        "INSERT OR IGNORE INTO panel_users (id, name, enabled, data_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+      ).bind(String(user.id), String(user.name || "user"), user.enabled === false ? 0 : 1, JSON.stringify(user), nowMs));
+    }
+    if (exitNodes.length) {
+      for (const node of validateExitNodes(exitNodes)) migration.push(PANEL_DB.prepare(
+        "INSERT OR IGNORE INTO panel_exit_nodes (id, country, name, kind, data_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+      ).bind(node.id, node.country, node.name, node.kind, JSON.stringify(node), nowMs));
+    }
+    if (migration.length) await PANEL_DB.batch(migration);
+
+    const [savedCore, userRows, exitRows] = await Promise.all([
+      readD1Meta("core"),
+      PANEL_DB.prepare("SELECT id, data_json FROM panel_users ORDER BY rowid").all(),
+      PANEL_DB.prepare("SELECT id, data_json FROM panel_exit_nodes ORDER BY rowid").all()
+    ]);
+    if (savedCore && typeof savedCore === "object") core = { ...core, ...savedCore };
+    users = (userRows?.results || []).map(row => parseStoredJson(row.data_json, null)).filter(Boolean);
+    exitNodes = (exitRows?.results || []).map(row => parseStoredJson(row.data_json, null)).filter(Boolean);
+
+    // Keep sensitive identity/user/proxy credentials out of KV once D1 owns them.
+    const hasLegacySecrets = ["users", "exitNodes", "passwordHash", "sessionSecret", "uuid", "trojanPassword", "subToken"].some(key => Object.prototype.hasOwnProperty.call(stored, key));
+    if (hasLegacySecrets) {
+      const sanitized = { ...stored };
+      for (const key of ["users", "exitNodes", "passwordHash", "sessionSecret", "uuid", "trojanPassword", "subToken"]) delete sanitized[key];
+      await kv.put(SETTINGS_KEY, JSON.stringify(sanitized));
+      stored = sanitized;
+    }
   }
-  return { ...defaults, subToken: defaults.subToken || await fallbackToken(env) };
+
+  const config = {
+    ...defaults, ...stored,
+    tlsPort: parsePort(stored.tlsPort, defaults.tlsPort),
+    nonTlsPort: parsePort(stored.nonTlsPort, defaults.nonTlsPort),
+    extraTlsPorts: safeStoredPortList(stored.extraTlsPorts),
+    extraNonTlsPorts: safeStoredPortList(stored.extraNonTlsPorts),
+    remoteDns: safeDohUrl(stored.remoteDns || DEFAULT_REMOTE_DNS),
+    localDns: safeStoredDns(stored.localDns || "localhost", "localhost"),
+    antiSanctionDns: safeStoredDns(stored.antiSanctionDns || "", ""),
+    fakeDnsEnabled: stored.fakeDnsEnabled === true,
+    ipv6Enabled: stored.ipv6Enabled !== false,
+    logLevel: normalizeLogLevel(stored.logLevel),
+    echEnabled: stored.echEnabled === true,
+    fragmentProfile: String(stored.fragmentProfile || "custom"),
+    fingerprint: normalizeFingerprint(stored.fingerprint),
+    echConfigList: String(stored.echConfigList || ""),
+    trafficByteTrackingEnabled: stored?.trafficByteTrackingEnabled === true,
+    shadowsocksEnabled: stored.shadowsocksEnabled === true,
+    shadowsocksMethod: SHADOWSOCKS_METHODS.has(String(stored.shadowsocksMethod || "aes-256-gcm").toLowerCase()) ? String(stored.shadowsocksMethod || "aes-256-gcm").toLowerCase() : "aes-256-gcm",
+    proxies: Array.isArray(stored.proxies) ? stored.proxies : [],
+    chainProxies: Array.isArray(stored.chainProxies) ? stored.chainProxies : [],
+    customBypass: safeCustomBypass(stored.customBypass || ""),
+    cleanIpSources: normalizeCleanIpSources(stored.cleanIpSources || defaults.cleanIpSources || DEFAULT_CLEAN_IP_SOURCE),
+    ...core,
+    users: Array.isArray(users) ? users : [],
+    exitNodes: Array.isArray(exitNodes) ? exitNodes : [],
+    subToken: String(core.subToken || defaults.subToken || await fallbackToken(env)),
+    storageMode: PANEL_DB ? "D1+KV" : "KV"
+  };
+  panelSettingsCache = {
+    config: { ...config }, core: { ...core }, users: config.users, exitNodes: config.exitNodes,
+    dbMode: !!PANEL_DB, expiresAt: now + PANEL_SETTINGS_CACHE_TTL_MS
+  };
+  return config;
 }
 
 async function saveSettings(kv, env, settings) {
   if (!kv) throw new Error("KV Binding یافت نشد. در تنظیمات Worker یک KV Namespace با نام SETTINGS تعریف کنید.");
-  await kv.put(SETTINGS_KEY, JSON.stringify(settings));
+  if (PANEL_DB) {
+    await ensurePanelD1Schema();
+    const now = Date.now();
+    const core = {
+      username: String(settings.username || "admin"),
+      passwordHash: String(settings.passwordHash || ""),
+      sessionSecret: String(settings.sessionSecret || ""),
+      uuid: String(settings.uuid || ""),
+      trojanPassword: String(settings.trojanPassword || ""),
+      subToken: String(settings.subToken || ""),
+      vlessEnabled: settings.vlessEnabled !== false,
+      trojanEnabled: settings.trojanEnabled !== false
+    };
+    const users = Array.isArray(settings.users) ? settings.users.slice(0, 50) : [];
+    const exits = validateExitNodes(Array.isArray(settings.exitNodes) ? settings.exitNodes : []);
+    const statements = [
+      PANEL_DB.prepare("INSERT OR REPLACE INTO panel_meta (key, value) VALUES ('core', ?1)").bind(JSON.stringify(core)),
+      PANEL_DB.prepare("DELETE FROM panel_users"),
+      PANEL_DB.prepare("DELETE FROM panel_exit_nodes")
+    ];
+    for (const user of users) statements.push(PANEL_DB.prepare(
+      "INSERT INTO panel_users (id, name, enabled, data_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+    ).bind(String(user.id), String(user.name || "user"), user.enabled === false ? 0 : 1, JSON.stringify(user), now));
+    for (const node of exits) statements.push(PANEL_DB.prepare(
+      "INSERT INTO panel_exit_nodes (id, country, name, kind, data_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    ).bind(node.id, node.country, node.name, node.kind, JSON.stringify(node), now));
+    await PANEL_DB.batch(statements);
+
+    const kvSettings = { ...settings };
+    for (const key of ["users", "exitNodes", "passwordHash", "sessionSecret", "uuid", "trojanPassword", "subToken"]) delete kvSettings[key];
+    await kv.put(SETTINGS_KEY, JSON.stringify(kvSettings));
+  } else {
+    await kv.put(SETTINGS_KEY, JSON.stringify(settings));
+  }
+  panelSettingsCache = null;
+  credentialIndexCache = null;
+  SUBSCRIPTION_URI_CACHE.clear();
+  panelSettingsRevision++;
 }
 
 function normalizeFingerprint(value) {
@@ -1207,6 +1572,7 @@ function normalizeUserDefinitions(value) {
     const createdAt = Number.isFinite(Number(u.createdAt)) && Number(u.createdAt) > 0 ? Number(u.createdAt) : now;
     return {
       id, name, uuid, trojanPassword, subToken,
+      shadowsocksPassword: String(u.shadowsocksPassword || uuid),
       vlessEnabled: u.vlessEnabled !== false,
       trojanEnabled: u.trojanEnabled !== false,
       trafficLimitGB: finiteLimit(u.trafficLimitGB, 0, 1000000),
@@ -1282,9 +1648,94 @@ function defaultUserUsage(user) {
   };
 }
 
-async function getUserUsage(kv, user) {
+// Returns undefined on a miss/expiry, otherwise the cached raw record (which may be null
+// when KV has no record for the key).
+function usageCacheGet(key) {
+  const entry = usageMemoryCache.get(key);
+  if (!entry) return undefined;
+  if (entry.expires <= Date.now()) { usageMemoryCache.delete(key); return undefined; }
+  return entry.raw;
+}
+
+function usageCacheSet(key, raw) {
+  usageMemoryCache.delete(key);
+  usageMemoryCache.set(key, { raw, expires: Date.now() + USAGE_CACHE_TTL_MS });
+  while (usageMemoryCache.size > USAGE_CACHE_MAX_ENTRIES) usageMemoryCache.delete(usageMemoryCache.keys().next().value);
+}
+
+function usageCacheDelete(key) { usageMemoryCache.delete(key); }
+
+// Waits for any queued/in-flight KV write of this key made by this isolate.
+async function waitForUsageWrite(key) {
+  const state = usageWriteStates.get(key);
+  if (state && state.running) { try { await state.running; } catch {} }
+}
+
+// Reads a raw usage record: RAM cache first, KV only on a miss. `fresh` skips the cache
+// (used by the periodic traffic flush / admin operations so that records written by other
+// isolates are never overwritten with a stale copy).
+async function readUsageRaw(kv, key, fresh = false) {
+  if (!fresh) {
+    const hit = usageCacheGet(key);
+    if (hit !== undefined) return hit;
+  } else {
+    await waitForUsageWrite(key);
+  }
+  let raw;
+  if (fresh) {
+    raw = readKvJson(await kv.get(key, { type: "json" }));
+  } else {
+    let pending = usageReadInflight.get(key);
+    if (!pending) {
+      pending = Promise.resolve(kv.get(key, { type: "json" })).finally(() => usageReadInflight.delete(key));
+      usageReadInflight.set(key, pending);
+    }
+    raw = readKvJson(await pending);
+  }
+  if (!fresh) {
+    // A local save may have landed while we were waiting for KV; it is newer than this read.
+    const again = usageCacheGet(key);
+    if (again !== undefined) return again;
+  }
+  if (!usageWriteStates.has(key)) usageCacheSet(key, raw);
+  return raw;
+}
+
+// Coalesced, paced KV write: concurrent callers share one in-flight writer that always
+// writes the newest payload, so parallel handshakes never exceed KV's 1 write/s/key limit.
+function persistUsagePayload(kv, key, payload) {
+  let state = usageWriteStates.get(key);
+  if (!state) { state = { payload: null, dirty: false, running: null }; usageWriteStates.set(key, state); }
+  state.payload = payload;
+  state.dirty = true;
+  if (!state.running) {
+    const st = state;
+    st.running = (async () => {
+      try {
+        while (st.dirty) {
+          await paceKvWrite(key);
+          const body = st.payload;
+          st.dirty = false;
+          await kv.put(key, body);
+          markKvWrite(key);
+        }
+      } finally {
+        st.running = null;
+        if (!st.dirty && usageWriteStates.get(key) === st) usageWriteStates.delete(key);
+      }
+    })();
+    st.running.catch(() => {});
+  }
+  return state.running;
+}
+
+async function getUserUsage(kv, user, options = {}) {
   if (!kv) return defaultUserUsage(user);
-  const raw = readKvJson(await kv.get(USER_USAGE_PREFIX + user.id, { type: "json" }));
+  const raw = await readUsageRaw(kv, USER_USAGE_PREFIX + user.id, options.fresh === true);
+  return normalizeUserUsage(raw, user);
+}
+
+function normalizeUserUsage(raw, user) {
   const base = defaultUserUsage(user);
   if (!raw) return base;
   const usage = {
@@ -1326,8 +1777,11 @@ async function getUserUsage(kv, user) {
 
 async function saveUserUsage(kv, userId, usage) {
   if (!kv) throw new Error("برای مدیریت کاربران باید KV متصل باشد.");
-  await kv.put(USER_USAGE_PREFIX + userId, JSON.stringify(usage));
-  markKvWrite(USER_USAGE_PREFIX + userId);
+  const key = USER_USAGE_PREFIX + userId;
+  const payload = JSON.stringify(usage);
+  // The RAM cache is updated synchronously (before any await) so parallel handshakes see it at once.
+  usageCacheSet(key, JSON.parse(payload));
+  await persistUsagePayload(kv, key, payload);
 }
 
 function normalizeAdminUsage(raw = {}) {
@@ -1342,16 +1796,17 @@ function normalizeAdminUsage(raw = {}) {
   };
 }
 
-async function getAdminUsage(kv) {
+async function getAdminUsage(kv, options = {}) {
   if (!kv) return normalizeAdminUsage();
-  const raw = readKvJson(await kv.get(ADMIN_USAGE_KEY, { type: "json" }));
+  const raw = await readUsageRaw(kv, ADMIN_USAGE_KEY, options.fresh === true);
   return normalizeAdminUsage(raw || {});
 }
 
 async function saveAdminUsage(kv, usage) {
   if (!kv) return;
-  await kv.put(ADMIN_USAGE_KEY, JSON.stringify(normalizeAdminUsage(usage)));
-  markKvWrite(ADMIN_USAGE_KEY);
+  const payload = JSON.stringify(normalizeAdminUsage(usage));
+  usageCacheSet(ADMIN_USAGE_KEY, JSON.parse(payload));
+  await persistUsagePayload(kv, ADMIN_USAGE_KEY, payload);
 }
 
 // Per-isolate write pacing/coalescing so that concurrent tunnels of the same account
@@ -1398,7 +1853,10 @@ function enqueueTrafficWrite(kv, accountId, bytes, dailyDeltas) {
 async function addAdminTraffic(kv, amount, dailyDeltas = null) {
   if (!kv || !Number.isFinite(amount) || amount <= 0) return null;
   return withUserUsageLock("default", async () => {
-    const usage = await getAdminUsage(kv);
+    // Flush path: pace first, then read straight from KV (not the RAM cache) so that
+    // updates written by other isolates are not overwritten by a stale cached copy.
+    await paceKvWrite(ADMIN_USAGE_KEY);
+    const usage = await getAdminUsage(kv, { fresh: true });
     const acceptedAmount = Math.floor(amount);
     usage.usageBytes += acceptedAmount;
     const deltas = dailyDeltas && typeof dailyDeltas === "object" ? dailyDeltas : { [utcUsageDayKey()]: acceptedAmount };
@@ -1410,7 +1868,6 @@ async function addAdminTraffic(kv, amount, dailyDeltas = null) {
       dailyTotal += bytes;
     }
     if (dailyTotal < acceptedAmount) addDailyUsage(usage, utcUsageDayKey(), 0, acceptedAmount - dailyTotal);
-    await paceKvWrite(ADMIN_USAGE_KEY);
     await saveAdminUsage(kv, usage);
     const local = userTrafficState.get("default");
     if (local && local.periodStartedAt === Number(usage.periodStartedAt || 0)) local.usageBytes = Math.max(local.usageBytes, usage.usageBytes);
@@ -1445,74 +1902,70 @@ function getUserAccessError(user, usage, now = Date.now()) {
   return "";
 }
 
-async function beginUserSession(kv, candidate) {
+async function beginUserSession(kv, candidate, ctx = null) {
   if (!candidate) throw new Error("اعتبارنامه نامعتبر است.");
+  // The handshake never waits for KV: usage comes from the isolate RAM cache, the updated
+  // counter is stored in the cache immediately and written to KV in the background.
+  // `candidate` was resolved from freshly loaded settings a moment ago in handleTunnel,
+  // so credentials / enabled flag / limits are already current (no second SETTINGS read).
+  const persistInBackground = pending => {
+    const guarded = pending.catch(err => console.warn("Session counter persistence failed:", String(err?.message || err).slice(0, 120)));
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(guarded);
+  };
   if (candidate.id === "default") {
     // The administrator is unlimited, but is still measured exactly like a user.
-    // Re-read credentials before accepting the tunnel to reject rotated secrets.
     if (kv) {
-      const latest = readKvJson(await kv.get(SETTINGS_KEY, { type: "json" }));
-      if (!latest) throw new Error("تنظیمات اصلی در دسترس نیست.");
-      if (candidate.uuid && String(latest.uuid || "").toLowerCase() !== String(candidate.uuid).toLowerCase()) {
-        throw new Error("UUID اصلی قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
-      }
-      if (candidate.trojanPassword && String(latest.trojanPassword || "") !== String(candidate.trojanPassword)) {
-        throw new Error("رمز Trojan اصلی قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
-      }
-      return withUserUsageLock("default", async () => {
-        const usage = await getAdminUsage(kv);
-        const trafficState = getLocalUserTrafficState("default", usage);
-        usage.usageBytes = Math.max(Number(usage.usageBytes) || 0, trafficState.usageBytes);
-        usage.requestCount++;
-        usage.lastConnectedAt = Date.now();
-        if (!usage.firstConnectedAt) usage.firstConnectedAt = Date.now();
-        addDailyUsage(usage, utcUsageDayKey(), 1, 0);
-        await saveAdminUsage(kv, usage);
-        userActiveConnections.set("default", (userActiveConnections.get("default") || 0) + 1);
-        return { user: candidate, usage, trafficState, tracked: true };
-      });
+      if (usageCacheGet(ADMIN_USAGE_KEY) === undefined) await readUsageRaw(kv, ADMIN_USAGE_KEY, false); // rare: cold cache
+      // No await between reading the cache and updating it: parallel handshakes cannot lose increments.
+      const usage = normalizeAdminUsage(usageCacheGet(ADMIN_USAGE_KEY) || {});
+      const trafficState = getLocalUserTrafficState("default", usage);
+      const now = Date.now();
+      usage.requestCount++;
+      usage.lastConnectedAt = now;
+      if (!usage.firstConnectedAt) usage.firstConnectedAt = now;
+      addDailyUsage(usage, utcUsageDayKey(now), 1, 0);
+      persistInBackground(saveAdminUsage(kv, usage));
+      userActiveConnections.set("default", (userActiveConnections.get("default") || 0) + 1);
+      return { user: candidate, usage, trafficState, tracked: true };
     }
     return { user: candidate, usage: normalizeAdminUsage(), trafficState: getLocalUserTrafficState("default", normalizeAdminUsage()), tracked: false };
   }
   if (!kv) throw new Error("مدیریت کاربر به KV نیاز دارد.");
   const id = String(candidate.id);
+  const key = USER_USAGE_PREFIX + id;
   const active = userActiveConnections.get(id) || 0;
   const limit = Math.max(0, Number(candidate.deviceLimit) || 0);
   if (limit > 0 && active >= limit) throw new Error("حد اتصال هم‌زمان این کاربر در این Worker پر شده است.");
   userActiveConnections.set(id, active + 1);
   try {
-    return await withUserUsageLock(id, async () => {
-      const latest = readKvJson(await kv.get(SETTINGS_KEY, { type: "json" }));
-      const liveUser = Array.isArray(latest?.users) ? latest.users.find(u => String(u.id) === id) : null;
-      if (!liveUser || liveUser.enabled === false) throw new Error("کاربر حذف یا غیرفعال شده است.");
-      if (candidate.uuid && String(liveUser.uuid || "").toLowerCase() !== String(candidate.uuid).toLowerCase()) throw new Error("اعتبارنامه قبلی کاربر منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
-      if (candidate.trojanPassword && String(liveUser.trojanPassword || "") !== String(candidate.trojanPassword)) throw new Error("رمز Trojan قبلی منسوخ شده است؛ کانفیگ جدید را دریافت کنید.");
-      const liveLimit = Math.max(0, Number(liveUser.deviceLimit) || 0);
-      const currentConnections = userActiveConnections.get(id) || 0;
-      if (liveLimit > 0 && currentConnections > liveLimit) throw new Error("حد اتصال هم‌زمان کاربر تغییر کرده و ظرفیت آن پر است.");
-      const usage = await getUserUsage(kv, liveUser);
-      const now = Date.now();
-      const resetDays = Math.max(0, Number(liveUser.resetPeriodDays) || 0);
-      if (resetDays > 0 && now - usage.periodStartedAt >= resetDays * 86400000) {
-        usage.usageBytes = 0; usage.requestCount = 0; usage.periodStartedAt = now;
-      }
-      if (liveUser.startOnFirstConnect && !usage.firstConnectedAt) {
-        usage.firstConnectedAt = now;
-        if (Number(liveUser.expireDays) > 0) usage.expiresAt = now + Number(liveUser.expireDays) * 86400000;
-      }
-      if (!liveUser.startOnFirstConnect && Number(liveUser.expireDays) > 0 && !usage.expiresAt) {
-        usage.expiresAt = (Number(liveUser.createdAt) || now) + Number(liveUser.expireDays) * 86400000;
-      }
-      const trafficState = getLocalUserTrafficState(id, usage);
-      usage.usageBytes = Math.max(Number(usage.usageBytes) || 0, trafficState.usageBytes);
-      const accessError = getUserAccessError(liveUser, usage, now);
-      if (accessError) throw new Error(accessError);
-      usage.requestCount++;
-      usage.lastConnectedAt = now;
-      addDailyUsage(usage, utcUsageDayKey(now), 1, 0);
-      await saveUserUsage(kv, id, usage);
-      return { user: liveUser, usage, trafficState, tracked: true };
-    });
+    if (usageCacheGet(key) === undefined) await readUsageRaw(kv, key, false); // rare: cold cache
+    const currentConnections = userActiveConnections.get(id) || 0;
+    if (limit > 0 && currentConnections > limit) throw new Error("حد اتصال هم‌زمان کاربر تغییر کرده و ظرفیت آن پر است.");
+    // Everything below is synchronous (no lock needed): status/quota validation straight from the cache.
+    const usage = normalizeUserUsage(usageCacheGet(key) || null, candidate);
+    const now = Date.now();
+    const resetDays = Math.max(0, Number(candidate.resetPeriodDays) || 0);
+    if (resetDays > 0 && now - usage.periodStartedAt >= resetDays * 86400000) {
+      usage.usageBytes = 0; usage.requestCount = 0; usage.periodStartedAt = now;
+    }
+    if (candidate.startOnFirstConnect && !usage.firstConnectedAt) {
+      usage.firstConnectedAt = now;
+      if (Number(candidate.expireDays) > 0) usage.expiresAt = now + Number(candidate.expireDays) * 86400000;
+    }
+    if (!candidate.startOnFirstConnect && Number(candidate.expireDays) > 0 && !usage.expiresAt) {
+      usage.expiresAt = (Number(candidate.createdAt) || now) + Number(candidate.expireDays) * 86400000;
+    }
+    const trafficState = getLocalUserTrafficState(id, usage);
+    // Quota is checked against max(stored, this isolate's live ledger) but only the stored
+    // figure is persisted: unflushed ledger bytes are added later by the traffic flush and
+    // must not be written twice (matters with the 1 GB / 6 min flush window).
+    const accessError = getUserAccessError(candidate, { ...usage, usageBytes: Math.max(Number(usage.usageBytes) || 0, trafficState.usageBytes) }, now);
+    if (accessError) throw new Error(accessError);
+    usage.requestCount++;
+    usage.lastConnectedAt = now;
+    addDailyUsage(usage, utcUsageDayKey(now), 1, 0);
+    persistInBackground(saveUserUsage(kv, id, usage));
+    return { user: candidate, usage, trafficState, tracked: true };
   } catch (err) {
     const current = userActiveConnections.get(id) || 0;
     if (current <= 1) userActiveConnections.delete(id); else userActiveConnections.set(id, current - 1);
@@ -1523,10 +1976,12 @@ async function beginUserSession(kv, candidate) {
 async function addUserTraffic(kv, userId, amount, dailyDeltas = null) {
   if (!kv || !userId || !Number.isFinite(amount) || amount <= 0) return null;
   return withUserUsageLock(userId, async () => {
-    const userSettings = readKvJson(await kv.get(SETTINGS_KEY, { type: "json" }));
+    const userSettings = await loadSettings(kv, {});
     const user = Array.isArray(userSettings?.users) ? userSettings.users.find(u => String(u.id) === String(userId)) : null;
     if (!user) return null;
-    const usage = await getUserUsage(kv, user);
+    // Flush path: pace first, then read straight from KV (bypass RAM cache) to avoid clobbering other isolates' writes.
+    await paceKvWrite(USER_USAGE_PREFIX + userId);
+    const usage = await getUserUsage(kv, user, { fresh: true });
     const acceptedAmount = Math.floor(amount);
     usage.usageBytes += acceptedAmount;
     const deltas = dailyDeltas && typeof dailyDeltas === "object" ? dailyDeltas : { [utcUsageDayKey()]: acceptedAmount };
@@ -1538,7 +1993,6 @@ async function addUserTraffic(kv, userId, amount, dailyDeltas = null) {
       dailyTotal += bytes;
     }
     if (dailyTotal < acceptedAmount) addDailyUsage(usage, utcUsageDayKey(), 0, acceptedAmount - dailyTotal);
-    await paceKvWrite(USER_USAGE_PREFIX + userId);
     await saveUserUsage(kv, userId, usage);
     const local = userTrafficState.get(String(userId));
     if (local && local.periodStartedAt === Number(usage.periodStartedAt || 0)) local.usageBytes = Math.max(local.usageBytes, usage.usageBytes);
@@ -1555,7 +2009,7 @@ async function reconcileUserUsageConfigs(kv, previousUsers, nextUsers) {
   for (const user of next) {
     const id = String(user.id);
     await withUserUsageLock(id, async () => {
-      const raw = readKvJson(await kv.get(USER_USAGE_PREFIX + id, { type: "json" }));
+      const raw = await readUsageRaw(kv, USER_USAGE_PREFIX + id, true);
       const oldUser = previous.get(id);
       if (!raw) {
         const usage = defaultUserUsage(user);
@@ -1593,11 +2047,48 @@ async function reconcileUserUsageConfigs(kv, previousUsers, nextUsers) {
     for (const oldUser of previous.values()) {
       const id = String(oldUser.id);
       if (!nextIds.has(id)) {
-        try { await kv.delete(USER_USAGE_PREFIX + id); }
+        try {
+          await waitForUsageWrite(USER_USAGE_PREFIX + id);
+          await kv.delete(USER_USAGE_PREFIX + id);
+          usageCacheDelete(USER_USAGE_PREFIX + id);
+        }
         catch (err) { console.warn("Unable to remove orphaned user usage:", String(err?.message || err).slice(0, 100)); }
       }
     }
   }
+}
+
+function validateExitNodes(value) {
+  if (!Array.isArray(value)) throw new Error("فهرست Exit Node باید آرایه باشد.");
+  if (value.length > MAX_EXIT_NODES) throw new Error(`حداکثر ${MAX_EXIT_NODES} Exit Node مجاز است.`);
+  const ids = new Set();
+  return value.map((raw, index) => {
+    const item = raw && typeof raw === "object" ? raw : {};
+    const id = String(item.id || crypto.randomUUID()).trim().replace(/[^A-Za-z0-9_-]/g, "").slice(0, 48);
+    const name = String(item.name || `Exit ${index + 1}`).trim().slice(0, 48);
+    const country = String(item.country || "UN").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "").slice(0, 8) || "UN";
+    const uri = String(item.uri || "").trim();
+    if (!id || ids.has(id)) throw new Error(`شناسه Exit Node در ردیف ${index + 1} نامعتبر یا تکراری است.`);
+    if (!name || /[\r\n<>]/.test(name)) throw new Error(`نام Exit Node در ردیف ${index + 1} نامعتبر است.`);
+    let parsed;
+    try { parsed = new URL(uri); } catch { throw new Error(`آدرس Exit Node «${name}» نامعتبر است.`); }
+    const protocol = parsed.protocol.toLowerCase();
+    const kind = protocol === "socks5:" || protocol === "socks:" ? "socks5" : protocol === "http:" ? "http" : "";
+    const port = Number(parsed.port || (kind === "socks5" ? 1080 : kind === "http" ? 8080 : 0));
+    if (!kind || !parsed.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`Exit Node «${name}» باید socks5:// یا http:// با پورت معتبر باشد.`);
+    }
+    if (parsed.hash || parsed.search || (parsed.pathname && parsed.pathname !== "/")) throw new Error(`آدرس Exit Node «${name}» نباید Path یا Query داشته باشد.`);
+    if (parsed.username.length > 255 || parsed.password.length > 255) throw new Error(`اطلاعات احراز هویت Exit Node «${name}» بیش از حد طولانی است.`);
+    try { decodeURIComponent(parsed.username); decodeURIComponent(parsed.password); }
+    catch { throw new Error(`کدگذاری نام کاربری یا رمز Exit Node «${name}» نامعتبر است.`); }
+    ids.add(id);
+    return { id, name, country, kind, uri, enabled: item.enabled !== false };
+  });
+}
+
+function getActiveExitNodes(settings) {
+  return (Array.isArray(settings?.exitNodes) ? settings.exitNodes : []).filter(node => node && node.enabled !== false);
 }
 
 function validateSettings(body, env) {
@@ -1638,6 +2129,10 @@ function validateSettings(body, env) {
     subToken: String(body.subToken || ""),
     clientIpRestrictionEnabled: body.clientIpRestrictionEnabled === true,
     allowedClientIps: String(body.allowedClientIps || "").trim(),
+    trafficByteTrackingEnabled: body.trafficByteTrackingEnabled === true,
+    shadowsocksEnabled: body.shadowsocksEnabled === true,
+    shadowsocksMethod: String(body.shadowsocksMethod || "aes-256-gcm").trim().toLowerCase(),
+    exitNodes: Array.isArray(body.exitNodes) ? body.exitNodes : [],
     users: Array.isArray(body.users) ? body.users : [],
     proxies: Array.isArray(body.proxies) ? body.proxies : [],
     chainProxies: Array.isArray(body.chainProxies) ? body.chainProxies : []
@@ -1646,6 +2141,8 @@ function validateSettings(body, env) {
   if (!s.username || s.username.length < 3) throw new Error("نام کاربری نامعتبر است");
   if (s.uuid && !UUID_RE.test(s.uuid)) throw new Error("UUID نامعتبر است");
   if (s.trojanPassword.length > 128) throw new Error("رمز Trojan خیلی طولانی است");
+  if (!SHADOWSOCKS_METHODS.has(s.shadowsocksMethod)) throw new Error("روش رمزنگاری Shadowsocks پشتیبانی نمی‌شود؛ AES-256-GCM یا AES-128-GCM را انتخاب کنید.");
+  if (s.shadowsocksEnabled && !s.uuid) throw new Error("برای فعال‌سازی Shadowsocks باید UUID اصلی تولید شده باشد.");
   if (!TLS_PORTS.includes(s.tlsPort)) throw new Error("پورت TLS پشتیبانی نمی‌شود");
   if (!PLAIN_PORTS.includes(s.nonTlsPort)) throw new Error("پورت غیر TLS پشتیبانی نمی‌شود");
   if (s.proxyIP) {
@@ -1672,6 +2169,7 @@ function validateSettings(body, env) {
   }
 
   s.users = normalizeUserDefinitions(s.users);
+  s.exitNodes = validateExitNodes(s.exitNodes);
   const rootUuid = s.uuid.toLowerCase();
   const rootTrojan = s.trojanPassword;
   const rootSubToken = s.subToken;
@@ -2160,24 +2658,59 @@ function generateOutboundsData(settings, endpoints) {
   let index = 1;
   const tlsPorts = getConfiguredPorts(settings, true);
   const nonTlsPorts = getConfiguredPorts(settings, false);
+  const exitNodes = getActiveExitNodes(settings);
 
-  for (const e of endpoints) {
-    const add = (proto, isTls, port) => {
+  endpoints.forEach((e, endpointIndex) => {
+    const add = (proto, isTls, port, exitId = "", exitLabel = "") => {
       const num = String(index++).padStart(2, '0');
       const trName = isTls ? "TLS" : "WS";
-      const baseTag = `${settings.username} config${num} ${proto}${trName}:${port}${e.label ? " ("+e.label+")" : ""}`;
-      outbounds.push({ proto, isTls, port, tag: baseTag, address: e.address, label: e.label });
+      const baseTag = `${settings.username} config${num} ${proto}${trName}:${port}${e.label ? " ("+e.label+")" : ""}${exitLabel ? " · "+exitLabel : ""}`;
+      outbounds.push({ proto, isTls, port, tag: baseTag, address: e.address, label: e.label, exitId });
+    };
+    const addAllPaths = (proto, isTls, port) => {
+      add(proto, isTls, port);
+      // Avoid multiplying every Clean IP by every country. Keep all legacy entries,
+      // then add country variants for a bounded number of entry endpoints.
+      if (endpointIndex < MAX_EXIT_ENDPOINTS) {
+        add(proto, isTls, port, "auto", "AUTO");
+        for (const node of exitNodes) add(proto, isTls, port, node.id, node.country + " " + node.name);
+      }
     };
     if (settings.vlessEnabled && settings.uuid) {
-      tlsPorts.forEach(port => add("VLESS", true, port));
-      nonTlsPorts.forEach(port => add("VLESS", false, port));
+      tlsPorts.forEach(port => addAllPaths("VLESS", true, port));
+      nonTlsPorts.forEach(port => addAllPaths("VLESS", false, port));
     }
     if (settings.trojanEnabled && settings.trojanPassword) {
-      tlsPorts.forEach(port => add("Trojan", true, port));
-      nonTlsPorts.forEach(port => add("Trojan", false, port));
+      tlsPorts.forEach(port => addAllPaths("Trojan", true, port));
+      nonTlsPorts.forEach(port => addAllPaths("Trojan", false, port));
     }
-  }
+  });
   return outbounds;
+}
+
+function generateShadowsocksOutboundsData(settings, endpoints) {
+  if (settings.shadowsocksEnabled !== true) return [];
+  const password = String(settings.shadowsocksPassword || settings.uuid || "");
+  const subToken = String(settings.subToken || "");
+  if (!password || !subToken) return [];
+  const result = [];
+  let index = 1;
+  const exitNodes = getActiveExitNodes(settings);
+  const ports = [...getConfiguredPorts(settings, true).map(port => ({ port, isTls: true })), ...getConfiguredPorts(settings, false).map(port => ({ port, isTls: false }))];
+  endpoints.forEach((endpoint, endpointIndex) => {
+    for (const port of ports) {
+      const add = (exitId = "", label = "") => result.push({
+        proto: "Shadowsocks", address: endpoint.address, label: endpoint.label, port: port.port, isTls: port.isTls,
+        exitId, tag: `${settings.username} Shadowsocks ${port.isTls ? "TLS" : "WS"}:${port.port} #${String(index++).padStart(2, "0")}${label ? " · " + label : ""}`
+      });
+      add();
+      if (endpointIndex < MAX_EXIT_ENDPOINTS) {
+        add("auto", "AUTO");
+        for (const node of exitNodes) add(node.id, node.country + " " + node.name);
+      }
+    }
+  });
+  return result;
 }
 
 async function handleSubscription(request, env, kv, url) {
@@ -2274,11 +2807,33 @@ function echPemLines(b64) {
 // One source of truth for the WebSocket path so the URI, Xray and Sing-box
 // outputs can never disagree. Xray-style early data: "?ed=N" in the path makes
 // V2RayN/Nekoray/Xray carry the first payload in Sec-WebSocket-Protocol.
-function wsPathFor(settings, proto, withEarlyDataQuery = true) {
-  return "/" + String(proto).toLowerCase() + (withEarlyDataQuery && settings.earlyData ? "?ed=" + EARLY_DATA_SIZE : "");
+function wsPathFor(settings, proto, withEarlyDataQuery = true, exitId = "") {
+  const params = [];
+  if (withEarlyDataQuery && settings.earlyData) params.push("ed=" + EARLY_DATA_SIZE);
+  if (exitId) params.push("exit=" + encodeURIComponent(exitId));
+  return "/" + String(proto).toLowerCase() + (params.length ? "?" + params.join("&") : "");
 }
 
-function makeUris(settings, host) {
+function shadowsocksWsPath(settings, exitId = "") {
+  const token = encodeURIComponent(String(settings.subToken || ""));
+  return "/ss/" + token + (exitId ? "?exit=" + encodeURIComponent(exitId) : "");
+}
+
+function base64Utf8Standard(value) {
+  return btoa(Array.from(enc.encode(String(value)), byte => String.fromCharCode(byte)).join(""));
+}
+
+function makeShadowsocksUri(settings, item, host, password) {
+  const method = SHADOWSOCKS_METHODS.has(settings.shadowsocksMethod) ? settings.shadowsocksMethod : "aes-256-gcm";
+  const pluginOptions = ["mode=websocket", "host=" + cleanHost(host), "path=" + shadowsocksWsPath(settings, item.exitId)];
+  if (item.isTls) pluginOptions.push("tls");
+  const credentials = base64Utf8Standard(method + ":" + password);
+  const plugin = encodeURIComponent("v2ray-plugin;" + pluginOptions.join(";"));
+  const tag = encodeURIComponent(item.tag || "Shadowsocks");
+  return `ss://${credentials}@${uriHost(item.address)}:${item.port}/?plugin=${plugin}#${tag}`;
+}
+
+function makeUrisUncached(settings, host) {
   const result = [];
   const publicHost = cleanHost(host);
   const pathOf = base => encodeURIComponent(wsPathFor(settings, base.replace(/^\//, "")));
@@ -2296,14 +2851,37 @@ function makeUris(settings, host) {
     const addr = uriHost(o.address);
     const safeTagStr = encodeURIComponent(o.tag);
     if (o.proto === "VLESS") {
-      if (o.isTls) result.push(`vless://${settings.uuid}@${addr}:${o.port}?encryption=none&security=tls&type=ws&host=${encodeURIComponent(publicHost)}&sni=${encodeURIComponent(publicHost)}${tlsExtra}&path=${pathOf("/vless")}#${safeTagStr}`);
-      else result.push(`vless://${settings.uuid}@${addr}:${o.port}?encryption=none&security=none&type=ws&host=${encodeURIComponent(publicHost)}&path=${pathOf("/vless")}#${safeTagStr}`);
+      if (o.isTls) result.push(`vless://${settings.uuid}@${addr}:${o.port}?encryption=none&security=tls&type=ws&host=${encodeURIComponent(publicHost)}&sni=${encodeURIComponent(publicHost)}${tlsExtra}&path=${encodeURIComponent(wsPathFor(settings, "vless", true, o.exitId))}#${safeTagStr}`);
+      else result.push(`vless://${settings.uuid}@${addr}:${o.port}?encryption=none&security=none&type=ws&host=${encodeURIComponent(publicHost)}&path=${encodeURIComponent(wsPathFor(settings, "vless", true, o.exitId))}#${safeTagStr}`);
     } else if (o.proto === "Trojan") {
-      if (o.isTls) result.push(`trojan://${pass}@${addr}:${o.port}?security=tls&type=ws&host=${encodeURIComponent(publicHost)}&sni=${encodeURIComponent(publicHost)}${tlsExtra}&path=${pathOf("/trojan")}#${safeTagStr}`);
-      else result.push(`trojan://${pass}@${addr}:${o.port}?security=none&type=ws&host=${encodeURIComponent(publicHost)}&path=${pathOf("/trojan")}#${safeTagStr}`);
+      const path = encodeURIComponent(wsPathFor(settings, "trojan", true, o.exitId));
+      if (o.isTls) result.push(`trojan://${pass}@${addr}:${o.port}?security=tls&type=ws&host=${encodeURIComponent(publicHost)}&sni=${encodeURIComponent(publicHost)}${tlsExtra}&path=${path}#${safeTagStr}`);
+      else result.push(`trojan://${pass}@${addr}:${o.port}?security=none&type=ws&host=${encodeURIComponent(publicHost)}&path=${path}#${safeTagStr}`);
     }
   }
+  const ssPassword = String(settings.shadowsocksPassword || settings.uuid || "");
+  for (const item of generateShadowsocksOutboundsData(settings, endpoints)) result.push(makeShadowsocksUri(settings, item, publicHost, ssPassword));
   return result;
+}
+
+function makeUris(settings, host) {
+  const exits = getActiveExitNodes(settings).map(node => [node.id, node.name, node.country, node.uri, node.enabled !== false]);
+  const cacheKey = JSON.stringify([
+    cleanHost(host), settings.username, settings.uuid, settings.trojanPassword, settings.shadowsocksPassword,
+    settings.subToken, settings.vlessEnabled, settings.trojanEnabled, settings.shadowsocksEnabled, settings.shadowsocksMethod,
+    settings.tlsPort, settings.nonTlsPort, settings.extraTlsPorts, settings.extraNonTlsPorts,
+    settings.cleanIPs, settings.earlyData, settings.fingerprint, settings.echEnabled, settings.echConfigList, exits
+  ]);
+  const now = Date.now();
+  const cached = SUBSCRIPTION_URI_CACHE.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.uris.slice();
+  const uris = makeUrisUncached(settings, host);
+  SUBSCRIPTION_URI_CACHE.set(cacheKey, { uris, expiresAt: now + SUBSCRIPTION_URI_CACHE_TTL_MS });
+  if (SUBSCRIPTION_URI_CACHE.size > SUBSCRIPTION_URI_CACHE_MAX) {
+    for (const [key, entry] of SUBSCRIPTION_URI_CACHE) if (entry.expiresAt <= now) SUBSCRIPTION_URI_CACHE.delete(key);
+    while (SUBSCRIPTION_URI_CACHE.size > SUBSCRIPTION_URI_CACHE_MAX) SUBSCRIPTION_URI_CACHE.delete(SUBSCRIPTION_URI_CACHE.keys().next().value);
+  }
+  return uris.slice();
 }
 
 function makeXrayConfig(settings, host) {
@@ -2316,7 +2894,7 @@ function makeXrayConfig(settings, host) {
   for (const o of outboundsData) {
     const stream = {
       network: "ws", security: o.isTls ? "tls" : "none",
-      wsSettings: { path: wsPathFor(settings, o.proto), headers: { Host: sni } }
+      wsSettings: { path: wsPathFor(settings, o.proto, true, o.exitId), headers: { Host: sni } }
     };
     if (o.isTls) {
       stream.tlsSettings = { serverName: sni, allowInsecure: false, fingerprint: normalizeFingerprint(settings.fingerprint), alpn: ["http/1.1"] };
@@ -2329,6 +2907,19 @@ function makeXrayConfig(settings, host) {
     } else {
       proxies.push({ tag: o.tag, protocol: "trojan", settings: { servers: [{ address: o.address, port: o.port, password: settings.trojanPassword }] }, streamSettings: stream });
     }
+  }
+  const ssPassword = String(settings.shadowsocksPassword || settings.uuid || "");
+  for (const item of generateShadowsocksOutboundsData(settings, endpoints)) {
+    const path = shadowsocksWsPath(settings, item.exitId);
+    const streamSettings = {
+      network: "ws", security: item.isTls ? "tls" : "none",
+      wsSettings: { path, headers: { Host: sni } }
+    };
+    if (item.isTls) {
+      streamSettings.tlsSettings = { serverName: sni, allowInsecure: false, fingerprint: normalizeFingerprint(settings.fingerprint), alpn: ["http/1.1"] };
+      if (echConfig) streamSettings.tlsSettings.echConfigList = echConfig;
+    }
+    proxies.push({ tag: item.tag, protocol: "shadowsocks", settings: { servers: [{ address: item.address, port: item.port, method: settings.shadowsocksMethod || "aes-256-gcm", password: ssPassword }] }, streamSettings });
   }
 
   const bypass = settings.bypassIran === true;
@@ -2419,10 +3010,19 @@ function makeSingBoxConfig(settings, host) {
   for (const o of outboundsData) {
     tags.push(o.tag);
     if (o.proto === "VLESS") {
-      outbounds.push({ type: "vless", tag: o.tag, server: o.address, server_port: o.port, uuid: settings.uuid, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "vless", false)) });
+      outbounds.push({ type: "vless", tag: o.tag, server: o.address, server_port: o.port, uuid: settings.uuid, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "vless", false, o.exitId)) });
     } else {
-      outbounds.push({ type: "trojan", tag: o.tag, server: o.address, server_port: o.port, password: settings.trojanPassword, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "trojan", false)) });
+      outbounds.push({ type: "trojan", tag: o.tag, server: o.address, server_port: o.port, password: settings.trojanPassword, tls: tlsCfg(o.isTls), transport: transport(wsPathFor(settings, "trojan", false, o.exitId)) });
     }
+  }
+  const ssPassword = String(settings.shadowsocksPassword || settings.uuid || "");
+  for (const item of generateShadowsocksOutboundsData(settings, endpoints)) {
+    const pluginOpts = [`mode=websocket`, `host=${sni}`, `path=${shadowsocksWsPath(settings, item.exitId)}`];
+    if (item.isTls) pluginOpts.push("tls");
+    tags.push(item.tag);
+    outbounds.push({ type: "shadowsocks", tag: item.tag, server: item.address, server_port: item.port,
+      method: settings.shadowsocksMethod || "aes-256-gcm", password: ssPassword,
+      plugin: "v2ray-plugin", plugin_opts: pluginOpts.join(";") });
   }
 
   if (tags.length > 0) {
@@ -2467,18 +3067,31 @@ function uriHost(host) { return host.includes(":") && !host.startsWith("[") ? "[
 function cleanHost(value) { return String(value || "").trim().replace(/^\[|\]$/g, ""); }
 
 // -------------------- Multi-user & Tunnel Handling --------------------
+function getCredentialIndex(settings) {
+  const users = Array.isArray(settings.users) ? settings.users : [];
+  if (credentialIndexCache && credentialIndexCache.users === users && credentialIndexCache.revision === panelSettingsRevision) return credentialIndexCache;
+  const vless = new Map(), trojan = new Map(), sub = new Map();
+  for (const user of users) {
+    if (!user || user.enabled === false) continue;
+    if (user.vlessEnabled !== false && user.uuid) vless.set(String(user.uuid).toLowerCase(), user);
+    if (user.trojanEnabled !== false && user.trojanPassword) trojan.set(sha224Hex(user.trojanPassword).toLowerCase(), user);
+    if (user.subToken) sub.set(String(user.subToken), user);
+  }
+  credentialIndexCache = { users, revision: panelSettingsRevision, vless, trojan, sub };
+  return credentialIndexCache;
+}
+
 function findUserByCredential(settings, kind, value) {
   if (!value) return null;
   const normalized = String(value).trim();
   if (kind === "vless" && isCredentialRevoked("vless", normalized)) return null;
   if (kind === "trojanHash" && isCredentialRevoked("trojanHash", normalized)) return null;
   if (kind === "sub" && isCredentialRevoked("sub", normalized)) return null;
-  for (const user of Array.isArray(settings.users) ? settings.users : []) {
-    if (user.enabled === false) continue;
-    if (kind === "vless" && user.vlessEnabled !== false && user.uuid && constantTimeEqual(String(user.uuid).toLowerCase(), normalized.toLowerCase())) return user;
-    if (kind === "trojanHash" && user.trojanEnabled !== false && user.trojanPassword && constantTimeEqual(sha224Hex(user.trojanPassword), normalized.toLowerCase())) return user;
-    if (kind === "sub" && user.subToken && constantTimeEqual(user.subToken, normalized)) return user;
-  }
+  const index = getCredentialIndex(settings);
+  const match = kind === "vless" ? index.vless.get(normalized.toLowerCase())
+    : kind === "trojanHash" ? index.trojan.get(normalized.toLowerCase())
+    : kind === "sub" ? index.sub.get(normalized) : null;
+  if (match) return match;
   if (kind === "vless" && settings.vlessEnabled && settings.uuid && constantTimeEqual(String(settings.uuid).toLowerCase(), normalized.toLowerCase())) return { ...settings, id: "default", name: settings.username || "default", vlessEnabled: true, trojanEnabled: false };
   if (kind === "trojanHash" && settings.trojanEnabled && settings.trojanPassword && constantTimeEqual(sha224Hex(settings.trojanPassword), normalized.toLowerCase())) return { ...settings, id: "default", name: settings.username || "default", vlessEnabled: false, trojanEnabled: true };
   if (kind === "sub" && settings.subToken && constantTimeEqual(settings.subToken, normalized)) return { ...settings, id: "default", name: settings.username || "default" };
@@ -2493,6 +3106,7 @@ function userScopedSettings(settings, user) {
     uuid: user.vlessEnabled !== false ? user.uuid : "",
     trojanPassword: user.trojanEnabled !== false ? user.trojanPassword : "",
     subToken: user.subToken || "",
+    shadowsocksPassword: user.shadowsocksPassword || user.uuid || "",
     vlessEnabled: settings.vlessEnabled !== false && user.vlessEnabled !== false && !!user.uuid,
     trojanEnabled: settings.trojanEnabled !== false && user.trojanEnabled !== false && !!user.trojanPassword,
     users: []
@@ -2512,7 +3126,284 @@ function isUserSubscriptionAvailable(user, usage) {
   return !(maxBytes > 0 && usageBytes >= maxBytes) && !(maxRequests > 0 && requestCount >= maxRequests);
 }
 
-async function handleTunnel(request, env, kv, kind, ctx) {
+// Shadowsocks AEAD (legacy aes-128-gcm/aes-256-gcm) over the Worker WebSocket
+// transport. Master-key derivation follows EVP_BytesToKey(MD5); per-connection
+// subkeys follow HKDF-SHA1(salt, master_key, "ss-subkey"). SIP022 2022 ciphers
+// are intentionally not advertised because they require BLAKE3 and different keying.
+const SS_MD5_SHIFTS = [7,12,17,22,5,9,14,20,4,11,16,23,6,10,15,21];
+const SS_MD5_K = Uint32Array.from({ length: 64 }, (_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0);
+
+function md5Bytes(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const paddedLength = Math.ceil((bytes.length + 9) / 64) * 64;
+  const padded = new Uint8Array(paddedLength);
+  padded.set(bytes); padded[bytes.length] = 0x80;
+  const view = new DataView(padded.buffer);
+  const bitLength = bytes.length * 8;
+  view.setUint32(paddedLength - 8, bitLength >>> 0, true);
+  view.setUint32(paddedLength - 4, Math.floor(bitLength / 0x100000000), true);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  const words = new Uint32Array(16);
+  const rotate = (x, n) => (x << n) | (x >>> (32 - n));
+  for (let offset = 0; offset < paddedLength; offset += 64) {
+    for (let i = 0; i < 16; i++) words[i] = view.getUint32(offset + i * 4, true);
+    let a = a0, b = b0, c = c0, d = d0;
+    for (let i = 0; i < 64; i++) {
+      let f, g, shift;
+      if (i < 16) { f = (b & c) | (~b & d); g = i; shift = SS_MD5_SHIFTS[i % 4]; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; shift = SS_MD5_SHIFTS[4 + (i % 4)]; }
+      else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; shift = SS_MD5_SHIFTS[8 + (i % 4)]; }
+      else { f = c ^ (b | ~d); g = (7 * i) % 16; shift = SS_MD5_SHIFTS[12 + (i % 4)]; }
+      const next = (b + rotate((a + f + SS_MD5_K[i] + words[g]) >>> 0, shift)) >>> 0;
+      a = d; d = c; c = b; b = next;
+    }
+    a0 = (a0 + a) >>> 0; b0 = (b0 + b) >>> 0; c0 = (c0 + c) >>> 0; d0 = (d0 + d) >>> 0;
+  }
+  const out = new Uint8Array(16), outView = new DataView(out.buffer);
+  outView.setUint32(0, a0, true); outView.setUint32(4, b0, true);
+  outView.setUint32(8, c0, true); outView.setUint32(12, d0, true);
+  return out;
+}
+
+function evpBytesToKey(password, keyLength) {
+  const pass = enc.encode(String(password));
+  const blocks = [];
+  let previous = new Uint8Array(0), total = 0;
+  while (total < keyLength) {
+    previous = md5Bytes(concatChunks([previous, pass]));
+    blocks.push(previous); total += previous.length;
+  }
+  return concatChunks(blocks).slice(0, keyLength);
+}
+
+function getShadowsocksMasterKey(password, method) {
+  const keyLength = method === "aes-128-gcm" ? 16 : method === "aes-256-gcm" ? 32 : 0;
+  if (!keyLength) throw new Error("Unsupported Shadowsocks AEAD method");
+  const cacheKey = method + "|" + String(password);
+  const cached = SS_MASTER_KEY_CACHE.get(cacheKey);
+  if (cached) return cached;
+  const key = evpBytesToKey(password, keyLength);
+  SS_MASTER_KEY_CACHE.set(cacheKey, key);
+  while (SS_MASTER_KEY_CACHE.size > SS_MASTER_KEY_CACHE_MAX) SS_MASTER_KEY_CACHE.delete(SS_MASTER_KEY_CACHE.keys().next().value);
+  return key;
+}
+
+async function deriveShadowsocksSubkey(password, method, salt) {
+  const masterKey = getShadowsocksMasterKey(password, method);
+  const hkdfKey = await crypto.subtle.importKey("raw", masterKey, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({
+    name: "HKDF", hash: "SHA-1", salt, info: enc.encode("ss-subkey")
+  }, hkdfKey, masterKey.length * 8);
+  return crypto.subtle.importKey("raw", bits, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+function incrementShadowsocksNonce(nonce) {
+  for (let i = 0; i < nonce.length; i++) {
+    nonce[i] = (nonce[i] + 1) & 255;
+    if (nonce[i] !== 0) break;
+  }
+}
+
+async function shadowsocksEncrypt(key, nonce, plaintext) {
+  return new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, tagLength: 128 }, key, plaintext));
+}
+async function shadowsocksDecrypt(key, nonce, ciphertext) {
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce, tagLength: 128 }, key, ciphertext));
+}
+
+function parseShadowsocksAddress(bytes) {
+  const address = parseTrojanAddress(bytes, 0);
+  if (address.next + 2 > bytes.length) throw new Error("truncated Shadowsocks destination port");
+  const port = (bytes[address.next] << 8) | bytes[address.next + 1];
+  if (!port) throw new Error("invalid Shadowsocks destination port");
+  return { host: address.host, port, data: bytes.slice(address.next + 2) };
+}
+
+async function encryptShadowsocksStreamChunk(key, nonce, payload) {
+  const length = new Uint8Array([(payload.length >> 8) & 255, payload.length & 255]);
+  const encryptedLength = await shadowsocksEncrypt(key, nonce, length);
+  incrementShadowsocksNonce(nonce);
+  const encryptedPayload = await shadowsocksEncrypt(key, nonce, payload);
+  incrementShadowsocksNonce(nonce);
+  return concatChunks([encryptedLength, encryptedPayload]);
+}
+
+async function sendShadowsocksEncrypted(ws, key, nonce, data) {
+  if (!data || !data.length || ws.readyState !== WebSocket.OPEN) return;
+  const frames = [];
+  for (let offset = 0; offset < data.length; offset += 0x3fff) {
+    const chunk = data.subarray(offset, Math.min(data.length, offset + 0x3fff));
+    frames.push(await encryptShadowsocksStreamChunk(key, nonce, chunk));
+  }
+  if (frames.length && ws.readyState === WebSocket.OPEN) ws.send(concatChunks(frames));
+}
+
+async function handleShadowsocksTunnel(request, env, kv, subscriptionToken, ctx, preferredExitId = "") {
+  if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return fakeLandingResponse();
+  const settings = await loadSettings(kv, env);
+  if (settings.shadowsocksEnabled !== true) return new Response("Shadowsocks disabled", { status: 404 });
+  const candidate = findUserByCredential(settings, "sub", subscriptionToken);
+  if (!candidate) return new Response("Not found", { status: 404 });
+  const userPassword = String(candidate.shadowsocksPassword || candidate.uuid || settings.shadowsocksPassword || settings.uuid || "");
+  const method = SHADOWSOCKS_METHODS.has(String(settings.shadowsocksMethod || "aes-256-gcm")) ? settings.shadowsocksMethod : "aes-256-gcm";
+  const keyLength = method === "aes-128-gcm" ? 16 : 32;
+  if (!userPassword) return new Response("Shadowsocks credential missing", { status: 503 });
+
+  const pair = new WebSocketPair();
+  const client = pair[0], server = pair[1];
+  server.accept({ allowHalfOpen: true });
+  let finished = false, initialized = false, sessionStarted = false;
+  let activeUser = null, activeSettings = settings, userUsageAtStart = null, userTrafficLedger = null;
+  let userSessionBytes = 0, userSessionPersistedBytes = 0, userUsageFlushTimer = null;
+  let userTrafficPersistChain = Promise.resolve(), remote = null, remoteWriter = null;
+  const userSessionDailyBytes = new Map();
+  const inputState = { buffer: new Uint8Array(0), saltReady: false, cipherKey: null, nonce: new Uint8Array(12), expectedLength: null };
+  let responseCipherKey = null, responseNonce = new Uint8Array(12);
+
+  const queueUserTrafficFlush = (force = false) => {
+    if (!activeUser || !kv || activeSettings.trafficByteTrackingEnabled !== true) return userTrafficPersistChain;
+    const pending = Math.max(0, userSessionBytes - userSessionPersistedBytes);
+    if (!pending || (!force && pending < USER_TRAFFIC_FLUSH_BYTES)) return userTrafficPersistChain;
+    const id = String(activeUser.id || "default");
+    const deltas = Object.fromEntries(userSessionDailyBytes.entries());
+    userSessionDailyBytes.clear();
+    userSessionPersistedBytes += pending;
+    userTrafficPersistChain = enqueueTrafficWrite(kv, id, pending, deltas);
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(userTrafficPersistChain);
+    return userTrafficPersistChain;
+  };
+
+  const releaseUserSession = () => {
+    if (!activeUser) return Promise.resolve();
+    if (userUsageFlushTimer) { clearInterval(userUsageFlushTimer); userUsageFlushTimer = null; }
+    const id = String(activeUser.id || "default");
+    unregisterUserConnection(id, closeAll);
+    const count = userActiveConnections.get(id) || 0;
+    if (count <= 1) userActiveConnections.delete(id); else userActiveConnections.set(id, count - 1);
+    if (userSessionBytes > 0 && kv) return queueUserTrafficFlush(true);
+    return Promise.resolve();
+  };
+
+  const closeAll = () => {
+    if (finished) return userTrafficPersistChain;
+    finished = true;
+    try { server.close(); } catch {}
+    try { if (remoteWriter) remoteWriter.close().catch(() => {}); } catch {}
+    try { remote?.close?.(); } catch {}
+    return releaseUserSession();
+  };
+
+  const recordTraffic = amount => {
+    if (activeSettings.trafficByteTrackingEnabled !== true) return true;
+    if (!activeUser || !userUsageAtStart || !userTrafficLedger || !Number.isFinite(amount) || amount <= 0) return true;
+    const current = Math.floor(amount);
+    const limitBytes = activeUser.id === "default" ? 0 : (Number(activeUser.trafficLimitGB) > 0 ? Number(activeUser.trafficLimitGB) * 1024 ** 3 : 0);
+    const remaining = limitBytes > 0 ? Math.max(0, limitBytes - Number(userTrafficLedger.usageBytes || 0)) : current;
+    const accepted = Math.min(current, remaining);
+    if (accepted > 0) {
+      userTrafficLedger.usageBytes += accepted; userSessionBytes += accepted;
+      const day = utcUsageDayKey(); userSessionDailyBytes.set(day, (userSessionDailyBytes.get(day) || 0) + accepted);
+      void queueUserTrafficFlush(false);
+    }
+    const exhausted = limitBytes > 0 && (current > remaining || userTrafficLedger.usageBytes >= limitBytes);
+    if (exhausted) { userTrafficLedger.usageBytes = Math.min(limitBytes, userTrafficLedger.usageBytes); void closeAll(); return false; }
+    return true;
+  };
+
+  const startRemotePump = async readable => {
+    const reader = readable.getReader();
+    try {
+      while (!finished) {
+        const item = await reader.read();
+        if (item.done) break;
+        if (!item.value?.byteLength) continue;
+        if (!recordTraffic(item.value.byteLength)) return;
+        await sendShadowsocksEncrypted(server, responseCipherKey, responseNonce, item.value);
+      }
+    } catch (error) {
+      console.warn("Shadowsocks remote stream ended:", String(error?.message || error).slice(0, 100));
+    } finally { try { reader.releaseLock(); } catch {} }
+    if (!finished) await closeAll();
+  };
+
+  const processEncryptedInput = async bytes => {
+    if (finished || !bytes?.length) return;
+    if (!sessionStarted) {
+      const session = await beginUserSession(kv, candidate, ctx);
+      activeUser = session.user; userUsageAtStart = session.usage; userTrafficLedger = session.trafficState || null;
+      activeSettings = userScopedSettings(settings, activeUser);
+      if (activeSettings.shadowsocksEnabled !== true) throw new Error("Shadowsocks is disabled for this account");
+      if (activeSettings.trafficByteTrackingEnabled === true) userUsageFlushTimer = setInterval(() => { void queueUserTrafficFlush(true); }, USER_TRAFFIC_FLUSH_INTERVAL_MS);
+      registerUserConnection(activeUser.id || "default", closeAll);
+      sessionStarted = true;
+    }
+    if (inputState.buffer.length + bytes.length > 256 * 1024) throw new Error("Shadowsocks input buffer limit exceeded");
+    inputState.buffer = concatChunks([inputState.buffer, bytes]);
+
+    if (!inputState.saltReady) {
+      if (inputState.buffer.length < keyLength) return;
+      const salt = inputState.buffer.slice(0, keyLength);
+      inputState.buffer = inputState.buffer.slice(keyLength);
+      inputState.cipherKey = await deriveShadowsocksSubkey(userPassword, method, salt);
+      inputState.nonce = new Uint8Array(12);
+      inputState.saltReady = true;
+    }
+
+    while (!finished) {
+      if (inputState.expectedLength === null) {
+        if (inputState.buffer.length < 18) return;
+        const encryptedLength = inputState.buffer.slice(0, 18);
+        inputState.buffer = inputState.buffer.slice(18);
+        const plainLength = await shadowsocksDecrypt(inputState.cipherKey, inputState.nonce, encryptedLength);
+        incrementShadowsocksNonce(inputState.nonce);
+        if (plainLength.length !== 2) throw new Error("invalid Shadowsocks encrypted length");
+        inputState.expectedLength = (plainLength[0] << 8) | plainLength[1];
+        if (inputState.expectedLength < 1 || inputState.expectedLength > 0x3fff) throw new Error("Shadowsocks chunk size is invalid");
+      }
+      const frameLength = inputState.expectedLength + 16;
+      if (inputState.buffer.length < frameLength) return;
+      const encryptedPayload = inputState.buffer.slice(0, frameLength);
+      inputState.buffer = inputState.buffer.slice(frameLength);
+      const payload = await shadowsocksDecrypt(inputState.cipherKey, inputState.nonce, encryptedPayload);
+      incrementShadowsocksNonce(inputState.nonce);
+      inputState.expectedLength = null;
+      if (payload.length === 0 || payload.length > 0x3fff) throw new Error("invalid Shadowsocks payload length");
+      if (!recordTraffic(payload.length)) return;
+
+      if (!initialized) {
+        const destination = parseShadowsocksAddress(payload);
+        if (!isAllowedDestinationPort(destination.port, env)) throw new Error("port not allowed");
+        remote = await openOutbound(activeSettings, destination.host, destination.port, destination.data, -1, preferredExitId);
+        if (finished) { try { remote.close(); } catch {} return; }
+        remoteWriter = remote.writable.getWriter();
+        const responseSalt = crypto.getRandomValues(new Uint8Array(keyLength));
+        responseCipherKey = await deriveShadowsocksSubkey(userPassword, method, responseSalt);
+        responseNonce = new Uint8Array(12);
+        server.send(responseSalt);
+        initialized = true;
+        void startRemotePump(remote.readable);
+      } else {
+        if (!remoteWriter) throw new Error("Shadowsocks remote stream is not ready");
+        await remoteWriter.write(payload);
+      }
+    }
+  };
+
+  let inboundQueue = Promise.resolve();
+  server.addEventListener("message", event => {
+    inboundQueue = inboundQueue.then(async () => {
+      if (!finished) await processEncryptedInput(await toBytes(event.data));
+    }).catch(error => {
+      console.warn("Shadowsocks tunnel closed:", String(error?.message || error).slice(0, 140));
+      void closeAll();
+    });
+  });
+  server.addEventListener("close", closeAll);
+  server.addEventListener("error", closeAll);
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+async function handleTunnel(request, env, kv, kind, ctx, preferredExitId = "") {
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return fakeLandingResponse();
   const settings = await loadSettings(kv, env);
   if (kind === "vless" && !settings.vlessEnabled) return new Response("VLESS disabled", { status: 404 });
@@ -2535,7 +3426,7 @@ async function handleTunnel(request, env, kv, kind, ctx) {
   const userSessionDailyBytes = new Map();
 
   const queueUserTrafficFlush = (force = false) => {
-    if (!activeUser || !kv) return userTrafficPersistChain;
+    if (!activeUser || !kv || activeSettings.trafficByteTrackingEnabled !== true) return userTrafficPersistChain;
     const pending = Math.max(0, userSessionBytes - userSessionPersistedBytes);
     if (!pending || (!force && pending < USER_TRAFFIC_FLUSH_BYTES)) return userTrafficPersistChain;
     const id = String(activeUser.id);
@@ -2573,6 +3464,8 @@ async function handleTunnel(request, env, kv, kind, ctx) {
   };
 
   const recordTraffic = amount => {
+    // Byte tracking is off by default: no byte counting / KV flush, the session itself still counts.
+    if (activeSettings.trafficByteTrackingEnabled !== true) return true;
     if (!activeUser || !userUsageAtStart || !userTrafficLedger || !Number.isFinite(amount) || amount <= 0) return true;
     const current = Math.floor(amount);
     const limitBytes = activeUser.id === "default" ? 0 : (Number(activeUser.trafficLimitGB) > 0 ? Number(activeUser.trafficLimitGB) * 1024 * 1024 * 1024 : 0);
@@ -2601,7 +3494,7 @@ async function handleTunnel(request, env, kv, kind, ctx) {
     initialWritesBuffer.push(bytes); initialWritesSize += bytes.length;
   };
 
-  const routesAfterCurrent = () => remote && Number.isInteger(remote.routeIndex) && remote.routeIndex < buildOutboundRoutes(settings).length - 1;
+  const routesAfterCurrent = () => remote && Number.isInteger(remote.routeIndex) && remote.routeIndex < buildOutboundRoutes(settings, preferredExitId).length - 1;
   const canFallback = () => !finished && !!dest && !receivedAny && !bufferOverflow && routesAfterCurrent();
 
   const startFallback = () => {
@@ -2611,7 +3504,7 @@ async function handleTunnel(request, env, kv, kind, ctx) {
       let next = null;
       try {
         const sentCount = initialWritesBuffer.length;
-        next = await openOutbound(settings, dest.host, dest.port, concatChunks(initialWritesBuffer), remote.routeIndex);
+        next = await openOutbound(settings, dest.host, dest.port, concatChunks(initialWritesBuffer), remote.routeIndex, preferredExitId);
         if (finished) { try { next.close(); } catch {} return false; }
         const nextWriter = next.writable.getWriter();
         for (let i = sentCount; i < initialWritesBuffer.length; i++) {
@@ -2653,7 +3546,7 @@ async function handleTunnel(request, env, kv, kind, ctx) {
     // Acknowledge the VLESS request right away so the client is not left waiting
     // (and the socket does not stall) while the outbound connection is opened.
     if (kind === "vless" && !finished) server.send(new Uint8Array([parsed.version, 0]));
-    const r = await openOutbound(settings, parsed.host, parsed.port, parsed.data, -1);
+    const r = await openOutbound(settings, parsed.host, parsed.port, parsed.data, -1, preferredExitId);
     if (finished) { try { r.close(); } catch {} return; }
     remote = r; remoteWriter = r.writable.getWriter();
     generation++;
@@ -2681,12 +3574,14 @@ async function handleTunnel(request, env, kv, kind, ctx) {
         ? findUserByCredential(authSettings, "vless", parsed.uuid)
         : findUserByCredential(authSettings, "trojanHash", parsed.passwordHash);
       if (!candidate) throw new Error("auth");
-      const session = await beginUserSession(kv, candidate);
+      const session = await beginUserSession(kv, candidate, ctx);
       activeUser = session.user;
       userUsageAtStart = session.usage;
       userTrafficLedger = session.trafficState || null;
-      userUsageFlushTimer = setInterval(() => { void queueUserTrafficFlush(true); }, USER_TRAFFIC_FLUSH_INTERVAL_MS);
       activeSettings = userScopedSettings(authSettings, activeUser);
+      if (activeSettings.trafficByteTrackingEnabled === true) {
+        userUsageFlushTimer = setInterval(() => { void queueUserTrafficFlush(true); }, USER_TRAFFIC_FLUSH_INTERVAL_MS);
+      }
       registerUserConnection(activeUser.id || "default", closeAll);
       if (kind === "vless" && !activeSettings.vlessEnabled) throw new Error("VLESS is disabled for this user");
       if (kind === "trojan" && !activeSettings.trojanEnabled) throw new Error("Trojan is disabled for this user");
@@ -2765,18 +3660,25 @@ async function pumpRemote(readable, ws, hooks, gen) {
   hooks.closeAll();
 }
 
-function buildOutboundRoutes(settings) {
+function buildOutboundRoutes(settings, preferredExitId = "") {
   const chains = [...(Array.isArray(settings.chainProxies) ? settings.chainProxies : []), settings.chainProxy].filter(Boolean);
   const proxies = [...(Array.isArray(settings.proxies) ? settings.proxies : []), settings.proxyIP].filter(Boolean);
   const routes = [];
+  const exits = getActiveExitNodes(settings);
+  if (preferredExitId === "auto") {
+    exits.forEach(node => routes.push({ type: node.kind, value: node.uri, id: node.id, label: `${node.country} · ${node.name}` }));
+  } else if (preferredExitId) {
+    const selected = exits.find(node => node.id === preferredExitId);
+    if (selected) routes.push({ type: selected.kind, value: selected.uri, id: selected.id, label: `${selected.country} · ${selected.name}` });
+  }
   chains.forEach(chain => routes.push({ type: "chain", value: chain, label: "Chain Proxy" }));
   routes.push({ type: "direct", value: "", label: "Direct" });
   proxies.forEach(proxy => routes.push({ type: "proxy", value: proxy, label: "Proxy IP" }));
   return routes;
 }
 
-async function openOutbound(settings, host, port, initialData, afterRouteIndex = -1) {
-  const routes = buildOutboundRoutes(settings);
+async function openOutbound(settings, host, port, initialData, afterRouteIndex = -1, preferredExitId = "") {
+  const routes = buildOutboundRoutes(settings, preferredExitId);
   let lastError = null;
   const startIndex = Number.isInteger(Number(afterRouteIndex)) ? Number(afterRouteIndex) + 1 : 0;
   for (let index = Math.max(0, startIndex); index < routes.length; index++) {
@@ -2784,6 +3686,8 @@ async function openOutbound(settings, host, port, initialData, afterRouteIndex =
     try {
       let tunnel;
       if (route.type === "chain") tunnel = await openChainedWebSocket(route.value, host, port, initialData);
+      else if (route.type === "socks5") tunnel = await openSocks5Exit(route.value, host, port, initialData);
+      else if (route.type === "http") tunnel = await openHttpConnectExit(route.value, host, port, initialData);
       else if (route.type === "direct") tunnel = await openDirect(host, port, initialData);
       else {
         const target = parseHostPort(route.value, port);
@@ -2793,6 +3697,170 @@ async function openOutbound(settings, host, port, initialData, afterRouteIndex =
     } catch (err) { lastError = err; }
   }
   throw lastError || new Error("No outbound route is configured");
+}
+
+function makeBufferedSocketReader(reader) {
+  let buffer = new Uint8Array(0);
+  return {
+    async readExact(length, timeoutMs = 8000) {
+      const started = Date.now();
+      while (buffer.length < length) {
+        const left = timeoutMs - (Date.now() - started);
+        if (left <= 0) throw new Error("proxy handshake timeout");
+        let timer;
+        let item;
+        try {
+          item = await Promise.race([reader.read(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("proxy handshake timeout")), left); })]);
+        } finally { if (timer) clearTimeout(timer); }
+        if (item.done || !item.value?.byteLength) throw new Error("proxy closed during handshake");
+        buffer = concatChunks([buffer, item.value]);
+        if (buffer.length > 65536) throw new Error("proxy handshake response too large");
+      }
+      const result = buffer.slice(0, length);
+      buffer = buffer.slice(length);
+      return result;
+    },
+    async readUntil(marker, maxBytes = 16384, timeoutMs = 8000) {
+      const needle = enc.encode(marker);
+      const started = Date.now();
+      while (true) {
+        for (let i = 0; i <= buffer.length - needle.length; i++) {
+          let same = true;
+          for (let j = 0; j < needle.length; j++) if (buffer[i + j] !== needle[j]) { same = false; break; }
+          if (same) {
+            const end = i + needle.length;
+            const result = buffer.slice(0, end);
+            buffer = buffer.slice(end);
+            return result;
+          }
+        }
+        if (buffer.length >= maxBytes) throw new Error("proxy response header too large");
+        const left = timeoutMs - (Date.now() - started);
+        if (left <= 0) throw new Error("proxy handshake timeout");
+        let timer; let item;
+        try {
+          item = await Promise.race([reader.read(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("proxy handshake timeout")), left); })]);
+        } finally { if (timer) clearTimeout(timer); }
+        if (item.done || !item.value?.byteLength) throw new Error("proxy closed during handshake");
+        buffer = concatChunks([buffer, item.value]);
+      }
+    },
+    takeRemainder() { const value = buffer; buffer = new Uint8Array(0); return value; }
+  };
+}
+
+function encodeSocks5Address(host, port) {
+  let addr;
+  if (isIPv4Text(host)) addr = new Uint8Array([1, ...host.split(".").map(Number)]);
+  else if (isIPv6Text(host)) {
+    const groups = expandIPv6(host), raw = new Uint8Array(17); raw[0] = 4;
+    for (let i = 0; i < groups.length; i++) { raw[1 + i * 2] = (groups[i] >> 8) & 255; raw[2 + i * 2] = groups[i] & 255; }
+    addr = raw;
+  } else {
+    const bytes = enc.encode(String(host));
+    if (!bytes.length || bytes.length > 255) throw new Error("invalid SOCKS5 target domain");
+    addr = new Uint8Array(2 + bytes.length); addr[0] = 3; addr[1] = bytes.length; addr.set(bytes, 2);
+  }
+  const out = new Uint8Array(addr.length + 2); out.set(addr); out[out.length - 2] = (port >> 8) & 255; out[out.length - 1] = port & 255;
+  return out;
+}
+
+function socketReadableWithPrefix(prefix, readable) {
+  if (!prefix || !prefix.length) return readable;
+  const reader = readable.getReader(); let sent = false;
+  return new ReadableStream({
+    async pull(controller) {
+      if (!sent) { sent = true; controller.enqueue(prefix); return; }
+      try { const item = await reader.read(); if (item.done) controller.close(); else if (item.value?.byteLength) controller.enqueue(item.value); }
+      catch (error) { controller.error(error); }
+    },
+    async cancel(reason) { try { await reader.cancel(reason); } catch {} }
+  });
+}
+
+function safeDecodeUriComponent(value) {
+  try { return decodeURIComponent(String(value || "")); }
+  catch { throw new Error("invalid percent-encoding in Exit Node credentials"); }
+}
+
+function parseExitProxyUri(uri) {
+  const u = new URL(String(uri));
+  const protocol = u.protocol.toLowerCase();
+  if (!(["socks5:", "socks:", "http:"].includes(protocol))) throw new Error("unsupported Exit Node protocol");
+  return {
+    kind: protocol === "http:" ? "http" : "socks5",
+    hostname: u.hostname,
+    port: Number(u.port || (protocol === "http:" ? 8080 : 1080)),
+    username: safeDecodeUriComponent(u.username || ""),
+    password: safeDecodeUriComponent(u.password || "")
+  };
+}
+
+async function openSocks5Exit(proxyUri, targetHost, targetPort, initialData) {
+  const proxy = parseExitProxyUri(proxyUri);
+  const socket = connect({ hostname: proxy.hostname, port: proxy.port }, { secureTransport: "off", allowHalfOpen: true });
+  const close = () => { try { Promise.resolve(socket.close()).catch(() => {}); } catch {} };
+  let reader, writer, connectTimer;
+  try {
+    try {
+      await Promise.race([socket.opened, new Promise((_, reject) => { connectTimer = setTimeout(() => reject(new Error("SOCKS5 connect timeout")), 10000); })]);
+    } finally { if (connectTimer) clearTimeout(connectTimer); }
+    reader = socket.readable.getReader(); writer = socket.writable.getWriter();
+    const useAuth = !!(proxy.username || proxy.password);
+    await writer.write(new Uint8Array(useAuth ? [5, 1, 2] : [5, 1, 0]));
+    const buffered = makeBufferedSocketReader(reader);
+    const methodReply = await buffered.readExact(2);
+    if (methodReply[0] !== 5 || methodReply[1] === 255) throw new Error("SOCKS5 authentication method rejected");
+    if (methodReply[1] === 2) {
+      const user = enc.encode(proxy.username), pass = enc.encode(proxy.password);
+      if (!user.length || user.length > 255 || pass.length > 255) throw new Error("SOCKS5 username/password length invalid");
+      await writer.write(new Uint8Array([1, user.length, ...user, pass.length, ...pass]));
+      const authReply = await buffered.readExact(2);
+      if (authReply[0] !== 1 || authReply[1] !== 0) throw new Error("SOCKS5 authentication failed");
+    } else if (methodReply[1] !== 0 || useAuth) throw new Error("SOCKS5 proxy did not accept configured authentication");
+    await writer.write(concatChunks([new Uint8Array([5, 1, 0]), encodeSocks5Address(targetHost, targetPort)]));
+    const head = await buffered.readExact(4);
+    if (head[0] !== 5 || head[1] !== 0) throw new Error(`SOCKS5 CONNECT failed (${head[1]})`);
+    const atyp = head[3];
+    if (atyp === 1) await buffered.readExact(4);
+    else if (atyp === 3) { const len = (await buffered.readExact(1))[0]; await buffered.readExact(len); }
+    else if (atyp === 4) await buffered.readExact(16);
+    else throw new Error("SOCKS5 returned an invalid address type");
+    await buffered.readExact(2);
+    if (initialData?.length) await writer.write(initialData);
+    writer.releaseLock();
+    const remainder = buffered.takeRemainder();
+    // Release the handshake reader before creating the long-lived tunnel reader.
+    reader.releaseLock();
+    return { readable: socketReadableWithPrefix(remainder, socket.readable), writable: socket.writable, close };
+  } catch (error) { try { writer?.releaseLock(); } catch {} try { reader?.releaseLock(); } catch {} close(); throw error; }
+}
+
+async function openHttpConnectExit(proxyUri, targetHost, targetPort, initialData) {
+  const proxy = parseExitProxyUri(proxyUri);
+  const socket = connect({ hostname: proxy.hostname, port: proxy.port }, { secureTransport: "off", allowHalfOpen: true });
+  const close = () => { try { Promise.resolve(socket.close()).catch(() => {}); } catch {} };
+  let reader, writer, connectTimer;
+  try {
+    try {
+      await Promise.race([socket.opened, new Promise((_, reject) => { connectTimer = setTimeout(() => reject(new Error("HTTP proxy connect timeout")), 10000); })]);
+    } finally { if (connectTimer) clearTimeout(connectTimer); }
+    reader = socket.readable.getReader(); writer = socket.writable.getWriter();
+    const authority = (isIPv6Text(targetHost) ? `[${targetHost}]` : targetHost) + ":" + targetPort;
+    const headers = [`CONNECT ${authority} HTTP/1.1`, `Host: ${authority}`, "Proxy-Connection: Keep-Alive"];
+    if (proxy.username || proxy.password) headers.push("Proxy-Authorization: Basic " + base64Utf8Standard(proxy.username + ":" + proxy.password));
+    await writer.write(enc.encode(headers.join("\r\n") + "\r\n\r\n"));
+    const buffered = makeBufferedSocketReader(reader);
+    const response = dec.decode(await buffered.readUntil("\r\n\r\n", 16384));
+    const statusLine = response.split("\r\n", 1)[0];
+    if (!/^HTTP\/1\.[01] 2\d\d(?:\s|$)/.test(statusLine)) throw new Error("HTTP CONNECT rejected: " + statusLine.slice(0, 100));
+    if (initialData?.length) await writer.write(initialData);
+    writer.releaseLock();
+    const remainder = buffered.takeRemainder();
+    // Release the handshake reader before creating the long-lived tunnel reader.
+    reader.releaseLock();
+    return { readable: socketReadableWithPrefix(remainder, socket.readable), writable: socket.writable, close };
+  } catch (error) { try { writer?.releaseLock(); } catch {} try { reader?.releaseLock(); } catch {} close(); throw error; }
 }
 
 async function openDirect(host, port, initialData) {
@@ -2877,7 +3945,7 @@ function encodeTrojanUdpPacket(host, port, payload) {
   return out;
 }
 
-async function forwardDnsQuery(packet, state, dohUrl, ws, trojanSource = null) {
+async function fetchDohAnswer(packet, state, dohUrl) {
   // A Worker invocation may issue only a limited number of subrequests (50 on the Free
   // plan). Long-lived tunnels that keep resolving names would otherwise hit the cap and
   // throw; instead the budget is tracked, the condition is logged once, and further
@@ -2885,7 +3953,7 @@ async function forwardDnsQuery(packet, state, dohUrl, ws, trojanSource = null) {
   if (state.dohBudget === undefined) state.dohBudget = DNS_DOH_SUBREQUEST_LIMIT;
   if (state.dohBudget <= 0) {
     if (!state.dohBudgetLogged) { state.dohBudgetLogged = true; console.warn("DoH subrequest budget exhausted; dropping further DNS queries for this tunnel."); }
-    return;
+    return null;
   }
   state.dohBudget--;
   const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 8000);
@@ -2898,10 +3966,24 @@ async function forwardDnsQuery(packet, state, dohUrl, ws, trojanSource = null) {
     if (/subrequest/i.test(String(err && err.message || err))) {
       state.dohBudget = 0;
       if (!state.dohBudgetLogged) { state.dohBudgetLogged = true; console.warn("Worker subrequest limit reached while resolving DNS:", String(err.message || err).slice(0, 120)); }
-      return;
+      return null;
     }
     throw err;
   } finally { clearTimeout(timer); }
+  return ans;
+}
+
+async function forwardDnsQuery(packet, state, dohUrl, ws, trojanSource = null) {
+  const cacheKey = dohCacheKey(packet, dohUrl);
+  let ans = cacheKey ? dohCacheGet(cacheKey) : null;
+  if (ans) {
+    // Cache hit: no subrequest, just restore this query's transaction ID.
+    ans[0] = packet[0]; ans[1] = packet[1];
+  } else {
+    ans = await fetchDohAnswer(packet, state, dohUrl);
+    if (!ans) return;
+    if (cacheKey && ans.length && ans.length <= 65535) dohCachePut(cacheKey, ans);
+  }
   if (!ans.length || ans.length > 65535) throw new Error();
   if (ws.readyState !== WebSocket.OPEN) return;
   if (typeof state.onTraffic === "function" && !state.onTraffic(ans.byteLength)) return;
@@ -3062,7 +4144,7 @@ function encodeAddress(host) {
   if (host.includes(":")) { const groups = expandIPv6(host); const out = new Uint8Array(17); out[0] = 3; groups.forEach((n, i) => { out[1 + i * 2] = (n >> 8) & 255; out[2 + i * 2] = n & 255; }); return out; }
   const data = enc.encode(host); return new Uint8Array([2, data.length, ...data]);
 }
-function sha224Hex(text) {
+function sha224HexUncached(text) {
   const bytes = enc.encode(String(text)), bitLen = bytes.length * 8, total = Math.ceil((bytes.length + 9) / 64) * 64, msg = new Uint8Array(total);
   msg.set(bytes); msg[bytes.length] = 0x80; const dv = new DataView(msg.buffer); dv.setUint32(total - 8, Math.floor(bitLen / 0x100000000)); dv.setUint32(total - 4, bitLen >>> 0);
   const K = SHA256_K, H = [0xc1059ed8,0x367cd507,0x3070dd17,0xf70e5939,0xffc00b31,0x68581511,0x64f98fa7,0xbefa4fa4], w = new Uint32Array(64), rotr = (x,n) => (x >>> n) | (x << (32-n));
@@ -3075,6 +4157,16 @@ function sha224Hex(text) {
   }
   return H.slice(0,7).map(x => x.toString(16).padStart(8,"0")).join("");
 }
+function sha224Hex(text) {
+  const key = String(text);
+  const cached = trojanHashCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const value = sha224HexUncached(key);
+  trojanHashCache.set(key, { value, expiresAt: Date.now() + 30 * 60 * 1000 });
+  while (trojanHashCache.size > TROJAN_HASH_CACHE_MAX) trojanHashCache.delete(trojanHashCache.keys().next().value);
+  return value;
+}
+
 const SHA256_K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
 
 function fakeLandingResponse() {
@@ -3085,9 +4177,10 @@ function fakeLandingResponse() {
 }
 
 const FAKE_LANDING_HTML = String.raw`<!doctype html>
-<html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>یادداشت‌های روزانه</title>
-<style>:root{color-scheme:light;--ink:#1c2c3d;--muted:#64748b;--line:#e4eaf1;--paper:#fff;--bg:#f4f7fb;--accent:#457b9d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Tahoma,Arial,sans-serif;line-height:1.9}.wrap{width:min(920px,calc(100% - 32px));margin:auto}.hero{padding:54px 0 34px;background:linear-gradient(135deg,#e8f2f8,#f4f7fb)}.brand{font-size:14px;font-weight:700;color:var(--accent)}.hero h1{font-size:clamp(28px,5vw,43px);line-height:1.4;margin:10px 0}.hero p{max-width:650px;color:var(--muted);margin:0}nav{display:flex;gap:18px;flex-wrap:wrap;padding:14px 0;border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}main{padding:30px 0 54px}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:22px}.tag{display:inline-block;background:#edf4f8;border-radius:99px;padding:3px 10px;font-size:11px;color:var(--accent)}footer{border-top:1px solid var(--line);padding:20px 0 30px;color:var(--muted);font-size:12px}@media(max-width:620px){.cards{grid-template-columns:1fr}}</style></head>
-<body><header class="hero"><div class="wrap"><div class="brand">دفترچهٔ آنلاین</div><h1>یادداشت‌هایی برای روزهای شلوغ</h1><p>چند نوشتهٔ کوتاه دربارهٔ فناوری، عادت‌های کوچک، کتاب‌ها و چیزهایی که در مسیر یادگیری به چشم می‌آیند.</p></div></header><div class="wrap"><nav><span>خانه</span><span>یادداشت‌ها</span><span>درباره</span><span>تماس</span></nav></div><main class="wrap"><div class="cards"><article class="card"><span class="tag">فناوری</span><h2>چطور ابزارهای ساده کارهای روزانه را بهتر می‌کنند؟</h2><p>گاهی یک روند ساده و منظم بیشتر از یک ابزار پیچیده به تمرکز و آرامش کمک می‌کند.</p></article><article class="card"><span class="tag">یادگیری</span><h2>یادداشت‌برداری؛ راهی برای ماندگار کردن ایده‌ها</h2><p>ثبت نکته‌های مهم، مرور دوباره و تبدیل آن‌ها به قدم‌های کوچک مسیر یادگیری را روشن‌تر می‌کند.</p></article></div></main><footer><div class="wrap">© دفترچهٔ آنلاین</div></footer></body></html>`;
+<html lang="en" dir="ltr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Botwise — Notes on AI &amp; Telegram Chatbots</title>
+<meta name="description" content="A small blog about AI assistants and building helpful chatbots on Telegram.">
+<style>:root{color-scheme:light;--ink:#1b2735;--muted:#5f6f82;--line:#e3e9f0;--paper:#fff;--bg:#f5f8fc;--accent:#2a8bd1}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.7}.wrap{width:min(920px,calc(100% - 32px));margin:auto}.hero{padding:56px 0 36px;background:linear-gradient(135deg,#e6f2fb,#f5f8fc)}.brand{font-size:14px;font-weight:700;color:var(--accent);letter-spacing:.04em;text-transform:uppercase}.hero h1{font-size:clamp(28px,5vw,44px);line-height:1.25;margin:10px 0 12px}.hero p{max-width:660px;color:var(--muted);margin:0;font-size:17px}nav{display:flex;gap:20px;flex-wrap:wrap;padding:14px 0;border-bottom:1px solid var(--line);font-size:14px;color:var(--muted)}main{padding:30px 0 54px}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:22px}.card h2{font-size:19px;line-height:1.35;margin:10px 0 8px}.card p{margin:0;color:var(--muted);font-size:15px}.tag{display:inline-block;background:#e9f3fb;border-radius:99px;padding:3px 10px;font-size:12px;color:var(--accent)}footer{border-top:1px solid var(--line);padding:20px 0 30px;color:var(--muted);font-size:13px}@media(max-width:620px){.cards{grid-template-columns:1fr}}</style></head>
+<body><header class="hero"><div class="wrap"><div class="brand">Botwise</div><h1>Practical notes on AI and Telegram chatbots</h1><p>AI assistants are changing how we search, write and get things done. Telegram, with its open Bot API, is one of the easiest places to put them to work. This blog collects short, hands-on notes for curious beginners and builders.</p></div></header><div class="wrap"><nav><span>Home</span><span>Articles</span><span>About</span><span>Contact</span></nav></div><main class="wrap"><div class="cards"><article class="card"><span class="tag">AI Basics</span><h2>What is an AI chatbot, really?</h2><p>Modern chatbots rely on large language models that predict useful text from the context you give them. Here is a plain-English look at what they can do well, and where they still need a human in the loop.</p></article><article class="card"><span class="tag">Telegram</span><h2>Why Telegram is a great home for bots</h2><p>Telegram bots are free to create through BotFather, work on every device, and support buttons, inline queries, files and payments, so a small idea can reach people quickly.</p></article><article class="card"><span class="tag">Getting Started</span><h2>Your first Telegram bot in an afternoon</h2><p>Create a bot token, choose between long polling and webhooks, and answer your first message. We walk through the core ideas without the jargon.</p></article><article class="card"><span class="tag">Good Practice</span><h2>Designing helpful, respectful chatbots</h2><p>Clear commands, honest answers, sensible rate limits and respect for user privacy turn a clever demo into a bot people actually want to keep using.</p></article></div></main><footer><div class="wrap">&copy; Botwise. Notes on AI and chatbots.</div></footer></body></html>`;
 
 // -------------------- Vision UI Dashboard Admin Template --------------------
 const ADMIN_HTML = String.raw`<!doctype html>
@@ -3674,6 +4767,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
       <div class="menu-item" data-target="sec-users"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M16 20v-1.5a4.5 4.5 0 0 0-4.5-4.5h-3A4.5 4.5 0 0 0 4 18.5V20"/><circle cx="10" cy="7" r="3.5"/><path d="M17 11a3.5 3.5 0 0 0 0-7"/></svg></span><span>کاربران</span></div>
       <div class="menu-item" data-target="sec-usage"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V5m0 14h17M8 16v-5m4 5V7m4 9v-8m4 8v-4"/></svg></span><span>میزان اتصالات</span></div>
       <div class="menu-item" data-target="sec-cleanip"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/></svg></span><span>Clean IP (Billing)</span></div>
+      <div class="menu-item" data-target="sec-exitnodes"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg></span><span>Exit Node</span></div>
       <div class="menu-item" data-target="sec-settings"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span><span>پروتکل‌ها</span></div>
       <div class="menu-divider">ACCOUNT PAGES</div>
       <div class="menu-item" data-target="sec-mainsettings"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></span><span>تنظیمات اصلی (Profile)</span></div>
@@ -3812,6 +4906,13 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
     </section>
 
     <section id="sec-usage" class="panel-section">
+      <div class="card" style="margin-bottom:14px;">
+        <label class="check-label" style="margin:0;">
+          <span>پایش میزان بایت رفت و آمد (ثبت حجم مصرفی ترافیک در بافر و KV)</span>
+          <input type="checkbox" id="trafficByteTrackingEnabled">
+        </label>
+        <p class="small-note" style="margin:6px 0 0;">به‌صورت پیش‌فرض خاموش است. در صورت نیاز به محاسبه و ثبت حجم ترافیک عبوری (بایت‌های رفت و برگشت)، این گزینه را فعال کنید.</p>
+      </div>
       <div class="usage-summary-grid">
         <div class="usage-summary-card"><span>مصرف مدیر · نامحدود</span><strong id="usageAdminTotal">0 B</strong></div>
         <div class="usage-summary-card"><span>مصرف کل مدیر و کاربران</span><strong id="usageTotalBytes">0 B</strong></div>
@@ -3876,8 +4977,33 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
           <label class="check-label"><span>فعال‌سازی IPv6 در DNS و خروجی‌ها</span><input type="checkbox" id="ipv6Enabled"></label>
           <div class="field"><label for="logLevel">Log Level</label><select id="logLevel"><option value="debug">Debug</option><option value="info">Info</option><option value="warning">Warning</option><option value="error">Error</option><option value="none">None</option></select></div>
         </div>
+        <div class="card" style="grid-column:1/-1;">
+          <h2>Shadowsocks</h2>
+          <label class="check-label"><span>فعال‌سازی Shadowsocks در اشتراک‌ها و خروجی‌ها</span><input type="checkbox" id="shadowsocksEnabled"></label>
+          <div class="field" style="max-width:360px;"><label for="shadowsocksMethod">روش رمزنگاری AEAD</label><select id="shadowsocksMethod"><option value="aes-256-gcm">AES-256-GCM (پیشنهادی)</option><option value="aes-128-gcm">AES-128-GCM</option></select></div>
+          <p class="small-note">رمز Shadowsocks برای مدیر از UUID اصلی و برای هر ساب‌کاربر از UUID همان کاربر ساخته می‌شود. خروجی از AEAD استاندارد Shadowsocks و افزونه v2ray-plugin روی WebSocket استفاده می‌کند؛ UDP/UDP relay در Worker پشتیبانی نمی‌شود.</p>
+        </div>
       </div>
+      <p class="small-note" style="margin-top:12px;">ذخیره‌سازی ترکیبی: برای فعال‌شدن D1+KV، یک D1 Database با Binding نام <code dir="ltr">DB</code> و یک KV Namespace با Binding نام <code dir="ltr">SETTINGS</code> متصل کنید. بدون DB، حالت سازگاری KV فعال می‌ماند.</p>
       <button type="button" id="saveMainSettingsBtn" style="margin-top:20px;">ذخیره تنظیمات اصلی</button>
+    </section>
+
+    <section id="sec-exitnodes" class="panel-section">
+      <div class="card">
+        <div class="section-head"><div><h2>مدیریت مسیرهای خروجی (Exit Nodes)</h2><p class="small-note">این بخش مسیر خروجی واقعی را از Clean IP ورودی جدا می‌کند. هر ردیف باید یک پراکسی خروجی SOCKS5 یا HTTP CONNECT در کشور مربوطه باشد.</p></div><span class="pill">حداکثر ۸ مسیر</span></div>
+        <input type="hidden" id="exitNodeEditId">
+        <div class="user-form-grid user-form-grid-basic">
+          <div class="field"><label for="exitNodeName">نام مسیر</label><input id="exitNodeName" maxlength="48" placeholder="Germany Frankfurt"></div>
+          <div class="field"><label for="exitNodeCountry">کد کشور (دو حرفی)</label><input id="exitNodeCountry" maxlength="8" dir="ltr" placeholder="DE"></div>
+          <div class="field" style="grid-column:1/-1"><label for="exitNodeUri">آدرس پراکسی خروجی</label><input id="exitNodeUri" dir="ltr" placeholder="socks5://user:password@host:1080 یا http://user:password@host:8080"></div>
+        </div>
+        <p class="small-note">اعتبارنامه پراکسی داخل D1 ذخیره می‌شود. Worker برای هر کانفیگ Exit Node از مسیر مشخص‌شده استفاده می‌کند و در صورت خرابی آن، مسیرهای قدیمی Direct/Chain Proxy همچنان به‌عنوان fallback باقی می‌مانند.</p>
+        <div class="user-form-actions"><button type="button" id="exitNodeSaveBtn">افزودن Exit Node</button><button type="button" class="secondary" id="exitNodeClearBtn">پاک‌کردن فرم</button></div>
+      </div>
+      <div class="card" style="margin-top:18px;">
+        <div class="section-head"><div><h2>فهرست Exit Nodeها</h2><p class="small-note">برای هر مسیر، کانفیگ جداگانه و یک کانفیگ AUTO در خروجی اشتراک ساخته می‌شود.</p></div></div>
+        <div class="table-wrap"><table class="users-table"><thead><tr><th>کشور</th><th>نام مسیر</th><th>نوع</th><th>وضعیت</th><th>عملیات</th></tr></thead><tbody id="exitNodeTableBody"><tr><td colspan="5">هنوز Exit Node تعریف نشده است.</td></tr></tbody></table></div>
+      </div>
     </section>
 
     <section id="sec-settings" class="panel-section">
@@ -4053,6 +5179,7 @@ const TAB_TITLES = {
   'sec-settings': 'تنظیمات پروتکل',
   'sec-users': 'مدیریت کاربران',
   'sec-cleanip': 'Clean IP هوشمند',
+  'sec-exitnodes': 'Exit Node',
   'sec-outputs': 'خروجی‌ها'
 };
 
@@ -4117,7 +5244,10 @@ async function initApp() {
 $('setupForm').onsubmit = async e => { e.preventDefault(); try { await api('/api/setup', { method: 'POST', body: JSON.stringify({ username: $('setupUser').value, password: $('setupPass').value }) }); initApp(); } catch (err) { $('setupStatus').textContent = err.message; $('setupStatus').classList.remove('hidden'); }};
 $('loginForm').onsubmit = async e => { e.preventDefault(); try { await api('/api/login', { method: 'POST', body: JSON.stringify({ username: $('loginUser').value, password: $('loginPass').value }) }); initApp(); } catch (err) { $('loginStatus').textContent = err.message; $('loginStatus').classList.remove('hidden'); }};
 $('logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); location.reload(); };
-setInterval(() => { void refreshUsageSnapshot(); }, 8000);
+const USAGE_REFRESH_INTERVAL_MS = 45000;
+// Poll only while the tab is visible; refresh once immediately when the user returns to it.
+setInterval(() => { if (document.visibilityState === 'visible') void refreshUsageSnapshot(); }, USAGE_REFRESH_INTERVAL_MS);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void refreshUsageSnapshot(); });
 $('refreshPanelBtn')?.addEventListener('click', async () => {
   const button = $('refreshPanelBtn');
   if (button) { button.disabled = true; button.textContent = 'در حال بازخوانی…'; }
@@ -4371,6 +5501,10 @@ function fillForm(s) {
   $('proxies').value = (Array.isArray(s.proxies) ? s.proxies : []).join('\n');
   $('clientIpRestrictionEnabled').checked = !!s.clientIpRestrictionEnabled;
   $('allowedClientIps').value = s.allowedClientIps || '';
+  $('trafficByteTrackingEnabled').checked = s.trafficByteTrackingEnabled === true;
+  $('shadowsocksEnabled').checked = s.shadowsocksEnabled === true;
+  $('shadowsocksMethod').value = s.shadowsocksMethod || 'aes-256-gcm';
+  renderExitNodes(s.exitNodes || []);
   fillSelect('tlsPort', s.tlsPorts, s.tlsPort); fillSelect('nonTlsPort', s.nonTlsPorts, s.nonTlsPort);
 
   const cleanCount = s.cleanIPs ? s.cleanIPs.split(/[\r\n,]+/).filter(Boolean).length : 0;
@@ -4382,7 +5516,7 @@ function fillForm(s) {
   updateCloudUsageMetrics(allSubUsers, globalSettings.adminUsage);
 
   $('dashCleanCount').textContent = String(cleanCount);
-  const activeProtocols = (s.vlessEnabled && s.uuid ? 1 : 0) + (s.trojanEnabled && s.trojanPassword ? 1 : 0);
+  const activeProtocols = (s.vlessEnabled && s.uuid ? 1 : 0) + (s.trojanEnabled && s.trojanPassword ? 1 : 0) + (s.shadowsocksEnabled && (s.shadowsocksPassword || s.uuid) ? 1 : 0);
   if ($('dashActiveProtocols')) $('dashActiveProtocols').textContent = String(activeProtocols);
   $('dashProtocolCount').textContent = String(activeProtocols);
   $('dashPortsCount').textContent = String(portsCount);
@@ -4426,6 +5560,10 @@ function buildDashboardConfigs(s) {
       tlsPorts.forEach(port => configs.push({ ...ep, proto: 'Trojan TLS', port, active: true }));
       wsPorts.forEach(port => configs.push({ ...ep, proto: 'Trojan WS', port, active: true }));
     }
+    if (s.shadowsocksEnabled && (s.shadowsocksPassword || s.uuid)) {
+      tlsPorts.forEach(port => configs.push({ ...ep, proto: 'Shadowsocks TLS', port, active: true }));
+      wsPorts.forEach(port => configs.push({ ...ep, proto: 'Shadowsocks WS', port, active: true }));
+    }
   });
   return configs;
 }
@@ -4434,7 +5572,7 @@ function countAvailableDashboardConfigs(s) {
   const endpoints = getUiEndpoints(s).length;
   const ports = getUiPorts(s, true).length + getUiPorts(s, false).length;
   if (!endpoints || !ports) return 0;
-  const rootProtocols = (s.vlessEnabled && s.uuid ? 1 : 0) + (s.trojanEnabled && s.trojanPassword ? 1 : 0);
+  const rootProtocols = (s.vlessEnabled && s.uuid ? 1 : 0) + (s.trojanEnabled && s.trojanPassword ? 1 : 0) + (s.shadowsocksEnabled && s.uuid ? 1 : 0);
   let total = endpoints * ports * rootProtocols;
   const users = Array.isArray(s.users) ? s.users : [];
   const now = Date.now();
@@ -4447,7 +5585,8 @@ function countAvailableDashboardConfigs(s) {
     if (Number(user.requestLimit) > 0 && Number(user.requestCount || 0) >= Number(user.requestLimit)) continue;
     const protocols =
       (s.vlessEnabled && user.vlessEnabled !== false && !!user.uuid ? 1 : 0) +
-      (s.trojanEnabled && user.trojanEnabled !== false && !!user.trojanPassword ? 1 : 0);
+      (s.trojanEnabled && user.trojanEnabled !== false && !!user.trojanPassword ? 1 : 0) +
+      (s.shadowsocksEnabled && !!(user.shadowsocksPassword || user.uuid) ? 1 : 0);
     total += endpoints * ports * protocols;
   }
   return total;
@@ -4588,12 +5727,86 @@ function gatherSettings() {
     proxyIP: $('proxyIP').value.trim(),
     proxies: $('proxies').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
     clientIpRestrictionEnabled: $('clientIpRestrictionEnabled').checked,
-    allowedClientIps: $('allowedClientIps').value.trim()
+    allowedClientIps: $('allowedClientIps').value.trim(),
+    trafficByteTrackingEnabled: $('trafficByteTrackingEnabled').checked,
+    shadowsocksEnabled: $('shadowsocksEnabled').checked,
+    shadowsocksMethod: $('shadowsocksMethod').value,
+    exitNodes: Array.isArray(base.exitNodes) ? base.exitNodes : []
   };
 }
 
+function clearExitNodeForm() {
+  if ($('exitNodeEditId')) $('exitNodeEditId').value = '';
+  if ($('exitNodeName')) $('exitNodeName').value = '';
+  if ($('exitNodeCountry')) $('exitNodeCountry').value = '';
+  if ($('exitNodeUri')) $('exitNodeUri').value = '';
+  if ($('exitNodeSaveBtn')) $('exitNodeSaveBtn').textContent = 'افزودن Exit Node';
+}
+
+function renderExitNodes(items = globalSettings.exitNodes || []) {
+  const body = $('exitNodeTableBody');
+  if (!body) return;
+  body.replaceChildren();
+  const nodes = Array.isArray(items) ? items : [];
+  if (!nodes.length) {
+    const tr = document.createElement('tr'), td = document.createElement('td');
+    td.colSpan = 5; td.textContent = 'هنوز Exit Node تعریف نشده است.'; tr.appendChild(td); body.appendChild(tr); return;
+  }
+  for (const node of nodes) {
+    const tr = document.createElement('tr');
+    for (const value of [node.country || 'UN', node.name || 'Exit', node.kind === 'socks5' ? 'SOCKS5' : 'HTTP CONNECT', node.enabled === false ? 'غیرفعال' : 'فعال']) {
+      const td = document.createElement('td'); td.textContent = value; tr.appendChild(td);
+    }
+    const actions = document.createElement('td'); actions.className = 'user-actions';
+    const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'secondary'; edit.textContent = 'ویرایش';
+    edit.addEventListener('click', () => {
+      $('exitNodeEditId').value = node.id; $('exitNodeName').value = node.name || '';
+      $('exitNodeCountry').value = node.country || ''; $('exitNodeUri').value = node.uri || '';
+      $('exitNodeSaveBtn').textContent = 'ذخیره تغییرات Exit Node'; switchTab('sec-exitnodes'); $('exitNodeName').focus();
+    });
+    const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = 'secondary'; toggle.textContent = node.enabled === false ? 'فعال‌سازی' : 'غیرفعال‌سازی';
+    toggle.addEventListener('click', async () => {
+      globalSettings.exitNodes = (globalSettings.exitNodes || []).map(item => item.id === node.id ? { ...item, enabled: item.enabled === false } : item);
+      if (await saveAllSettings()) renderExitNodes(globalSettings.exitNodes);
+    });
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger-button'; remove.textContent = 'حذف';
+    remove.addEventListener('click', async () => {
+      if (!confirm('Exit Node «' + node.name + '» حذف شود؟')) return;
+      globalSettings.exitNodes = (globalSettings.exitNodes || []).filter(item => item.id !== node.id);
+      if (await saveAllSettings()) { renderExitNodes(globalSettings.exitNodes); if ($('exitNodeEditId').value === node.id) clearExitNodeForm(); }
+    });
+    actions.append(edit, toggle, remove); tr.appendChild(actions); body.appendChild(tr);
+  }
+}
+
+$('exitNodeSaveBtn')?.addEventListener('click', async () => {
+  try {
+    const id = $('exitNodeEditId').value || crypto.randomUUID();
+    const name = $('exitNodeName').value.trim();
+    const country = $('exitNodeCountry').value.trim().toUpperCase();
+    const uri = $('exitNodeUri').value.trim();
+    if (!name || !country || !uri) throw new Error('نام، کشور و آدرس Exit Node الزامی است.');
+    const parsed = new URL(uri);
+    if (!['socks5:', 'socks:', 'http:'].includes(parsed.protocol.toLowerCase()) || !parsed.hostname) throw new Error('فقط socks5:// یا http:// پشتیبانی می‌شود.');
+    const old = (globalSettings.exitNodes || []).find(item => item.id === id);
+    const node = { id, name, country, uri, kind: parsed.protocol.toLowerCase() === 'http:' ? 'http' : 'socks5', enabled: old ? old.enabled !== false : true };
+    const list = Array.isArray(globalSettings.exitNodes) ? [...globalSettings.exitNodes] : [];
+    const index = list.findIndex(item => item.id === id);
+    if (index >= 0) list[index] = node;
+    else { if (list.length >= 8) throw new Error('حداکثر ۸ Exit Node مجاز است.'); list.push(node); }
+    globalSettings.exitNodes = list;
+    if (await saveAllSettings()) { clearExitNodeForm(); renderExitNodes(globalSettings.exitNodes); showStatus(index >= 0 ? 'Exit Node به‌روزرسانی شد.' : 'Exit Node اضافه شد.'); }
+  } catch (error) { showStatus(error.message || String(error), true); }
+});
+$('exitNodeClearBtn')?.addEventListener('click', clearExitNodeForm);
+
 async function saveAllSettings() { try { const res = await api('/api/settings', { method: 'POST', body: JSON.stringify(gatherSettings()) }); globalSettings = res.settings; fillForm(res.settings); showStatus('تنظیمات ذخیره شد.'); $('previewChanges').classList.add('hidden'); return true; } catch (err) { showStatus(err.message, true); return false; } }
 $('saveSettingsBtn').onclick = saveAllSettings; $('saveCleanBtn').onclick = saveAllSettings; $('saveMainSettingsBtn').onclick = saveAllSettings;
+$('trafficByteTrackingEnabled').addEventListener('change', async () => {
+  const box = $('trafficByteTrackingEnabled');
+  const ok = await saveAllSettings();
+  if (!ok) box.checked = !box.checked;
+});
 
 $('syncCleanBtn').onclick = async () => {
   const button = $('syncCleanBtn');
