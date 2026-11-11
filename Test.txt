@@ -2720,18 +2720,17 @@ async function discoverPlacementCredentials(env, kv, url) {
 }
 
 async function createPlacementApiToken(env, accountId, bootstrapTokenOverride = "") {
-  // Prefer a one-time UI value, then CF_BOOTSTRAP_TOKEN, then reuse CF_API_TOKEN if it has User > API Tokens > Edit. Never persist the supplied token.
+  // Account-owned token flow: the bootstrap credential must have Account > Account API Tokens > Edit. Prefer the one-time UI value, then CF_BOOTSTRAP_TOKEN, then CF_API_TOKEN. Never persist the supplied token.
   const bootstrapToken = String(bootstrapTokenOverride || env.CF_BOOTSTRAP_TOKEN || env.CF_API_TOKEN || "")
     .trim().replace(/^Bearer\s+/i, "");
   if (!bootstrapToken || bootstrapToken.length > 512) {
-    throw new Error("اعتبارنامهٔ ساخت Token پیدا نشد یا نامعتبر است. یک مقدار در فیلد Bootstrap Token وارد کنید یا CF_BOOTSTRAP_TOKEN / CF_API_TOKEN را با مجوز User > API Tokens > Edit در Worker تعریف کنید.");
+    throw new Error("اعتبارنامهٔ ساخت Token پیدا نشد یا نامعتبر است. یک مقدار در فیلد Bootstrap Token وارد کنید یا CF_BOOTSTRAP_TOKEN / CF_API_TOKEN را با مجوز Account > Account API Tokens > Edit در Worker تعریف کنید.");
   }
 
   let id = String(accountId || env.CF_ACCOUNT_ID || "").trim();
   if (!id) {
     try {
-      // Account discovery needs Account Read. The recommended Create additional tokens
-      // bootstrap normally has only API Tokens Write, so manual Account ID is the fallback.
+      // Account discovery needs Account Read. Account API Tokens Edit alone may not include it, so manual Account ID is the reliable fallback.
       const accountData = await cloudflareApiJson("/accounts?page=1&per_page=50", bootstrapToken, { method: "GET" });
       const accounts = Array.isArray(accountData.result)
         ? accountData.result.filter(item => /^[a-f0-9]{32}$/i.test(String(item?.id || ""))) : [];
@@ -2741,13 +2740,19 @@ async function createPlacementApiToken(env, accountId, bootstrapTokenOverride = 
     } catch (error) {
       const message = String(error?.message || "");
       if (/چند حساب|فهرست حساب/.test(message)) throw error;
-      throw new Error("Account ID را دستی وارد کنید. Bootstrap Token با قالب Create additional tokens معمولاً مجوز فهرست‌کردن حساب‌ها (Account Read) ندارد.");
+      throw new Error("Account ID را دستی وارد کنید. Bootstrap Token با مجوز Account API Tokens Edit ممکن است مجوز فهرست‌کردن حساب‌ها (Account Read) نداشته باشد.");
     }
   }
   if (!/^[a-f0-9]{32}$/i.test(id)) throw new Error("CF_ACCOUNT_ID باید شناسهٔ ۳۲ کاراکتری هگز حساب Cloudflare باشد.");
 
-  // For user-owned tokens Cloudflare documents this endpoint and requires API Tokens Write.
-  const groupsData = await cloudflareApiJson("/user/tokens/permission_groups", bootstrapToken, { method: "GET" });
+  // Create an account-owned token. Cloudflare requires Account API Tokens Write on the bootstrap token.
+  // Use the account-scoped permission-group endpoint, not /user/tokens/permission_groups.
+  let groupsData;
+  try {
+    groupsData = await cloudflareApiJson("/accounts/" + encodeURIComponent(id) + "/tokens/permission_groups", bootstrapToken, { method: "GET" });
+  } catch (error) {
+    throw new Error("مرحلهٔ خواندن مجوزهای Account ناموفق بود. Bootstrap Token باید مجوز Account → Account API Tokens → Edit روی همین حساب داشته باشد. جزئیات Cloudflare: " + String(error?.message || error).slice(0, 180));
+  }
   const groups = Array.isArray(groupsData.result) ? groupsData.result : [];
   const normalizePermissionName = value => String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
   const workerGroup = groups.find(group => {
@@ -2757,7 +2762,7 @@ async function createPlacementApiToken(env, accountId, bootstrapTokenOverride = 
     return nameMatches && group?.id && group.is_selectable !== false && accountScoped;
   });
   if (!workerGroup) {
-    throw new Error("Cloudflare در فهرست مجوزهای قابل انتخاب، Workers Scripts Write را برای این حساب برنگرداند. بررسی کنید Bootstrap Token از قالب Create additional tokens ساخته شده و مجوز API Tokens Write دارد.");
+    throw new Error("Cloudflare در فهرست مجوزهای قابل انتخاب این Account، گروه Workers Scripts Write را برنگرداند. در داشبورد بررسی کنید Bootstrap Token مجوز Account > Account API Tokens > Edit دارد و حساب مقصد، همان Account ID واردشده است.");
   }
 
   // Prevent concurrent accidental duplicate creation. Cooldown starts only after success,
@@ -2783,10 +2788,15 @@ async function createPlacementApiToken(env, accountId, bootstrapTokenOverride = 
     // expires_on is intentionally omitted: Cloudflare creates a non-expiring token.
     // The token is returned once and must be copied to Worker Secret CF_API_TOKEN
     // if it should remain available after the current panel page is closed.
-    const created = await cloudflareApiJson("/user/tokens", bootstrapToken, {
-      method: "POST",
-      body: JSON.stringify({ name: tokenName, policies: [policy] })
-    });
+    let created;
+    try {
+      created = await cloudflareApiJson("/accounts/" + encodeURIComponent(id) + "/tokens", bootstrapToken, {
+        method: "POST",
+        body: JSON.stringify({ name: tokenName, policies: [policy] })
+      });
+    } catch (error) {
+      throw new Error("مرحلهٔ ساخت Account API Token ناموفق بود. مجوز Bootstrap، شناسهٔ Account و امکان اعطای Workers Scripts Write را بررسی کنید. جزئیات Cloudflare: " + String(error?.message || error).slice(0, 180));
+    }
     throttleState.lastCreatedAt = Date.now();
     const result = created?.result || {};
     const tokenValue = typeof result.value === "string" ? result.value.trim()
@@ -6287,7 +6297,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
           <div class="field" style="margin-top:10px">
             <label for="cfBootstrapToken">Bootstrap Token (برای ساخت API Token دائمی)</label>
             <div class="cf-token-row"><input id="cfBootstrapToken" type="password" dir="ltr" maxlength="512" autocomplete="new-password" placeholder="Paste Cloudflare Bootstrap Token"><button type="button" class="secondary" id="toggleCfBootstrapTokenVisibilityBtn">نمایش</button></div>
-            <p class="small-note">می‌توانید این مقدار را فقط در همین صفحه وارد کنید؛ به Worker، KV یا D1 ذخیره نمی‌شود. در صورت خالی بودن، Worker ابتدا Secret با نام <code>CF_BOOTSTRAP_TOKEN</code> و سپس <code>CF_API_TOKEN</code> را امتحان می‌کند؛ توکن جایگزین باید مجوز <code>User → API Tokens → Edit</code> داشته باشد.</p>
+            <p class="small-note">می‌توانید این مقدار را فقط در همین صفحه وارد کنید؛ به Worker، KV یا D1 ذخیره نمی‌شود. در صورت خالی بودن، Worker ابتدا Secret با نام <code>CF_BOOTSTRAP_TOKEN</code> و سپس <code>CF_API_TOKEN</code> را امتحان می‌کند؛ توکن جایگزین باید مجوز <code>Account → Account API Tokens → Edit</code> روی همین حساب داشته باشد.</p>
           </div>
           <div class="cf-placement-actions">
             <button type="button" class="secondary" id="refreshCfCredentialsBtn">تشخیص خودکار مشخصات</button>
@@ -6298,7 +6308,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
             <div class="cf-token-row"><input id="cfNewApiToken" type="password" dir="ltr" readonly autocomplete="off"><button type="button" class="secondary" id="toggleCfTokenVisibilityBtn">نمایش</button><button type="button" id="copyCfApiTokenBtn">کپی Token</button></div>
             <p class="small-note" id="cfApiTokenExpiryNote">Token دائمی است و تا زمان لغو دستی در Cloudflare اعتبار دارد. برای استفاده پس از بستن صفحه، آن را به‌عنوان Secret با نام CF_API_TOKEN در تنظیمات Worker ذخیره کنید.</p>
           </div>
-          <p class="small-note">Bootstrap Token باید User-owned و از قالب رسمی <code>Create additional tokens</code> با مجوز <code>User &gt; API Tokens &gt; Edit</code> باشد. برای ساخت Token دائمی، مجوز <code>Workers Scripts Write</code> فقط روی همین Account اعمال می‌شود. Cloudflare مقدار Secret را فقط هنگام ساخت برمی‌گرداند؛ آن را کپی کرده و در Worker → Settings → Variables and Secrets با نام <code>CF_API_TOKEN</code> به‌صورت Secret ذخیره کنید. Worker نمی‌تواند Secretهای محیط خودش را از داخل کد تغییر دهد. تا وقتی صفحه باز است، Token ساخته‌شده برای Apply نیز در حافظهٔ همان صفحه استفاده می‌شود و در KV/D1 ذخیره نمی‌شود. اگر Account ID به‌صورت خودکار پیدا نشد، آن را دستی وارد کنید؛ قالب Bootstrap معمولاً مجوز Account Read برای فهرست‌کردن حساب‌ها ندارد.</p>
+          <p class="small-note">Bootstrap Token باید برای ساخت Account-owned Token مجوز <code>Account &gt; Account API Tokens &gt; Edit</code> روی همین حساب داشته باشد. برای ساخت Token Placement، مجوز <code>Workers Scripts Write</code> فقط روی همین Account اعمال می‌شود. Cloudflare مقدار Secret را فقط هنگام ساخت برمی‌گرداند؛ آن را کپی کرده و در Worker → Settings → Variables and Secrets با نام <code>CF_API_TOKEN</code> به‌صورت Secret ذخیره کنید. Worker نمی‌تواند Secretهای محیط خودش را از داخل کد تغییر دهد. تا وقتی صفحه باز است، Token ساخته‌شده برای Apply نیز در حافظهٔ همان صفحه استفاده می‌شود و در KV/D1 ذخیره نمی‌شود. اگر Account ID به‌صورت خودکار پیدا نشد، آن را دستی وارد کنید؛ قالب Bootstrap معمولاً مجوز Account Read برای فهرست‌کردن حساب‌ها ندارد.</p>
         </div>
         <div class="user-form-actions"><button type="button" id="applyWorkerPlacementBtn">ذخیره و اعمال محل اجرا</button></div>
       </div>
@@ -7341,7 +7351,7 @@ $('createCfApiTokenBtn')?.addEventListener('click', async event => {
   const accountId = String($('cfAccountId')?.value || '').trim();
   const bootstrapToken = String($('cfBootstrapToken')?.value || '').trim();
   if (accountId && !/^[a-f0-9]{32}$/i.test(accountId)) return showStatus('Account ID باید ۳۲ کاراکتر hex باشد.', true);
-  if (!bootstrapToken && !placementCredentialState.canCreateToken) return showStatus('هیچ اعتبارنامهٔ اولیه‌ای پیدا نشد. CF_BOOTSTRAP_TOKEN یا CF_API_TOKEN باید در Worker موجود باشد و مجوز User → API Tokens → Edit داشته باشد.', true);
+  if (!bootstrapToken && !placementCredentialState.canCreateToken) return showStatus('هیچ اعتبارنامهٔ اولیه‌ای پیدا نشد. CF_BOOTSTRAP_TOKEN یا CF_API_TOKEN باید در Worker موجود باشد و مجوز Account → Account API Tokens → Edit روی حساب مقصد داشته باشد.', true);
   button.disabled = true; button.textContent = 'در حال ساخت API Token دائمی…';
   try {
     const result = await api('/api/placement/token', { method: 'POST', body: JSON.stringify({ accountId, bootstrapToken }) });
