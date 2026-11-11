@@ -393,8 +393,8 @@ export default {
           try {
             const body = await readJsonLimited(request, 2048);
             const token = await createPlacementApiToken(env, body.accountId, body.bootstrapToken);
-            // The generated, one-hour scoped token is returned once and is never persisted by this Worker.
-            return json({ ok: true, apiToken: token.token, tokenId: token.id, tokenName: token.name, expiresOn: token.expiresOn, accountId: token.accountId });
+            // The generated scoped token is non-expiring; its secret is returned once and never persisted by this Worker.
+            return json({ ok: true, apiToken: token.token, tokenId: token.id, tokenName: token.name, expiresOn: null, permanent: true, accountId: token.accountId });
           } catch (err) {
             return json({ error: String(err?.message || "ساخت API Token ناموفق بود").slice(0, 260), code: "ERR_CF_TOKEN_CREATE" }, 400);
           }
@@ -2623,17 +2623,23 @@ async function applyCloudflareWorkerPlacement(env, value, credentials = {}) {
   }
   if (!/^[a-f0-9]{32}$/i.test(accountId)) throw new Error("CF_ACCOUNT_ID باید شناسه ۳۲ کاراکتری حساب Cloudflare باشد.");
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(scriptName)) throw new Error("CF_WORKER_NAME نام Worker معتبری نیست.");
-  const url = "https://api.cloudflare.com/client/v4/accounts/" + encodeURIComponent(accountId) + "/workers/scripts/" + encodeURIComponent(scriptName) + "/script-settings";
+  // Cloudflare's documented endpoint is /settings (not /script-settings),
+  // and placement belongs inside the top-level "settings" object.
+  const url = "https://api.cloudflare.com/client/v4/accounts/" + encodeURIComponent(accountId) + "/workers/scripts/" + encodeURIComponent(scriptName) + "/settings";
   const response = await fetch(url, {
     method: "PATCH",
     headers: { Authorization: "Bearer " + apiToken, "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify({ placement: cloudflarePlacementPayload(value) })
+    body: JSON.stringify({ settings: { placement: cloudflarePlacementPayload(value) } })
   });
   let result = null;
   try { result = await response.json(); } catch {}
   if (!response.ok || result?.success === false) {
-    const apiMessage = Array.isArray(result?.errors) ? result.errors.map(error => error?.message).filter(Boolean).join("; ") : "";
-    throw new Error("Cloudflare Placement API خطا داد: " + (apiMessage || ("HTTP " + response.status)));
+    const apiMessage = Array.isArray(result?.errors) ? result.errors.map(error => {
+      const code = error?.code ? " [" + error.code + "]" : "";
+      const pointer = error?.source?.pointer ? " (" + error.source.pointer + ")" : "";
+      return String(error?.message || "Cloudflare API error") + code + pointer;
+    }).filter(Boolean).join("; ") : "";
+    throw new Error("Cloudflare Placement API خطا داد: " + (apiMessage || ("HTTP " + response.status)) + " · HTTP " + response.status);
   }
   return result;
 }
@@ -2668,8 +2674,12 @@ async function cloudflareApiJson(path, token, init = {}) {
     let data = {};
     try { data = await response.json(); } catch {}
     if (!response.ok || data?.success === false) {
-      const messages = Array.isArray(data?.errors) ? data.errors.map(item => item?.message).filter(Boolean).join("؛ ") : "";
-      throw new Error(messages || ("Cloudflare API HTTP " + response.status));
+      const messages = Array.isArray(data?.errors) ? data.errors.map(item => {
+        const code = item?.code ? " [" + item.code + "]" : "";
+        const pointer = item?.source?.pointer ? " (" + item.source.pointer + ")" : "";
+        return String(item?.message || "Cloudflare API error") + code + pointer;
+      }).filter(Boolean).join("؛ ") : "";
+      throw new Error((messages || "Cloudflare API HTTP " + response.status) + " · HTTP " + response.status);
     }
     return data;
   } finally {
@@ -2710,61 +2720,94 @@ async function discoverPlacementCredentials(env, kv, url) {
 }
 
 async function createPlacementApiToken(env, accountId, bootstrapTokenOverride = "") {
-  // The bootstrap credential is supplied per request or via CF_BOOTSTRAP_TOKEN.
-  // It is deliberately never persisted in KV/D1 or copied into global isolate state.
-  const bootstrapToken = String(bootstrapTokenOverride || env.CF_BOOTSTRAP_TOKEN || "").trim();
+  // Bootstrap token is accepted per request or via CF_BOOTSTRAP_TOKEN. Never persist it.
+  const bootstrapToken = String(bootstrapTokenOverride || env.CF_BOOTSTRAP_TOKEN || "")
+    .trim().replace(/^Bearer\s+/i, "");
   if (!bootstrapToken || bootstrapToken.length > 512) {
-    throw new Error("Bootstrap Token را وارد کنید یا Secret با نام CF_BOOTSTRAP_TOKEN را در Worker تنظیم کنید. این توکن باید از قالب Create additional tokens و مجوز User > API Tokens > Edit ساخته شده باشد.");
+    throw new Error("Bootstrap Token نامعتبر است. از قالب رسمی Create additional tokens استفاده کنید؛ این قالب مجوز User > API Tokens > Edit را فراهم می‌کند.");
   }
+
   let id = String(accountId || env.CF_ACCOUNT_ID || "").trim();
   if (!id) {
     try {
+      // Account discovery needs Account Read. The recommended Create additional tokens
+      // bootstrap normally has only API Tokens Write, so manual Account ID is the fallback.
       const accountData = await cloudflareApiJson("/accounts?page=1&per_page=50", bootstrapToken, { method: "GET" });
-      const accounts = Array.isArray(accountData.result) ? accountData.result.filter(item => /^[a-f0-9]{32}$/i.test(String(item?.id || ""))) : [];
+      const accounts = Array.isArray(accountData.result)
+        ? accountData.result.filter(item => /^[a-f0-9]{32}$/i.test(String(item?.id || ""))) : [];
       if (accounts.length === 1) id = String(accounts[0].id);
-      else if (accounts.length > 1) throw new Error("چند Account در دسترس است؛ CF_ACCOUNT_ID موردنظر را دستی وارد کنید.");
-      else throw new Error("فهرست حساب Cloudflare خالی است.");
+      else if (accounts.length > 1) throw new Error("چند حساب Cloudflare در دسترس است؛ Account ID حساب مقصد را دستی وارد کنید.");
+      else throw new Error("فهرست حساب‌های Cloudflare خالی است؛ Account ID را دستی وارد کنید.");
     } catch (error) {
-      if (/چند Account/.test(String(error?.message || ""))) throw error;
-      throw new Error("CF_ACCOUNT_ID را دستی وارد کنید؛ این Bootstrap Token اجازهٔ تشخیص خودکار حساب را ندارد یا حسابی برنگردانده است.");
+      const message = String(error?.message || "");
+      if (/چند حساب|فهرست حساب/.test(message)) throw error;
+      throw new Error("Account ID را دستی وارد کنید. Bootstrap Token با قالب Create additional tokens معمولاً مجوز فهرست‌کردن حساب‌ها (Account Read) ندارد.");
     }
   }
-  if (!/^[a-f0-9]{32}$/i.test(id)) throw new Error("CF_ACCOUNT_ID باید شناسه ۳۲ کاراکتری حساب Cloudflare باشد.");
+  if (!/^[a-f0-9]{32}$/i.test(id)) throw new Error("CF_ACCOUNT_ID باید شناسهٔ ۳۲ کاراکتری هگز حساب Cloudflare باشد.");
 
-  // User-owned API tokens use the User API Tokens Write permission at /user/tokens.
+  // For user-owned tokens Cloudflare documents this endpoint and requires API Tokens Write.
   const groupsData = await cloudflareApiJson("/user/tokens/permission_groups", bootstrapToken, { method: "GET" });
   const groups = Array.isArray(groupsData.result) ? groupsData.result : [];
-  const workerGroup = groups.find(group => String(group.name || "").trim().toLowerCase() === "workers scripts write" && group.id && group.is_selectable !== false);
-  if (!workerGroup) throw new Error("مجوز Workers Scripts Write برای این Account قابل انتخاب نیست یا Bootstrap Token اجازهٔ مشاهده Permission Groupها را ندارد.");
-
-  // Avoid leaving a permanent credential around when the browser only needs it
-  // for this placement operation. The returned token expires after one hour.
-  const THROTTLE_KEY = "__cf_token_create_throttle";
-  const lastCreate = Number(globalThis[THROTTLE_KEY] || 0);
-  if (Date.now() - lastCreate < 60000) {
-    throw new Error("برای جلوگیری از محدودیت Cloudflare، حداقل ۶۰ ثانیه بین دو ساخت Token صبر کنید.");
+  const normalizePermissionName = value => String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+  const workerGroup = groups.find(group => {
+    const nameMatches = normalizePermissionName(group?.name) === "workers scripts write";
+    const scopes = Array.isArray(group?.scopes) ? group.scopes.map(String) : [];
+    const accountScoped = !scopes.length || scopes.includes("com.cloudflare.api.account");
+    return nameMatches && group?.id && group.is_selectable !== false && accountScoped;
+  });
+  if (!workerGroup) {
+    throw new Error("Cloudflare در فهرست مجوزهای قابل انتخاب، Workers Scripts Write را برای این حساب برنگرداند. بررسی کنید Bootstrap Token از قالب Create additional tokens ساخته شده و مجوز API Tokens Write دارد.");
   }
 
-  const expiresOn = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-  const policy = {
-    id: crypto.randomUUID().replace(/-/g, ""),
-    effect: "allow",
-    permission_groups: [{ id: String(workerGroup.id), name: String(workerGroup.name || "Workers Scripts Write") }],
-    resources: { ["com.cloudflare.api.account." + id]: "*" }
-  };
-  globalThis[THROTTLE_KEY] = Date.now();
-  const created = await cloudflareApiJson("/user/tokens", bootstrapToken, {
-    method: "POST",
-    body: JSON.stringify({
-      name: "Temporary Worker Placement - " + new Date().toISOString().slice(0, 16),
-      policies: [policy],
-      expires_on: expiresOn
-    })
-  });
-  const result = created?.result || {};
-  const tokenValue = String(result.value || result.token || result.api_token || "").trim();
-  if (!tokenValue) throw new Error("Cloudflare توکن را ساخت، اما secret را در پاسخ برنگرداند. در این حالت از مسیر داشبورد Cloudflare برای ساخت Token استفاده کنید.");
-  return { token: tokenValue, id: String(result.id || ""), name: String(result.name || "Temporary Worker Placement"), expiresOn, accountId: id };
+  // Prevent concurrent accidental duplicate creation. Cooldown starts only after success,
+  // so a failed Cloudflare request does not lock the user out for the next minute.
+  const THROTTLE_KEY = "__cf_token_create_throttle_v2";
+  const throttleState = globalThis[THROTTLE_KEY] && typeof globalThis[THROTTLE_KEY] === "object"
+    ? globalThis[THROTTLE_KEY] : { inFlight: false, lastCreatedAt: 0 };
+  if (throttleState.inFlight) throw new Error("درخواست ساخت Token دیگری در حال اجراست؛ چند لحظه صبر کنید.");
+  if (Date.now() - Number(throttleState.lastCreatedAt || 0) < 60000) {
+    throw new Error("یک Token در کمتر از ۶۰ ثانیهٔ قبل ساخته شده است؛ برای جلوگیری از ساخت Tokenهای تکراری کمی صبر کنید.");
+  }
+  throttleState.inFlight = true;
+  globalThis[THROTTLE_KEY] = throttleState;
+
+  try {
+    const policy = {
+      id: crypto.randomUUID().replace(/-/g, ""),
+      effect: "allow",
+      permission_groups: [{ id: String(workerGroup.id) }],
+      resources: { ["com.cloudflare.api.account." + id]: "*" }
+    };
+    const tokenName = "Worker Placement - " + new Date().toISOString().slice(0, 16);
+    // expires_on is intentionally omitted: Cloudflare creates a non-expiring token.
+    // The token is returned once and must be copied to Worker Secret CF_API_TOKEN
+    // if it should remain available after the current panel page is closed.
+    const created = await cloudflareApiJson("/user/tokens", bootstrapToken, {
+      method: "POST",
+      body: JSON.stringify({ name: tokenName, policies: [policy] })
+    });
+    throttleState.lastCreatedAt = Date.now();
+    const result = created?.result || {};
+    const tokenValue = typeof result.value === "string" ? result.value.trim()
+      : typeof result.value?.value === "string" ? result.value.value.trim()
+      : typeof result.token === "string" ? result.token.trim()
+      : typeof result.api_token === "string" ? result.api_token.trim() : "";
+    if (!tokenValue || tokenValue.length < 20) {
+      throw new Error("Cloudflare درخواست ساخت Token را پذیرفت اما Secret قابل استفاده در پاسخ نبود. برای امنیت، مقدار Token بعد از ساخت دوباره قابل بازیابی نیست؛ فهرست Tokenهای Cloudflare را بررسی کنید.");
+    }
+    return {
+      token: tokenValue,
+      id: String(result.id || ""),
+      name: String(result.name || tokenName),
+      expiresOn: null,
+      permanent: true,
+      accountId: id
+    };
+  } finally {
+    throttleState.inFlight = false;
+    globalThis[THROTTLE_KEY] = throttleState;
+  }
 }
 
 function validateSettings(body, env) {
@@ -6242,20 +6285,20 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
             <div class="field"><label for="cfWorkerName">CF_WORKER_NAME</label><input id="cfWorkerName" dir="ltr" maxlength="128" placeholder="worker-script-name" autocomplete="off"></div>
           </div>
           <div class="field" style="margin-top:10px">
-            <label for="cfBootstrapToken">Bootstrap Token (اختیاری؛ فقط برای ساخت Token موقت)</label>
+            <label for="cfBootstrapToken">Bootstrap Token (برای ساخت API Token دائمی)</label>
             <div class="cf-token-row"><input id="cfBootstrapToken" type="password" dir="ltr" maxlength="512" autocomplete="new-password" placeholder="Paste Cloudflare Bootstrap Token"><button type="button" class="secondary" id="toggleCfBootstrapTokenVisibilityBtn">نمایش</button></div>
             <p class="small-note">می‌توانید این مقدار را فقط در همین صفحه وارد کنید؛ به Worker، KV یا D1 ذخیره نمی‌شود. در صورت خالی بودن، Secret اختیاری <code>CF_BOOTSTRAP_TOKEN</code> در محیط Worker استفاده می‌شود.</p>
           </div>
           <div class="cf-placement-actions">
             <button type="button" class="secondary" id="refreshCfCredentialsBtn">تشخیص خودکار مشخصات</button>
-            <button type="button" class="secondary" id="createCfApiTokenBtn">ساخت Token موقت با مجوز Workers Scripts Write</button>
+            <button type="button" class="secondary" id="createCfApiTokenBtn">ساخت API Token دائمی با مجوز Workers Scripts Write</button>
           </div>
           <div id="cfApiTokenResult" class="cf-api-token-result hidden">
-            <label for="cfNewApiToken">Token موقت (فقط یک‌بار از Cloudflare دریافت می‌شود)</label>
+            <label for="cfNewApiToken">API Token دائمی (Secret فقط هنگام ساخت نمایش داده می‌شود)</label>
             <div class="cf-token-row"><input id="cfNewApiToken" type="password" dir="ltr" readonly autocomplete="off"><button type="button" class="secondary" id="toggleCfTokenVisibilityBtn">نمایش</button><button type="button" id="copyCfApiTokenBtn">کپی Token</button></div>
-            <p class="small-note" id="cfApiTokenExpiryNote">این Token در حافظهٔ همین صفحه نگهداری می‌شود و برای اعمال Placement استفاده خواهد شد؛ نیازی به ثبت CF_API_TOKEN در تنظیمات Worker نیست.</p>
+            <p class="small-note" id="cfApiTokenExpiryNote">Token دائمی است و تا زمان لغو دستی در Cloudflare اعتبار دارد. برای استفاده پس از بستن صفحه، آن را به‌عنوان Secret با نام CF_API_TOKEN در تنظیمات Worker ذخیره کنید.</p>
           </div>
-          <p class="small-note">Bootstrap Token باید User-owned و دارای مجوز <code>User &gt; API Tokens &gt; Edit</code> باشد (قالب Cloudflare با نام <code>Create additional tokens</code>). از آن برای ساخت Token جدید با مجوز <code>Workers Scripts Write</code> فقط روی همین Account استفاده می‌شود. Token تولیدشده یک ساعت اعتبار دارد؛ تا زمانی که همین صفحه باز است، برای اعمال Placement به‌صورت موقت ارسال می‌شود و در KV/D1 یا تنظیمات Worker ذخیره نمی‌شود. پس از بارگذاری مجدد صفحه، آن را دوباره بسازید. در صورت تمایل می‌توانید Token را کپی کنید، اما برای کار عادی نیازی به ساخت Secret به نام <code>CF_API_TOKEN</code> نیست.</p>
+          <p class="small-note">Bootstrap Token باید User-owned و از قالب رسمی <code>Create additional tokens</code> با مجوز <code>User &gt; API Tokens &gt; Edit</code> باشد. برای ساخت Token دائمی، مجوز <code>Workers Scripts Write</code> فقط روی همین Account اعمال می‌شود. Cloudflare مقدار Secret را فقط هنگام ساخت برمی‌گرداند؛ آن را کپی کرده و در Worker → Settings → Variables and Secrets با نام <code>CF_API_TOKEN</code> به‌صورت Secret ذخیره کنید. Worker نمی‌تواند Secretهای محیط خودش را از داخل کد تغییر دهد. تا وقتی صفحه باز است، Token ساخته‌شده برای Apply نیز در حافظهٔ همان صفحه استفاده می‌شود و در KV/D1 ذخیره نمی‌شود. اگر Account ID به‌صورت خودکار پیدا نشد، آن را دستی وارد کنید؛ قالب Bootstrap معمولاً مجوز Account Read برای فهرست‌کردن حساب‌ها ندارد.</p>
         </div>
         <div class="user-form-actions"><button type="button" id="applyWorkerPlacementBtn">ذخیره و اعمال محل اجرا</button></div>
       </div>
@@ -7260,10 +7303,10 @@ async function refreshPlacementCredentials(showMessage = false) {
     placementCredentialState = data;
     const accountOk = !!String($('cfAccountId')?.value || '').trim();
     const workerOk = !!String($('cfWorkerName')?.value || '').trim();
-    const transientReady = !!cfGeneratedPlacementToken && Date.now() < cfGeneratedPlacementTokenExpiresAt;
+    const transientReady = !!cfGeneratedPlacementToken && (!cfGeneratedPlacementTokenExpiresAt || Date.now() < cfGeneratedPlacementTokenExpiresAt);
     if (status) {
       status.textContent = accountOk && workerOk
-        ? (transientReady ? 'Token موقت آماده' : data.hasApplyToken ? 'CF_API_TOKEN آماده' : data.canCreateToken ? 'Bootstrap آماده · Token بسازید' : 'Bootstrap Token لازم است')
+        ? (transientReady ? 'API Token دائمی آماده' : data.hasApplyToken ? 'CF_API_TOKEN آماده' : data.canCreateToken ? 'Bootstrap آماده · Token بسازید' : 'Bootstrap Token لازم است')
         : 'نیازمند تکمیل دستی';
       status.className = 'pill' + (accountOk && workerOk && (transientReady || data.hasApplyToken) ? '' : ' off');
     }
@@ -7299,22 +7342,22 @@ $('createCfApiTokenBtn')?.addEventListener('click', async event => {
   const bootstrapToken = String($('cfBootstrapToken')?.value || '').trim();
   if (accountId && !/^[a-f0-9]{32}$/i.test(accountId)) return showStatus('Account ID باید ۳۲ کاراکتر hex باشد.', true);
   if (!bootstrapToken && !placementCredentialState.canCreateToken) return showStatus('Bootstrap Token را وارد کنید یا CF_BOOTSTRAP_TOKEN را در محیط Worker تعریف کنید.', true);
-  button.disabled = true; button.textContent = 'در حال ساخت Token موقت…';
+  button.disabled = true; button.textContent = 'در حال ساخت API Token دائمی…';
   try {
     const result = await api('/api/placement/token', { method: 'POST', body: JSON.stringify({ accountId, bootstrapToken }) });
     if ($('cfAccountId') && result.accountId) $('cfAccountId').value = result.accountId;
     cfGeneratedPlacementToken = String(result.apiToken || '');
-    cfGeneratedPlacementTokenExpiresAt = Date.parse(result.expiresOn || '') || (Date.now() + 60 * 60 * 1000);
+    cfGeneratedPlacementTokenExpiresAt = result.permanent === true || !result.expiresOn ? 0 : (Date.parse(result.expiresOn) || 0);
     if (!cfGeneratedPlacementToken) throw new Error('Cloudflare مقدار Token را برنگرداند.');
     const output = $('cfApiTokenResult');
     const tokenInput = $('cfNewApiToken');
     if (tokenInput) tokenInput.value = cfGeneratedPlacementToken;
-    if ($('cfApiTokenExpiryNote')) $('cfApiTokenExpiryNote').textContent = 'Token فقط تا ' + new Date(cfGeneratedPlacementTokenExpiresAt).toLocaleString() + ' معتبر است و در حافظهٔ همین صفحه برای Apply استفاده می‌شود. نیازی به ذخیرهٔ CF_API_TOKEN در تنظیمات Worker نیست.';
+    if ($('cfApiTokenExpiryNote')) $('cfApiTokenExpiryNote').textContent = 'این API Token تاریخ انقضا ندارد و تا زمان لغو دستی معتبر است. برای استفاده پس از بستن صفحه، آن را در Worker → Settings → Variables and Secrets با نام CF_API_TOKEN به‌صورت Secret ذخیره کنید. تا آن زمان، در همین صفحه برای Apply استفاده می‌شود.';
     $('cfBootstrapToken').value = '';
     output?.classList.remove('hidden');
     const status = $('cfCredentialsStatus');
     if (status) { status.textContent = 'توکن موقت آمادهٔ اعمال'; status.className = 'pill'; }
-    showStatus('Token محدود یک‌ساعته ساخته شد؛ اکنون می‌توانید Placement را اعمال کنید.');
+    showStatus('API Token دائمی ساخته شد؛ آن را کپی و به‌عنوان Secret با نام CF_API_TOKEN ذخیره کنید. اکنون می‌توانید Placement را اعمال کنید.');
   } catch (error) {
     showStatus(error.message || String(error), true);
   } finally { button.disabled = false; button.textContent = oldText; }
@@ -7341,14 +7384,14 @@ $('applyWorkerPlacementBtn')?.addEventListener('click', async () => {
   const accountId = String($('cfAccountId')?.value || '').trim();
   const workerName = String($('cfWorkerName')?.value || '').trim();
   let temporaryApiToken = '';
-  if (cfGeneratedPlacementToken && Date.now() < cfGeneratedPlacementTokenExpiresAt) temporaryApiToken = cfGeneratedPlacementToken;
-  else if (cfGeneratedPlacementToken) {
+  if (cfGeneratedPlacementToken && (!cfGeneratedPlacementTokenExpiresAt || Date.now() < cfGeneratedPlacementTokenExpiresAt)) temporaryApiToken = cfGeneratedPlacementToken;
+  else if (cfGeneratedPlacementToken && cfGeneratedPlacementTokenExpiresAt) {
     cfGeneratedPlacementToken = ''; cfGeneratedPlacementTokenExpiresAt = 0;
     if ($('cfNewApiToken')) $('cfNewApiToken').value = '';
   }
   if (!/^[a-f0-9]{32}$/i.test(accountId)) return showStatus('CF_ACCOUNT_ID معتبر نیست؛ آن را تکمیل کنید.', true);
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(workerName)) return showStatus('CF_WORKER_NAME معتبر نیست؛ آن را تکمیل کنید.', true);
-  if (!temporaryApiToken && !placementCredentialState.hasApplyToken) return showStatus('ابتدا Bootstrap Token را وارد و Token موقت یک‌ساعته را بسازید؛ یا CF_API_TOKEN دارای مجوز Workers Scripts Write را در محیط Worker تنظیم کنید.', true);
+  if (!temporaryApiToken && !placementCredentialState.hasApplyToken) return showStatus('ابتدا با Bootstrap Token یک API Token دائمی بسازید؛ یا CF_API_TOKEN دارای مجوز Workers Scripts Write را در تنظیمات Worker قرار دهید.', true);
   button.disabled = true; button.textContent = 'در حال اعمال…';
   try {
     const current = gatherSettings(); current.workerPlacement = placement;
