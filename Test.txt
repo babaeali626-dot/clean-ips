@@ -2738,13 +2738,15 @@ async function applyCloudflareWorkerPlacement(env, value, credentials = {}, toke
   }
   if (!/^[a-f0-9]{32}$/i.test(accountId)) throw new Error("CF_ACCOUNT_ID باید شناسه ۳۲ کاراکتری حساب Cloudflare باشد.");
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(scriptName)) throw new Error("CF_WORKER_NAME نام Worker معتبری نیست.");
-  // Cloudflare's documented endpoint is /settings (not /script-settings),
-  // and placement belongs inside the top-level "settings" object.
+  // Cloudflare PATCH /settings requires multipart/form-data (not JSON).
+  // FormData sets the multipart boundary automatically; do not set Content-Type manually.
   const url = "https://api.cloudflare.com/client/v4/accounts/" + encodeURIComponent(accountId) + "/workers/scripts/" + encodeURIComponent(scriptName) + "/settings";
+  const form = new FormData();
+  form.append("settings", JSON.stringify({ placement: cloudflarePlacementPayload(value) }));
   const response = await fetch(url, {
     method: "PATCH",
-    headers: { Authorization: "Bearer " + apiToken, "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify({ settings: { placement: cloudflarePlacementPayload(value) } })
+    headers: { Authorization: "Bearer " + apiToken, accept: "application/json" },
+    body: form
   });
   let result = null;
   try { result = await response.json(); } catch {}
