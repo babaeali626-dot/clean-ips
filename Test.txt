@@ -1,4 +1,5 @@
-// BUILD_ID: cf-worker-zeus-hybrid-d1-kv-exitnodes-placement-streamcpu-telegram-webproxy-twpcf-v7-20261111
+// BUILD_ID: cf-worker-zeus-hybrid-d1-kv-exitnodes-placement-streamcpu-telegram-webproxy-twpcf-mobile-ss-token-kv-optimized-v9-20261112
+// KV optimization: session counters batched per isolate (25s / 10 threshold; 5s waitUntil margin); traffic flush 15min; settings cache 10s; TCP history cache 15s.
 // Enhanced with ZEUS-inspired features + Exact Vision UI Dashboard Redesign:
 // - Multi-user structure (users[] with traffic/expire/device/request limits, startOnFirstConnect, resetPeriod)
 // - Fragment profiles for operators (hamrah, irancell, rightel, mokhaberat, gaming, custom)
@@ -16,7 +17,7 @@ let PANEL_DB = null;
 let panelSchemaPromise = null;
 let panelSettingsCache = null;
 let panelSettingsRevision = 1;
-const PANEL_SETTINGS_CACHE_TTL_MS = 3500;
+const PANEL_SETTINGS_CACHE_TTL_MS = 10000;
 const TROJAN_HASH_CACHE_MAX = 2048;
 const trojanHashCache = new Map();
 let credentialIndexCache = null;
@@ -54,9 +55,9 @@ const DEFAULT_CLEAN_IP_SOURCE = "https://raw.githubusercontent.com/babaeali626-d
 const USER_USAGE_PREFIX = "panel-user-usage-v1:";
 const ADMIN_USAGE_KEY = "panel-admin-usage-v1";
 // KV allows one write per second per key. Traffic is therefore buffered in memory and
-// persisted only after 1 GB or every 6 minutes (and once more when a tunnel closes).
+// persisted only after 1 GB or every 15 minutes (and once more when a tunnel closes).
 const USER_TRAFFIC_FLUSH_BYTES = 1024 * 1024 * 1024;
-const USER_TRAFFIC_FLUSH_INTERVAL_MS = 6 * 60 * 1000;
+const USER_TRAFFIC_FLUSH_INTERVAL_MS = 15 * 60 * 1000;
 // Isolate-level usage cache: handshakes read/update usage from RAM instead of hitting KV.
 const USAGE_CACHE_TTL_MS = 60 * 1000;
 const USAGE_CACHE_MAX_ENTRIES = 2000;
@@ -94,6 +95,9 @@ function dohCachePut(key, answer) {
 }
 const TCP_TEST_HISTORY_KEY = "panel-tcp-test-history-v1";
 const TCP_TEST_HISTORY_LIMIT = 500;
+let tcpHistoryCache = null;
+let tcpHistoryCacheAt = 0;
+const TCP_HISTORY_CACHE_TTL_MS = 15000;
 const userActiveConnections = new Map();
 const userUsageLocks = new Map();
 // Short-lived (60 s) in-memory copy of the raw usage records, keyed by KV key.
@@ -388,9 +392,9 @@ export default {
         if (path === "/api/placement/token" && request.method === "POST") {
           try {
             const body = await readJsonLimited(request, 2048);
-            const token = await createPlacementApiToken(env, body.accountId);
-            // The API token is returned once to the authenticated panel and is never persisted by this Worker.
-            return json({ ok: true, apiToken: token.token, tokenId: token.id, tokenName: token.name, accountId: String(body.accountId || env.CF_ACCOUNT_ID || "") });
+            const token = await createPlacementApiToken(env, body.accountId, body.bootstrapToken);
+            // The generated, one-hour scoped token is returned once and is never persisted by this Worker.
+            return json({ ok: true, apiToken: token.token, tokenId: token.id, tokenName: token.name, expiresOn: token.expiresOn, accountId: token.accountId });
           } catch (err) {
             return json({ error: String(err?.message || "ساخت API Token ناموفق بود").slice(0, 260), code: "ERR_CF_TOKEN_CREATE" }, 400);
           }
@@ -401,8 +405,10 @@ export default {
             const placement = validateWorkerPlacement(body.workerPlacement || body);
             const credentials = {
               accountId: String(body.accountId || "").trim(),
-              workerName: String(body.workerName || "").trim()
+              workerName: String(body.workerName || "").trim(),
+              apiToken: String(body.apiToken || "").trim()
             };
+            if (credentials.apiToken.length > 512) throw new Error("API Token ارسالی نامعتبر یا بیش از حد طولانی است.");
             const result = await applyCloudflareWorkerPlacement(env, placement, credentials);
             return json({ ok: true, placement, status: result?.result?.placement || result?.result || null });
           } catch (err) {
@@ -1314,11 +1320,18 @@ function normalizeTcpTestHistoryEntry(item) {
 }
 
 async function loadTcpTestHistory(kv) {
+  const now = Date.now();
+  if (tcpHistoryCache && (now - tcpHistoryCacheAt) < TCP_HISTORY_CACHE_TTL_MS) {
+    return tcpHistoryCache.slice();
+  }
   if (!kv) return [];
   try {
     const raw = readKvJson(await kv.get(TCP_TEST_HISTORY_KEY, { type: "json" }));
-    return (Array.isArray(raw) ? raw : []).map(normalizeTcpTestHistoryEntry).filter(Boolean)
+    const result = (Array.isArray(raw) ? raw : []).map(normalizeTcpTestHistoryEntry).filter(Boolean)
       .sort((a, b) => b.checkedAt - a.checkedAt).slice(0, TCP_TEST_HISTORY_LIMIT);
+    tcpHistoryCache = result;
+    tcpHistoryCacheAt = now;
+    return result.slice();
   } catch (err) {
     console.warn("TCP test history read failed:", String(err?.message || err).slice(0, 120));
     return [];
@@ -1332,6 +1345,8 @@ async function appendTcpTestHistory(kv, results) {
     const current = await loadTcpTestHistory(kv);
     const combined = [...stamped, ...current].sort((a, b) => b.checkedAt - a.checkedAt).slice(0, TCP_TEST_HISTORY_LIMIT);
     await kv.put(TCP_TEST_HISTORY_KEY, JSON.stringify(combined));
+    tcpHistoryCache = null;
+    tcpHistoryCacheAt = 0;
   } catch (err) {
     console.warn("TCP test history write failed:", String(err?.message || err).slice(0, 120));
   }
@@ -2053,6 +2068,115 @@ function persistUsagePayload(kv, key, payload) {
   return state.running;
 }
 
+// Session request counters are immediately visible in RAM, but KV writes are
+// batched per isolate to reduce write volume. A trailing timer is reset on each
+// connection; 10 increments force an early flush.
+const debouncedPersistStates = new Map();
+const pendingIncrementCounts = new Map();
+// Keep this below Cloudflare waitUntil's 30s post-response ceiling to leave room for KV pacing/write latency.
+const DEBOUNCED_FLUSH_MS = 25000;
+const DEBOUNCED_FLUSH_COUNT_THRESHOLD = 10;
+
+function cancelDebouncedUsagePersist(key) {
+  const state = debouncedPersistStates.get(key);
+  if (!state) {
+    pendingIncrementCounts.delete(key);
+    return;
+  }
+  if (state.timerHandle) {
+    try { clearTimeout(state.timerHandle); } catch {}
+  }
+  debouncedPersistStates.delete(key);
+  pendingIncrementCounts.delete(key);
+  // Release any waitUntil promise associated with the cancelled timer. The
+  // immediate writer that supersedes it is awaited by its own caller.
+  if (typeof state.resolveTimer === "function") {
+    const resolve = state.resolveTimer;
+    state.resolveTimer = null;
+    resolve();
+  }
+}
+
+function queueDebouncedPersist(kv, key, payload, delayMs, ctx) {
+  const newCount = (pendingIncrementCounts.get(key) || 0) + 1;
+  pendingIncrementCounts.set(key, newCount);
+
+  let state = debouncedPersistStates.get(key);
+  if (!state) {
+    state = { payload, timerHandle: null, timerPromise: null, resolveTimer: null, waitUntilRegistered: false };
+    state.timerPromise = new Promise(resolve => { state.resolveTimer = resolve; });
+    debouncedPersistStates.set(key, state);
+  } else {
+    state.payload = payload;
+  }
+
+  // Threshold flush: cancel the trailing timer and persist the newest snapshot now.
+  if (newCount >= DEBOUNCED_FLUSH_COUNT_THRESHOLD) {
+    if (state.timerHandle) { try { clearTimeout(state.timerHandle); } catch {} }
+    debouncedPersistStates.delete(key);
+    pendingIncrementCounts.delete(key);
+    if (typeof state.resolveTimer === "function") {
+      const resolve = state.resolveTimer;
+      state.resolveTimer = null;
+      resolve();
+    }
+    return persistUsagePayload(kv, key, payload);
+  }
+
+  // Debounce from the most recent increment, not the first one.
+  if (state.timerHandle) { try { clearTimeout(state.timerHandle); } catch {} }
+  state.timerHandle = setTimeout(async () => {
+    const current = debouncedPersistStates.get(key);
+    if (!current || current !== state) {
+      if (typeof state.resolveTimer === "function") {
+        const resolve = state.resolveTimer; state.resolveTimer = null; resolve();
+      }
+      return;
+    }
+    debouncedPersistStates.delete(key);
+    pendingIncrementCounts.delete(key);
+    state.timerHandle = null;
+    try {
+      await persistUsagePayload(kv, key, current.payload);
+    } catch (err) {
+      console.warn("Debounced usage flush failed:", String(err?.message || err).slice(0, 120));
+    } finally {
+      if (typeof state.resolveTimer === "function") {
+        const resolve = state.resolveTimer; state.resolveTimer = null; resolve();
+      }
+    }
+  }, Math.max(0, Number(delayMs) || DEBOUNCED_FLUSH_MS));
+
+  if (ctx && typeof ctx.waitUntil === "function" && !state.waitUntilRegistered) {
+    try { ctx.waitUntil(state.timerPromise); state.waitUntilRegistered = true; } catch {}
+  }
+  return state.timerPromise;
+}
+
+// Merge request counters already advanced in this isolate into an immediate
+// traffic/config write. This prevents a fresh KV read in the traffic flusher
+// from overwriting session increments that are waiting in the debounce queue.
+function mergeUsageSnapshotWithCache(incoming, cached) {
+  if (!cached || typeof cached !== "object" || !incoming || typeof incoming !== "object") return incoming;
+  const samePeriod = Number(incoming.periodStartedAt || 0) === Number(cached.periodStartedAt || 0);
+  if (!samePeriod) return incoming;
+  const merged = { ...incoming };
+  merged.requestCount = Math.max(0, Math.floor(Number(incoming.requestCount) || 0), Math.floor(Number(cached.requestCount) || 0));
+  merged.usageBytes = Math.max(0, Number(incoming.usageBytes) || 0, Number(cached.usageBytes) || 0);
+  const firstTimes = [Number(incoming.firstConnectedAt) || 0, Number(cached.firstConnectedAt) || 0].filter(value => value > 0);
+  merged.firstConnectedAt = firstTimes.length ? Math.min(...firstTimes) : 0;
+  merged.lastConnectedAt = Math.max(Number(incoming.lastConnectedAt) || 0, Number(cached.lastConnectedAt) || 0);
+  const daily = new Map(normalizeDailyUsageStats(incoming.dailyStats).map(item => [item.date, { ...item }]));
+  for (const item of normalizeDailyUsageStats(cached.dailyStats)) {
+    const current = daily.get(item.date) || { ...item };
+    current.requestCount = Math.max(Number(current.requestCount) || 0, Number(item.requestCount) || 0);
+    current.usageBytes = Math.max(Number(current.usageBytes) || 0, Number(item.usageBytes) || 0);
+    daily.set(item.date, current);
+  }
+  merged.dailyStats = [...daily.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-30);
+  return merged;
+}
+
 async function getUserUsage(kv, user, options = {}) {
   if (!kv) return defaultUserUsage(user);
   const raw = await readUsageRaw(kv, USER_USAGE_PREFIX + user.id, options.fresh === true);
@@ -2099,12 +2223,19 @@ function normalizeUserUsage(raw, user) {
   return usage;
 }
 
-async function saveUserUsage(kv, userId, usage) {
+async function saveUserUsage(kv, userId, usage, options = {}) {
   if (!kv) throw new Error("برای مدیریت کاربران باید KV متصل باشد.");
   const key = USER_USAGE_PREFIX + userId;
-  const payload = JSON.stringify(usage);
-  // The RAM cache is updated synchronously (before any await) so parallel handshakes see it at once.
+  const debounceMs = Math.max(0, Number(options.debounceMs) || 0);
+  const nextUsage = debounceMs > 0 ? usage : mergeUsageSnapshotWithCache(usage, usageCacheGet(key));
+  const payload = JSON.stringify(nextUsage);
+  // The RAM cache is updated synchronously so dashboard reads and parallel
+  // handshakes see the newest counters before the deferred KV write.
   usageCacheSet(key, JSON.parse(payload));
+  if (debounceMs > 0) return queueDebouncedPersist(kv, key, payload, debounceMs, options.ctx);
+  // An immediate traffic/config write includes the RAM counters; cancel an older
+  // delayed snapshot so it cannot overwrite the newer traffic payload later.
+  cancelDebouncedUsagePersist(key);
   await persistUsagePayload(kv, key, payload);
 }
 
@@ -2126,11 +2257,17 @@ async function getAdminUsage(kv, options = {}) {
   return normalizeAdminUsage(raw || {});
 }
 
-async function saveAdminUsage(kv, usage) {
+async function saveAdminUsage(kv, usage, options = {}) {
   if (!kv) return;
-  const payload = JSON.stringify(normalizeAdminUsage(usage));
-  usageCacheSet(ADMIN_USAGE_KEY, JSON.parse(payload));
-  await persistUsagePayload(kv, ADMIN_USAGE_KEY, payload);
+  const key = ADMIN_USAGE_KEY;
+  const debounceMs = Math.max(0, Number(options.debounceMs) || 0);
+  const normalized = normalizeAdminUsage(usage);
+  const nextUsage = debounceMs > 0 ? normalized : normalizeAdminUsage(mergeUsageSnapshotWithCache(normalized, usageCacheGet(key)));
+  const payload = JSON.stringify(nextUsage);
+  usageCacheSet(key, JSON.parse(payload));
+  if (debounceMs > 0) return queueDebouncedPersist(kv, key, payload, debounceMs, options.ctx);
+  cancelDebouncedUsagePersist(key);
+  await persistUsagePayload(kv, key, payload);
 }
 
 // Per-isolate write pacing/coalescing so that concurrent tunnels of the same account
@@ -2248,7 +2385,7 @@ async function beginUserSession(kv, candidate, ctx = null) {
       usage.lastConnectedAt = now;
       if (!usage.firstConnectedAt) usage.firstConnectedAt = now;
       addDailyUsage(usage, utcUsageDayKey(now), 1, 0);
-      persistInBackground(saveAdminUsage(kv, usage));
+      persistInBackground(saveAdminUsage(kv, usage, { debounceMs: DEBOUNCED_FLUSH_MS, ctx }));
       userActiveConnections.set("default", (userActiveConnections.get("default") || 0) + 1);
       return { user: candidate, usage, trafficState, tracked: true };
     }
@@ -2289,13 +2426,13 @@ async function beginUserSession(kv, candidate, ctx = null) {
     const trafficState = getLocalUserTrafficState(id, usage);
     // Quota is checked against max(stored, this isolate's live ledger) but only the stored
     // figure is persisted: unflushed ledger bytes are added later by the traffic flush and
-    // must not be written twice (matters with the 1 GB / 6 min flush window).
+    // must not be written twice (matters with the 1 GB / 15 min flush window).
     const accessError = getUserAccessError(candidate, { ...usage, usageBytes: Math.max(Number(usage.usageBytes) || 0, trafficState.usageBytes) }, now);
     if (accessError) throw new Error(accessError);
     usage.requestCount++;
     usage.lastConnectedAt = now;
     addDailyUsage(usage, utcUsageDayKey(now), 1, 0);
-    persistInBackground(saveUserUsage(kv, id, usage));
+    persistInBackground(saveUserUsage(kv, id, usage, { debounceMs: DEBOUNCED_FLUSH_MS, ctx }));
     return { user: candidate, usage, trafficState, tracked: true };
   } catch (err) {
     const current = userActiveConnections.get(id) || 0;
@@ -2379,6 +2516,9 @@ async function reconcileUserUsageConfigs(kv, previousUsers, nextUsers) {
       const id = String(oldUser.id);
       if (!nextIds.has(id)) {
         try {
+          // Cancel delayed session-counter persistence before deleting a removed
+          // user's usage key, otherwise a pending timer could recreate the key.
+          cancelDebouncedUsagePersist(USER_USAGE_PREFIX + id);
           await waitForUsageWrite(USER_USAGE_PREFIX + id);
           await kv.delete(USER_USAGE_PREFIX + id);
           usageCacheDelete(USER_USAGE_PREFIX + id);
@@ -2476,10 +2616,10 @@ function cloudflarePlacementPayload(value) {
 
 async function applyCloudflareWorkerPlacement(env, value, credentials = {}) {
   const accountId = String(credentials.accountId || env.CF_ACCOUNT_ID || "").trim();
-  const apiToken = String(env.CF_API_TOKEN || env.CF_BOOTSTRAP_TOKEN || "").trim();
+  const apiToken = String(credentials.apiToken || env.CF_API_TOKEN || "").trim();
   const scriptName = String(credentials.workerName || env.CF_WORKER_NAME || "").trim();
   if (!accountId || !apiToken || !scriptName) {
-    throw new Error("برای اعمال واقعی Placement باید سه Secret/Variable با نام‌های CF_ACCOUNT_ID، CF_API_TOKEN و CF_WORKER_NAME در تنظیمات Worker تعریف شوند.");
+    throw new Error("برای اعمال Placement، CF_ACCOUNT_ID و CF_WORKER_NAME و یک Token دارای مجوز Workers Scripts Write لازم است؛ Token می‌تواند CF_API_TOKEN یا Token موقت ساخته‌شده در همین پنل باشد.");
   }
   if (!/^[a-f0-9]{32}$/i.test(accountId)) throw new Error("CF_ACCOUNT_ID باید شناسه ۳۲ کاراکتری حساب Cloudflare باشد.");
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(scriptName)) throw new Error("CF_WORKER_NAME نام Worker معتبری نیست.");
@@ -2564,48 +2704,67 @@ async function discoverPlacementCredentials(env, kv, url) {
     accountIdAutoDetected: accountAutoDetected || !!env.CF_ACCOUNT_ID,
     workerNameAutoDetected: !!(env.CF_WORKER_NAME || env.WORKER_NAME || env.SCRIPT_NAME || inferCloudflareWorkerName(url.hostname)),
     hasApplyToken: !!env.CF_API_TOKEN,
-    canCreateToken: !!discoveryToken,
+    canCreateToken: !!String(env.CF_BOOTSTRAP_TOKEN || "").trim(),
     accounts: accounts.length > 1 ? accounts : []
   };
 }
 
-async function createPlacementApiToken(env, accountId) {
-  // Simple per-isolate throttle to avoid hammering Cloudflare token creation
+async function createPlacementApiToken(env, accountId, bootstrapTokenOverride = "") {
+  // The bootstrap credential is supplied per request or via CF_BOOTSTRAP_TOKEN.
+  // It is deliberately never persisted in KV/D1 or copied into global isolate state.
+  const bootstrapToken = String(bootstrapTokenOverride || env.CF_BOOTSTRAP_TOKEN || "").trim();
+  if (!bootstrapToken || bootstrapToken.length > 512) {
+    throw new Error("Bootstrap Token را وارد کنید یا Secret با نام CF_BOOTSTRAP_TOKEN را در Worker تنظیم کنید. این توکن باید از قالب Create additional tokens و مجوز User > API Tokens > Edit ساخته شده باشد.");
+  }
+  let id = String(accountId || env.CF_ACCOUNT_ID || "").trim();
+  if (!id) {
+    try {
+      const accountData = await cloudflareApiJson("/accounts?page=1&per_page=50", bootstrapToken, { method: "GET" });
+      const accounts = Array.isArray(accountData.result) ? accountData.result.filter(item => /^[a-f0-9]{32}$/i.test(String(item?.id || ""))) : [];
+      if (accounts.length === 1) id = String(accounts[0].id);
+      else if (accounts.length > 1) throw new Error("چند Account در دسترس است؛ CF_ACCOUNT_ID موردنظر را دستی وارد کنید.");
+      else throw new Error("فهرست حساب Cloudflare خالی است.");
+    } catch (error) {
+      if (/چند Account/.test(String(error?.message || ""))) throw error;
+      throw new Error("CF_ACCOUNT_ID را دستی وارد کنید؛ این Bootstrap Token اجازهٔ تشخیص خودکار حساب را ندارد یا حسابی برنگردانده است.");
+    }
+  }
+  if (!/^[a-f0-9]{32}$/i.test(id)) throw new Error("CF_ACCOUNT_ID باید شناسه ۳۲ کاراکتری حساب Cloudflare باشد.");
+
+  // User-owned API tokens use the User API Tokens Write permission at /user/tokens.
+  const groupsData = await cloudflareApiJson("/user/tokens/permission_groups", bootstrapToken, { method: "GET" });
+  const groups = Array.isArray(groupsData.result) ? groupsData.result : [];
+  const workerGroup = groups.find(group => String(group.name || "").trim().toLowerCase() === "workers scripts write" && group.id && group.is_selectable !== false);
+  if (!workerGroup) throw new Error("مجوز Workers Scripts Write برای این Account قابل انتخاب نیست یا Bootstrap Token اجازهٔ مشاهده Permission Groupها را ندارد.");
+
+  // Avoid leaving a permanent credential around when the browser only needs it
+  // for this placement operation. The returned token expires after one hour.
   const THROTTLE_KEY = "__cf_token_create_throttle";
   const lastCreate = Number(globalThis[THROTTLE_KEY] || 0);
   if (Date.now() - lastCreate < 60000) {
     throw new Error("برای جلوگیری از محدودیت Cloudflare، حداقل ۶۰ ثانیه بین دو ساخت Token صبر کنید.");
   }
-  globalThis[THROTTLE_KEY] = Date.now();
-  const bootstrapToken = String(env.CF_BOOTSTRAP_TOKEN || env.CF_API_TOKEN || "").trim();
-  if (!bootstrapToken) {
-    throw new Error("برای ساخت خودکار Token، ابتدا Secret با نام CF_BOOTSTRAP_TOKEN را در Worker تعریف کنید. این Token اولیه باید مجوز Account API Tokens Write داشته باشد.");
-  }
-  const id = String(accountId || env.CF_ACCOUNT_ID || "").trim();
-  if (!/^[a-f0-9]{32}$/i.test(id)) throw new Error("ابتدا Account ID معتبر را وارد کنید یا دسترسی خواندن فهرست Accountها را به Token اولیه بدهید.");
 
-  const groupsData = await cloudflareApiJson("/accounts/" + encodeURIComponent(id) + "/tokens/permission_groups", bootstrapToken, { method: "GET" });
-  const groups = Array.isArray(groupsData.result) ? groupsData.result : [];
-  const workerGroup = groups.find(group => String(group.name || "").trim().toLowerCase() === "workers scripts write" && group.id && group.is_selectable !== false);
-  if (!workerGroup) throw new Error("مجوز Workers Scripts Write برای این Account در دسترس نیست یا Token اولیه اجازه مشاهده Permission Groupها را ندارد.");
-
+  const expiresOn = new Date(Date.now() + 60 * 60 * 1000).toISOString();
   const policy = {
     id: crypto.randomUUID().replace(/-/g, ""),
     effect: "allow",
-    permission_groups: [{ id: String(workerGroup.id) }],
+    permission_groups: [{ id: String(workerGroup.id), name: String(workerGroup.name || "Workers Scripts Write") }],
     resources: { ["com.cloudflare.api.account." + id]: "*" }
   };
-  const created = await cloudflareApiJson("/accounts/" + encodeURIComponent(id) + "/tokens", bootstrapToken, {
+  globalThis[THROTTLE_KEY] = Date.now();
+  const created = await cloudflareApiJson("/user/tokens", bootstrapToken, {
     method: "POST",
     body: JSON.stringify({
-      name: "Worker Placement - " + new Date().toISOString().slice(0, 10),
-      policies: [policy]
+      name: "Temporary Worker Placement - " + new Date().toISOString().slice(0, 16),
+      policies: [policy],
+      expires_on: expiresOn
     })
   });
   const result = created?.result || {};
   const tokenValue = String(result.value || result.token || result.api_token || "").trim();
-  if (!tokenValue) throw new Error("Cloudflare توکن را ساخت، اما مقدار محرمانه را در پاسخ برنگرداند. برای امنیت، مقدار Token فقط هنگام ایجاد قابل دریافت است؛ از داشبورد Cloudflare یک Token بسازید.");
-  return { token: tokenValue, id: String(result.id || ""), name: String(result.name || policy.name || "Worker Placement") };
+  if (!tokenValue) throw new Error("Cloudflare توکن را ساخت، اما secret را در پاسخ برنگرداند. در این حالت از مسیر داشبورد Cloudflare برای ساخت Token استفاده کنید.");
+  return { token: tokenValue, id: String(result.id || ""), name: String(result.name || "Temporary Worker Placement"), expiresOn, accountId: id };
 }
 
 function validateSettings(body, env) {
@@ -3180,7 +3339,10 @@ function base64Utf8(text) { return btoa(Array.from(enc.encode(text), b => String
 // -------------------- Telegram Web Proxy (TWP-CF) runtime --------------------
 // Protocol engine adapted from https://github.com/ToiCF/CF-Workers-TGProxy/blob/main/telegram_webproxy.js
 // TWP bridge configuration is persisted separately by the panel; sessions/leases and
-// relay streams below intentionally remain in Worker-isolate memory only.
+// relay streams below intentionally remain in Worker-isolate memory only. The injected
+// TelegramWebProxy / loopback MessagePort bridge is a client-side WebView contract, not a
+// conventional SOCKS5 or raw MTProto proxy listener; clients without this native bridge
+// cannot use the resulting tg://webproxy entry as an ordinary mobile proxy.
 const TWP_RUNTIME = (() => {
   const CFG = { dnPack: 32 * 1024, upPack: 20 * 1024, dnMs: 1 };
   const txt = new TextEncoder(), dec = new TextDecoder(), nil = new Uint8Array(0), badHead = new Set(['HEAD', 'POST', 'GET ', 'OPTI']);
@@ -3548,7 +3710,7 @@ function base64Utf8Standard(value) {
 
 function makeShadowsocksUri(settings, item, host, password) {
   const method = SHADOWSOCKS_METHODS.has(settings.shadowsocksMethod) ? settings.shadowsocksMethod : "aes-256-gcm";
-  const pluginOptions = ["mode=websocket", "host=" + cleanHost(host), "path=" + shadowsocksWsPath(settings, item.exitId)];
+  const pluginOptions = ["mux=0", "mode=websocket", "host=" + cleanHost(host), "path=" + shadowsocksWsPath(settings, item.exitId)];
   if (item.isTls) pluginOptions.push("tls");
   const credentials = base64Utf8Standard(method + ":" + password);
   const plugin = encodeURIComponent("v2ray-plugin;" + pluginOptions.join(";"));
@@ -6039,7 +6201,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
           <h2>Shadowsocks</h2>
           <label class="check-label"><span>فعال‌سازی Shadowsocks در اشتراک‌ها و خروجی‌ها</span><input type="checkbox" id="shadowsocksEnabled"></label>
           <div class="field" style="max-width:360px;"><label for="shadowsocksMethod">روش رمزنگاری AEAD</label><select id="shadowsocksMethod"><option value="aes-256-gcm">AES-256-GCM (پیشنهادی)</option><option value="aes-128-gcm">AES-128-GCM</option></select></div>
-          <p class="small-note">رمز Shadowsocks برای مدیر از UUID اصلی و برای هر ساب‌کاربر از UUID همان کاربر ساخته می‌شود. خروجی از AEAD استاندارد Shadowsocks و افزونه v2ray-plugin روی WebSocket استفاده می‌کند؛ UDP/UDP relay در Worker پشتیبانی نمی‌شود.</p>
+          <p class="small-note">رمز Shadowsocks برای مدیر از UUID اصلی و برای هر ساب‌کاربر از UUID همان کاربر ساخته می‌شود. خروجی از AEAD استاندارد Shadowsocks و افزونهٔ v2ray-plugin روی WebSocket استفاده می‌کند؛ انتقال این پیاده‌سازی TCP-only است و UDP یا UDP relay (از جمله QUIC/Hysteria2 در v2ray-plugin) پشتیبانی نمی‌شود. گزینهٔ mux=0 برای سازگاری با یک جریان TCP روی هر WebSocket در لینک‌ها اعمال شده است.</p>
         </div>
       </div>
       <p class="small-note" style="margin-top:12px;">ذخیره‌سازی ترکیبی: برای فعال‌شدن D1+KV، یک D1 Database با Binding نام <code dir="ltr">DB</code> و یک KV Namespace با Binding نام <code dir="ltr">SETTINGS</code> متصل کنید. بدون DB، حالت سازگاری KV فعال می‌ماند.</p>
@@ -6079,16 +6241,21 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
             <div class="field"><label for="cfAccountId">CF_ACCOUNT_ID</label><input id="cfAccountId" dir="ltr" inputmode="text" maxlength="32" placeholder="32-character Account ID" autocomplete="off"></div>
             <div class="field"><label for="cfWorkerName">CF_WORKER_NAME</label><input id="cfWorkerName" dir="ltr" maxlength="128" placeholder="worker-script-name" autocomplete="off"></div>
           </div>
+          <div class="field" style="margin-top:10px">
+            <label for="cfBootstrapToken">Bootstrap Token (اختیاری؛ فقط برای ساخت Token موقت)</label>
+            <div class="cf-token-row"><input id="cfBootstrapToken" type="password" dir="ltr" maxlength="512" autocomplete="new-password" placeholder="Paste Cloudflare Bootstrap Token"><button type="button" class="secondary" id="toggleCfBootstrapTokenVisibilityBtn">نمایش</button></div>
+            <p class="small-note">می‌توانید این مقدار را فقط در همین صفحه وارد کنید؛ به Worker، KV یا D1 ذخیره نمی‌شود. در صورت خالی بودن، Secret اختیاری <code>CF_BOOTSTRAP_TOKEN</code> در محیط Worker استفاده می‌شود.</p>
+          </div>
           <div class="cf-placement-actions">
             <button type="button" class="secondary" id="refreshCfCredentialsBtn">تشخیص خودکار مشخصات</button>
-            <button type="button" class="secondary" id="createCfApiTokenBtn">ساخت خودکار و دریافت API Token</button>
+            <button type="button" class="secondary" id="createCfApiTokenBtn">ساخت Token موقت با مجوز Workers Scripts Write</button>
           </div>
           <div id="cfApiTokenResult" class="cf-api-token-result hidden">
-            <label for="cfNewApiToken">API Token جدید (فقط همین یک‌بار نمایش داده می‌شود)</label>
+            <label for="cfNewApiToken">Token موقت (فقط یک‌بار از Cloudflare دریافت می‌شود)</label>
             <div class="cf-token-row"><input id="cfNewApiToken" type="password" dir="ltr" readonly autocomplete="off"><button type="button" class="secondary" id="toggleCfTokenVisibilityBtn">نمایش</button><button type="button" id="copyCfApiTokenBtn">کپی Token</button></div>
-            <p class="small-note">این مقدار را در Cloudflare → Worker → Settings → Variables and Secrets با نام <code>CF_API_TOKEN</code> به‌صورت Secret ثبت کنید. Worker نمی‌تواند Secretهای محیط اجرای خودش را از داخل پنل تغییر دهد.</p>
+            <p class="small-note" id="cfApiTokenExpiryNote">این Token در حافظهٔ همین صفحه نگهداری می‌شود و برای اعمال Placement استفاده خواهد شد؛ نیازی به ثبت CF_API_TOKEN در تنظیمات Worker نیست.</p>
           </div>
-          <p class="small-note">ساخت Token به یک Token اولیه با مجوز <code>Account API Tokens Write</code> نیاز دارد. آن را فقط با نام <code>CF_BOOTSTRAP_TOKEN</code> در تنظیمات Worker به‌صورت Secret تعریف کنید. Token ساخته‌شده فقط مجوز <code>Workers Scripts Write</code> برای همین Account می‌گیرد.</p>
+          <p class="small-note">Bootstrap Token باید User-owned و دارای مجوز <code>User &gt; API Tokens &gt; Edit</code> باشد (قالب Cloudflare با نام <code>Create additional tokens</code>). از آن برای ساخت Token جدید با مجوز <code>Workers Scripts Write</code> فقط روی همین Account استفاده می‌شود. Token تولیدشده یک ساعت اعتبار دارد؛ تا زمانی که همین صفحه باز است، برای اعمال Placement به‌صورت موقت ارسال می‌شود و در KV/D1 یا تنظیمات Worker ذخیره نمی‌شود. پس از بارگذاری مجدد صفحه، آن را دوباره بسازید. در صورت تمایل می‌توانید Token را کپی کنید، اما برای کار عادی نیازی به ساخت Secret به نام <code>CF_API_TOKEN</code> نیست.</p>
         </div>
         <div class="user-form-actions"><button type="button" id="applyWorkerPlacementBtn">ذخیره و اعمال محل اجرا</button></div>
       </div>
@@ -6103,7 +6270,8 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
         <div class="section-head">
           <div>
             <h2>Telegram Web Proxy (TWP-CF)</h2>
-            <p class="small-note">این قابلیت برای Telegram Web و webview دسکتاپ/اندروید است. برای اپلیکیشن موبایل از SOCKS5 استفاده کنید. نشست‌ها و وضعیت relay در حافظهٔ Worker نگهداری می‌شوند.</p>
+            <p class="small-note">TWP-CF یک WebSocket Web Proxy برای کلاینت تلگرامی است که WebView Bridge بومی را پیاده‌سازی کرده باشد (Desktop و برخی buildهای Android سازگار). این لینک پروکسی معمولی MTProto یا SOCKS5 نیست و در صفحهٔ تنظیمات Proxy هر نسخهٔ تلگرام موبایل کار نمی‌کند؛ برای استفادهٔ عادی در اپلیکیشن موبایل، از SOCKS5 پایین همین صفحه استفاده کنید. نشست‌ها و وضعیت relay فقط در حافظهٔ isolate نگهداری می‌شوند.</p>
+            <div class="notice-box" style="margin-top:10px">راهنمای استفاده: لینک «صفحهٔ Bridge» را فقط در Telegram client دارای WebView Bridge باز کنید. صفحهٔ Bridge خودش دکمهٔ Import عمومی ندارد؛ نمایش/تأیید اتصال را کلاینت سازگار انجام می‌دهد. اگر تلگرام لینک را به‌عنوان Web Proxy نشناخت یا صفحه را در WebView اختصاصی باز نکرد، این قابلیت روی آن build در دسترس نیست و باید از SOCKS5 استفاده کنید. تغییر server به IP دلخواه پشتیبانی نمی‌شود، چون امضای Bridge و TLS به hostname دامنه متصل است.</div>
           </div>
           <span class="pill off" id="twpStatusPill">در انتظار بررسی</span>
         </div>
@@ -6451,8 +6619,11 @@ function renderTwpProxy() {
     }
     links.appendChild(row);
   };
-  add('لینک Telegram Web / WebView', twpProxyState.links.webBridge, twpProxyState.links.webBridge, true);
-  add('لینک افزودن Web Proxy به تلگرام', twpProxyState.links.tg, twpProxyState.links.tg, true);
+  add('صفحهٔ Bridge برای WebView پشتیبانی‌شده', twpProxyState.links.webBridge, twpProxyState.links.webBridge, true);
+  add('لینک افزودن WEB Proxy (فقط کلاینت سازگار)', twpProxyState.links.tg, twpProxyState.links.tg, true);
+  const guide = document.createElement('p'); guide.className = 'small-note';
+  guide.textContent = 'ابتدا لینک Bridge را در کلاینتی باز کنید که TelegramWebProxy / WebView carrier را پشتیبانی می‌کند. این قابلیت را به‌عنوان SOCKS5 یا MTProto معمولی وارد نکنید؛ برای کلاینت موبایل فاقد این قابلیت، لینک SOCKS5 را انتخاب کنید.';
+  links.appendChild(guide);
 }
 async function twpProxyAction(action) {
   try {
@@ -7086,11 +7257,15 @@ async function refreshPlacementCredentials(showMessage = false) {
     const data = await api('/api/placement/credentials');
     if ($('cfAccountId') && data.accountId && (data.accountIdAutoDetected || !$('cfAccountId').value.trim())) $('cfAccountId').value = data.accountId;
     if ($('cfWorkerName') && data.workerName && (data.workerNameAutoDetected || !$('cfWorkerName').value.trim())) $('cfWorkerName').value = data.workerName;
+    placementCredentialState = data;
     const accountOk = !!String($('cfAccountId')?.value || '').trim();
     const workerOk = !!String($('cfWorkerName')?.value || '').trim();
+    const transientReady = !!cfGeneratedPlacementToken && Date.now() < cfGeneratedPlacementTokenExpiresAt;
     if (status) {
-      status.textContent = accountOk && workerOk ? (data.hasApplyToken ? 'اتصال آماده بررسی' : 'مشخصات آماده · API Token ثبت نشده') : 'نیازمند تکمیل دستی';
-      status.className = 'pill' + (accountOk && workerOk && data.hasApplyToken ? '' : ' off');
+      status.textContent = accountOk && workerOk
+        ? (transientReady ? 'Token موقت آماده' : data.hasApplyToken ? 'CF_API_TOKEN آماده' : data.canCreateToken ? 'Bootstrap آماده · Token بسازید' : 'Bootstrap Token لازم است')
+        : 'نیازمند تکمیل دستی';
+      status.className = 'pill' + (accountOk && workerOk && (transientReady || data.hasApplyToken) ? '' : ' off');
     }
     if (showMessage) showStatus(accountOk && workerOk ? 'مشخصات حساب و Worker دریافت شد.' : 'بعضی مشخصات قابل تشخیص نبود؛ فیلدهای خالی را تکمیل کنید.', !(accountOk && workerOk));
     return data;
@@ -7103,21 +7278,43 @@ async function refreshPlacementCredentials(showMessage = false) {
   }
 }
 
+let cfGeneratedPlacementToken = "";
+let cfGeneratedPlacementTokenExpiresAt = 0;
+let placementCredentialState = { hasApplyToken: false, canCreateToken: false };
+
 $('refreshCfCredentialsBtn')?.addEventListener('click', () => { void refreshPlacementCredentials(true); });
+
+$('toggleCfBootstrapTokenVisibilityBtn')?.addEventListener('click', event => {
+  const input = $('cfBootstrapToken');
+  if (!input) return;
+  const show = input.type === 'password';
+  input.type = show ? 'text' : 'password';
+  event.currentTarget.textContent = show ? 'مخفی‌کردن' : 'نمایش';
+});
 
 $('createCfApiTokenBtn')?.addEventListener('click', async event => {
   const button = event.currentTarget;
   const oldText = button.textContent;
   const accountId = String($('cfAccountId')?.value || '').trim();
-  if (!/^[a-f0-9]{32}$/i.test(accountId)) return showStatus('ابتدا Account ID معتبر را وارد کنید یا تشخیص خودکار را اجرا کنید.', true);
-  button.disabled = true; button.textContent = 'در حال ساخت Token…';
+  const bootstrapToken = String($('cfBootstrapToken')?.value || '').trim();
+  if (accountId && !/^[a-f0-9]{32}$/i.test(accountId)) return showStatus('Account ID باید ۳۲ کاراکتر hex باشد.', true);
+  if (!bootstrapToken && !placementCredentialState.canCreateToken) return showStatus('Bootstrap Token را وارد کنید یا CF_BOOTSTRAP_TOKEN را در محیط Worker تعریف کنید.', true);
+  button.disabled = true; button.textContent = 'در حال ساخت Token موقت…';
   try {
-    const result = await api('/api/placement/token', { method: 'POST', body: JSON.stringify({ accountId }) });
+    const result = await api('/api/placement/token', { method: 'POST', body: JSON.stringify({ accountId, bootstrapToken }) });
+    if ($('cfAccountId') && result.accountId) $('cfAccountId').value = result.accountId;
+    cfGeneratedPlacementToken = String(result.apiToken || '');
+    cfGeneratedPlacementTokenExpiresAt = Date.parse(result.expiresOn || '') || (Date.now() + 60 * 60 * 1000);
+    if (!cfGeneratedPlacementToken) throw new Error('Cloudflare مقدار Token را برنگرداند.');
     const output = $('cfApiTokenResult');
     const tokenInput = $('cfNewApiToken');
-    if (tokenInput) tokenInput.value = result.apiToken || '';
+    if (tokenInput) tokenInput.value = cfGeneratedPlacementToken;
+    if ($('cfApiTokenExpiryNote')) $('cfApiTokenExpiryNote').textContent = 'Token فقط تا ' + new Date(cfGeneratedPlacementTokenExpiresAt).toLocaleString() + ' معتبر است و در حافظهٔ همین صفحه برای Apply استفاده می‌شود. نیازی به ذخیرهٔ CF_API_TOKEN در تنظیمات Worker نیست.';
+    $('cfBootstrapToken').value = '';
     output?.classList.remove('hidden');
-    showStatus('API Token محدود ساخته شد. آن را به‌صورت Secret با نام CF_API_TOKEN در Cloudflare ثبت کنید.');
+    const status = $('cfCredentialsStatus');
+    if (status) { status.textContent = 'توکن موقت آمادهٔ اعمال'; status.className = 'pill'; }
+    showStatus('Token محدود یک‌ساعته ساخته شد؛ اکنون می‌توانید Placement را اعمال کنید.');
   } catch (error) {
     showStatus(error.message || String(error), true);
   } finally { button.disabled = false; button.textContent = oldText; }
@@ -7132,20 +7329,26 @@ $('toggleCfTokenVisibilityBtn')?.addEventListener('click', event => {
 });
 
 $('copyCfApiTokenBtn')?.addEventListener('click', async () => {
-  const value = $('cfNewApiToken')?.value || '';
-  if (!value) return showStatus('ابتدا API Token را ایجاد کنید.', true);
-  try { await navigator.clipboard.writeText(value); showStatus('API Token کپی شد. آن را در Cloudflare به‌صورت Secret ذخیره کنید.'); }
+  const value = cfGeneratedPlacementToken || $('cfNewApiToken')?.value || '';
+  if (!value) return showStatus('ابتدا API Token موقت را ایجاد کنید.', true);
+  try { await navigator.clipboard.writeText(value); showStatus('Token موقت کپی شد؛ مراقب نگهداری آن باشید.'); }
   catch { showStatus('کپی خودکار مجاز نیست؛ Token را دستی انتخاب کنید.', true); }
 });
-
 $('applyWorkerPlacementBtn')?.addEventListener('click', async () => {
   const button = $('applyWorkerPlacementBtn');
   const placement = readWorkerPlacement();
   const oldText = button.textContent;
   const accountId = String($('cfAccountId')?.value || '').trim();
   const workerName = String($('cfWorkerName')?.value || '').trim();
+  let temporaryApiToken = '';
+  if (cfGeneratedPlacementToken && Date.now() < cfGeneratedPlacementTokenExpiresAt) temporaryApiToken = cfGeneratedPlacementToken;
+  else if (cfGeneratedPlacementToken) {
+    cfGeneratedPlacementToken = ''; cfGeneratedPlacementTokenExpiresAt = 0;
+    if ($('cfNewApiToken')) $('cfNewApiToken').value = '';
+  }
   if (!/^[a-f0-9]{32}$/i.test(accountId)) return showStatus('CF_ACCOUNT_ID معتبر نیست؛ آن را تکمیل کنید.', true);
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(workerName)) return showStatus('CF_WORKER_NAME معتبر نیست؛ آن را تکمیل کنید.', true);
+  if (!temporaryApiToken && !placementCredentialState.hasApplyToken) return showStatus('ابتدا Bootstrap Token را وارد و Token موقت یک‌ساعته را بسازید؛ یا CF_API_TOKEN دارای مجوز Workers Scripts Write را در محیط Worker تنظیم کنید.', true);
   button.disabled = true; button.textContent = 'در حال اعمال…';
   try {
     const current = gatherSettings(); current.workerPlacement = placement;
@@ -7153,7 +7356,7 @@ $('applyWorkerPlacementBtn')?.addEventListener('click', async () => {
     const saved = await api('/api/settings', { method: 'POST', body: JSON.stringify(current) });
     globalSettings = saved.settings;
     fillForm(saved.settings);
-    await api('/api/placement/apply', { method: 'POST', body: JSON.stringify({ workerPlacement: placement, accountId, workerName }) });
+    await api('/api/placement/apply', { method: 'POST', body: JSON.stringify({ workerPlacement: placement, accountId, workerName, apiToken: temporaryApiToken }) });
     showStatus('محل اجرای Worker در Cloudflare اعمال شد: ' + (placement.mode === 'smart' ? 'Smart' : placement.provider + ':' + placement.region));
   } catch (error) {
     showStatus(error.message || String(error), true);
