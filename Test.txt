@@ -2714,17 +2714,17 @@ async function discoverPlacementCredentials(env, kv, url) {
     accountIdAutoDetected: accountAutoDetected || !!env.CF_ACCOUNT_ID,
     workerNameAutoDetected: !!(env.CF_WORKER_NAME || env.WORKER_NAME || env.SCRIPT_NAME || inferCloudflareWorkerName(url.hostname)),
     hasApplyToken: !!env.CF_API_TOKEN,
-    canCreateToken: !!String(env.CF_BOOTSTRAP_TOKEN || "").trim(),
+    canCreateToken: !!String(env.CF_BOOTSTRAP_TOKEN || env.CF_API_TOKEN || "").trim(),
     accounts: accounts.length > 1 ? accounts : []
   };
 }
 
 async function createPlacementApiToken(env, accountId, bootstrapTokenOverride = "") {
-  // Bootstrap token is accepted per request or via CF_BOOTSTRAP_TOKEN. Never persist it.
-  const bootstrapToken = String(bootstrapTokenOverride || env.CF_BOOTSTRAP_TOKEN || "")
+  // Prefer a one-time UI value, then CF_BOOTSTRAP_TOKEN, then reuse CF_API_TOKEN if it has User > API Tokens > Edit. Never persist the supplied token.
+  const bootstrapToken = String(bootstrapTokenOverride || env.CF_BOOTSTRAP_TOKEN || env.CF_API_TOKEN || "")
     .trim().replace(/^Bearer\s+/i, "");
   if (!bootstrapToken || bootstrapToken.length > 512) {
-    throw new Error("Bootstrap Token نامعتبر است. از قالب رسمی Create additional tokens استفاده کنید؛ این قالب مجوز User > API Tokens > Edit را فراهم می‌کند.");
+    throw new Error("اعتبارنامهٔ ساخت Token پیدا نشد یا نامعتبر است. یک مقدار در فیلد Bootstrap Token وارد کنید یا CF_BOOTSTRAP_TOKEN / CF_API_TOKEN را با مجوز User > API Tokens > Edit در Worker تعریف کنید.");
   }
 
   let id = String(accountId || env.CF_ACCOUNT_ID || "").trim();
@@ -6287,7 +6287,7 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
           <div class="field" style="margin-top:10px">
             <label for="cfBootstrapToken">Bootstrap Token (برای ساخت API Token دائمی)</label>
             <div class="cf-token-row"><input id="cfBootstrapToken" type="password" dir="ltr" maxlength="512" autocomplete="new-password" placeholder="Paste Cloudflare Bootstrap Token"><button type="button" class="secondary" id="toggleCfBootstrapTokenVisibilityBtn">نمایش</button></div>
-            <p class="small-note">می‌توانید این مقدار را فقط در همین صفحه وارد کنید؛ به Worker، KV یا D1 ذخیره نمی‌شود. در صورت خالی بودن، Secret اختیاری <code>CF_BOOTSTRAP_TOKEN</code> در محیط Worker استفاده می‌شود.</p>
+            <p class="small-note">می‌توانید این مقدار را فقط در همین صفحه وارد کنید؛ به Worker، KV یا D1 ذخیره نمی‌شود. در صورت خالی بودن، Worker ابتدا Secret با نام <code>CF_BOOTSTRAP_TOKEN</code> و سپس <code>CF_API_TOKEN</code> را امتحان می‌کند؛ توکن جایگزین باید مجوز <code>User → API Tokens → Edit</code> داشته باشد.</p>
           </div>
           <div class="cf-placement-actions">
             <button type="button" class="secondary" id="refreshCfCredentialsBtn">تشخیص خودکار مشخصات</button>
@@ -7306,7 +7306,7 @@ async function refreshPlacementCredentials(showMessage = false) {
     const transientReady = !!cfGeneratedPlacementToken && (!cfGeneratedPlacementTokenExpiresAt || Date.now() < cfGeneratedPlacementTokenExpiresAt);
     if (status) {
       status.textContent = accountOk && workerOk
-        ? (transientReady ? 'API Token دائمی آماده' : data.hasApplyToken ? 'CF_API_TOKEN آماده' : data.canCreateToken ? 'Bootstrap آماده · Token بسازید' : 'Bootstrap Token لازم است')
+        ? (transientReady ? 'API Token دائمی آماده' : data.hasApplyToken ? 'CF_API_TOKEN آماده' : data.canCreateToken ? 'اعتبارنامهٔ ساخت Token موجود است' : 'اعتبارنامهٔ اولیه لازم است')
         : 'نیازمند تکمیل دستی';
       status.className = 'pill' + (accountOk && workerOk && (transientReady || data.hasApplyToken) ? '' : ' off');
     }
@@ -7341,7 +7341,7 @@ $('createCfApiTokenBtn')?.addEventListener('click', async event => {
   const accountId = String($('cfAccountId')?.value || '').trim();
   const bootstrapToken = String($('cfBootstrapToken')?.value || '').trim();
   if (accountId && !/^[a-f0-9]{32}$/i.test(accountId)) return showStatus('Account ID باید ۳۲ کاراکتر hex باشد.', true);
-  if (!bootstrapToken && !placementCredentialState.canCreateToken) return showStatus('Bootstrap Token را وارد کنید یا CF_BOOTSTRAP_TOKEN را در محیط Worker تعریف کنید.', true);
+  if (!bootstrapToken && !placementCredentialState.canCreateToken) return showStatus('هیچ اعتبارنامهٔ اولیه‌ای پیدا نشد. CF_BOOTSTRAP_TOKEN یا CF_API_TOKEN باید در Worker موجود باشد و مجوز User → API Tokens → Edit داشته باشد.', true);
   button.disabled = true; button.textContent = 'در حال ساخت API Token دائمی…';
   try {
     const result = await api('/api/placement/token', { method: 'POST', body: JSON.stringify({ accountId, bootstrapToken }) });
