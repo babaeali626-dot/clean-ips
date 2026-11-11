@@ -351,7 +351,6 @@ export default {
         if (request.method !== "GET" && !sameOrigin(request, url)) return json({ error: "Bad Origin", code: "ERR_BAD_ORIGIN" }, 403);
 
         if (path === "/api/twp/config") return await handleTwpAdminConfig(request, env, kv, url);
-        if (path === "/api/twp/stats" && request.method === "GET") return json(TWP_RUNTIME.getStats());
         if (path === "/api/ping-ip" && request.method === "POST") return await handlePingIp(request);
         if (path === "/api/telegram-proxies/test-active" && request.method === "POST") {
           const settings = await loadSettings(kv, env);
@@ -3419,16 +3418,16 @@ const TWP_RUNTIME = (() => {
   // bound KWS buffering and apply backpressure instead of growing WS queues.
   const CFG = {
     dnPack: 32 * 1024, upPack: 20 * 1024, dnMs: 1,
-    dialTimeoutMs: 7500, dialHedgeMs: 150,
+    // Keep outbound KWS handshakes bounded in the shared-carrier invocation.
+    dialTimeoutMs: 5000, dialHedgeDelayMs: 200,
     upHighWaterBytes: 512 * 1024, upLowWaterBytes: 128 * 1024, upChunkBytes: 64 * 1024,
-    dnQueueMaxBytes: 8 * 1024 * 1024
+    dnQueueMaxBytes: 8 * 1024 * 1024,
+    muxBatchBytes: 256 * 1024,
+    muxQueueMaxBytes: 2 * 1024 * 1024
   };
   const txt = new TextEncoder(), dec = new TextDecoder(), nil = new Uint8Array(0), badHead = new Set(['HEAD', 'POST', 'GET ', 'OPTI']);
   const CRYPTO = globalThis.crypto, macKeys = new Map(), leases = new Map();
-  const hostSelectionCache = new Map();
-  const stats = { startedAt: Date.now(), sessionsStarted: 0, activeWebSockets: 0, totalWebSockets: 0, activeKwsWebSockets: 0, totalKwsWebSockets: 0, activeLanes: 0, totalLanes: 0, uploadBytes: 0, downloadBytes: 0, kwsDialAttempts: 0, kwsDialSuccess: 0, kwsDialFailures: 0, kwsDialTotalMs: 0, wsProtocolErrors: 0, peakKwsQueueBytes: 0 };
   const CARRIERS = new Set(['websocket-lanes', 'websocket']);
-  const copyStats = () => ({ ...stats, uptimeSec: Math.max(0, Math.floor((Date.now() - stats.startedAt) / 1000)), hostCacheEntries: hostSelectionCache.size });
   const reply = (body = null, status = 404) => new Response(body, { status });
   function u8(v) { if (v instanceof Uint8Array && v.constructor === Uint8Array) return v; if (v instanceof ArrayBuffer) return new Uint8Array(v); if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength); throw TypeError(); }
   const dup = v => u8(v).slice();
@@ -3471,131 +3470,75 @@ const TWP_RUNTIME = (() => {
   async function cipher(head, secret, reverse) { const mat = dup(u8(head).subarray(8, 56)); if (reverse) mat.reverse(); const key = secret.byteLength ? await sha(cat(mat.subarray(0, 32), secret)) : mat.subarray(0, 32); return mkCtr(key, mat.subarray(32, 48)); }
   async function wireHead(head) { const ctr = await cipher(head, nil, false); const raw = await ctr.crypt(head); raw.set(u8(head).subarray(0, 56)); return { wire: raw, cipher: ctr }; }
   const hosts = (dc, media) => [`kws${dc}${media ? '-1' : ''}.web.telegram.org`, `kws${dc}${media ? '' : '-1'}.web.telegram.org`];
-  async function dial({ target, media, signal, onEnd }) {
-    const cacheKey = `${target + 1}:${media ? 'media' : 'api'}`;
-    const cached = hostSelectionCache.get(cacheKey);
+  async function dial({ target, media, signal, onEnd, dialGate = null }) {
+    // Stagger the alternate KWS endpoint instead of waiting for a full timeout
+    // on a degraded preferred path. The shared-session gate still bounds the
+    // number of handshakes awaiting their response headers.
     const candidates = hosts(target + 1, media);
-    if (cached && Date.now() - cached.at < 10 * 60 * 1000 && candidates.includes(cached.host)) { candidates.splice(candidates.indexOf(cached.host), 1); candidates.unshift(cached.host); }
-    else if (cached) hostSelectionCache.delete(cacheKey);
-    const startAttempt = host => {
-      const controller = new AbortController();
+    const controllers = candidates.map(() => new AbortController());
+    const attempt = async index => {
+      const controller = controllers[index];
       const abortFromParent = () => controller.abort();
       if (signal?.aborted) controller.abort();
       else signal?.addEventListener('abort', abortFromParent, { once: true });
-      const attempt = {
-        controller, kws: null, promise: null, active: false, host, startedAt: Date.now(),
-        cancel() {
-          signal?.removeEventListener('abort', abortFromParent);
-          controller.abort();
-          try { attempt.kws?.close(); } catch {}
-        }
-      };
-      stats.kwsDialAttempts++;
+      let releaseSlot = null, kws = null, selected = false;
       try {
-        if (controller.signal.aborted) throw Error('KWS dial aborted');
-        attempt.kws = mkWire(new WebSocket(`wss://${host}/apiws`, 'binary'), CFG.dialTimeoutMs, controller.signal, error => {
-          if (attempt.active) { try { onEnd?.(error); } catch {} }
+        if (dialGate) releaseSlot = await dialGate.acquire(controller.signal);
+        if (signal?.aborted || controller.signal.aborted) throw Error('KWS dial aborted');
+        kws = mkWire(new WebSocket(`wss://${candidates[index]}/apiws`, 'binary'), CFG.dialTimeoutMs, controller.signal, error => {
+          if (selected) { try { onEnd?.(error); } catch {} }
         });
-        attempt.promise = attempt.kws.ready.then(kws => {
-          stats.kwsDialSuccess++; stats.kwsDialTotalMs += Date.now() - attempt.startedAt;
-          hostSelectionCache.set(cacheKey, { host, at: Date.now() }); return kws;
-        }, error => {
-          stats.kwsDialFailures++;
-          if (hostSelectionCache.get(cacheKey)?.host === host) hostSelectionCache.delete(cacheKey);
-          signal?.removeEventListener('abort', abortFromParent); attempt.kws?.close(); throw error;
-        });
+        await kws.ready;
+        if (signal?.aborted || controller.signal.aborted) { kws.close(); throw Error('KWS dial aborted'); }
+        return { index, kws, activate: () => { selected = true; } };
       } catch (error) {
-        stats.kwsDialFailures++; signal?.removeEventListener('abort', abortFromParent); attempt.promise = Promise.reject(error);
+        try { kws?.close(); } catch {}
+        throw error;
+      } finally {
+        releaseSlot?.();
+        signal?.removeEventListener('abort', abortFromParent);
       }
-      return attempt;
-    };
-    const first = startAttempt(candidates[0]);
-    let cancelHedge = () => {};
-    const hedgeDelay = () => {
-      let timer = null, onAbort = null, settled = false, finish;
-      const promise = new Promise((resolve, reject) => {
-        const cleanup = () => {
-          if (timer) clearTimeout(timer);
-          if (onAbort) signal?.removeEventListener('abort', onAbort);
-          timer = null;
-          onAbort = null;
-        };
-        finish = () => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          resolve({ cancelled: true });
-        };
-        if (signal?.aborted) {
-          settled = true;
-          reject(Error('KWS dial aborted'));
-          return;
-        }
-        timer = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          resolve({ startFallback: true });
-        }, CFG.dialHedgeMs);
-        onAbort = () => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          reject(Error('KWS dial aborted'));
-        };
-        signal?.addEventListener('abort', onAbort, { once: true });
-      });
-      cancelHedge = () => finish?.();
-      return promise;
     };
 
-    let firstResult;
-    try {
-      firstResult = await Promise.race([
-        first.promise.then(kws => ({ winner: kws }), error => ({ error })),
-        hedgeDelay().then(result => result, error => ({ error }))
-      ]);
-    } catch (error) {
-      cancelHedge();
-      first.cancel();
+    let secondStarted = false, secondTimer = null, startSecond;
+    const second = new Promise((resolve, reject) => {
+      startSecond = () => {
+        if (secondStarted) return;
+        secondStarted = true;
+        attempt(1).then(resolve, reject);
+      };
+      secondTimer = setTimeout(startSecond, CFG.dialHedgeDelayMs);
+    });
+    const first = attempt(0).catch(error => {
+      if (!secondStarted) {
+        if (secondTimer) clearTimeout(secondTimer);
+        startSecond();
+      }
       throw error;
-    }
-    if (firstResult.winner) {
-      cancelHedge();
-      first.active = true;
-      return firstResult.winner;
-    }
-    cancelHedge();
-    if (signal?.aborted) {
-      first.cancel();
-      throw firstResult.error || Error('KWS dial aborted');
-    }
-
-    const second = startAttempt(candidates[1]);
+    });
     try {
-      const winner = await Promise.any([first.promise, second.promise]);
-      if (first.kws === winner) first.active = true;
-      else first.cancel();
-      if (second.kws === winner) second.active = true;
-      else second.cancel();
-      return winner;
-    } catch {
-      first.cancel();
-      second.cancel();
-      throw Error('Unable to connect to either Telegram KWS endpoint');
+      const winner = await Promise.any([first, second]);
+      if (secondTimer) clearTimeout(secondTimer);
+      winner.activate();
+      for (let i = 0; i < controllers.length; i++) if (i !== winner.index) controllers[i].abort();
+      return winner.kws;
+    } catch (error) {
+      for (const controller of controllers) controller.abort();
+      const errors = error?.errors || [];
+      throw errors[errors.length - 1] || error || Error('Unable to connect to either Telegram KWS endpoint');
     }
   }
-  const mkWire = (ws, ms, signal, onEnd = null) => { const q = [], wait = []; let h = 0, qBytes = 0, closed = false, dead = false, up = false, countedKws = false, fault = null; let pWake = null, pNeed, openTimer, readyOk, readyBad; const ready = new Promise((ok, bad) => { readyOk = ok; readyBad = bad; }); const onAbort = () => { end(Error()); close(); }; const onOpen = () => { if (closed) return; if (ws.protocol !== 'binary') { end(Error()); close(); return; } up = true; if (!countedKws) { countedKws = true; stats.activeKwsWebSockets++; stats.totalKwsWebSockets++; } clearTimeout(openTimer); readyOk(api); }; const onData = v => { if (closed) return; const b = v instanceof Uint8Array ? v : new Uint8Array(v); if (!b.byteLength) return; if (b.byteLength > CFG.dnQueueMaxBytes) { end(Error('KWS message exceeds receive queue limit')); close(); return; } const waiter = wait.shift(); if (waiter) waiter.resolve(b); else { if (qBytes + b.byteLength > CFG.dnQueueMaxBytes) { end(Error('KWS receive queue limit exceeded')); close(); return; } q.push(b); qBytes += b.byteLength; if (qBytes > stats.peakKwsQueueBytes) stats.peakKwsQueueBytes = qBytes; if (pWake && (qBytes >= pNeed || b.byteLength >= CFG.dnPack)) pWake(); } }; const end = (err = null) => { if (closed) return; closed = true; fault = err; clearTimeout(openTimer); if (countedKws) { countedKws = false; stats.activeKwsWebSockets = Math.max(0, stats.activeKwsWebSockets - 1); } signal?.removeEventListener('abort', onAbort); try { onEnd?.(err); } catch {} if (!up) readyBad(err || Error()); pWake?.(); for (const waiter of wait.splice(0)) err ? waiter.reject(err) : waiter.resolve(null); }; const waitWritable = async () => { const buffered = () => Number(ws.bufferedAmount) || 0; if (buffered() <= CFG.upHighWaterBytes) return; const started = Date.now(); while (buffered() > CFG.upLowWaterBytes) { if (closed || dead || signal?.aborted || ws.readyState !== WebSocket.OPEN) throw fault || Error('KWS socket closed during upstream backpressure'); if (Date.now() - started > 30000) throw Error('KWS upstream backpressure timeout'); await new Promise(resolve => setTimeout(resolve, 5)); } }; const write = async v => { await ready; const b = u8(v); for (let offset = 0; offset < b.byteLength;) { await waitWritable(); if (closed || dead || signal?.aborted || ws.readyState !== WebSocket.OPEN) throw fault || Error('KWS socket closed'); const count = Math.min(CFG.upChunkBytes, b.byteLength - offset); ws.send(b.subarray(offset, offset + count)); offset += count; } }; const take = async () => { await ready; if (h < q.length) { const msg = q[h]; q[h++] = null; qBytes -= msg.byteLength; trim(); return msg; } if (fault) throw fault; if (closed) return null; return new Promise((ok, bad) => wait.push({ resolve: ok, reject: bad })); }; const pack = async () => { const first = await take(); if (dead) return null; if (!first || first.byteLength >= CFG.dnPack) return first; if (!closed && qBytes < CFG.dnPack - first.byteLength) await new Promise(ok => { pNeed = CFG.dnPack - first.byteLength; const timer = setTimeout(() => pWake?.(), CFG.dnMs); pWake = () => { clearTimeout(timer); pWake = null; ok(); }; }); if (dead) return null; let n = first.byteLength, endAt = h; while (endAt < q.length && n + q[endAt].byteLength <= CFG.dnPack) n += q[endAt++].byteLength; if (endAt === h) return first; const b = new Uint8Array(n); b.set(first); let o = first.byteLength; while (h < endAt) { const part = q[h]; q[h++] = null; b.set(part, o); o += part.byteLength; qBytes -= part.byteLength; } trim(); return b; }; const trim = () => { if (h === q.length) { q.length = 0; h = 0; } else if (h >= 256 && h * 2 >= q.length) { q.splice(0, h); h = 0; } }; const close = () => { if (dead) return; dead = true; if (!closed) end(); q.length = h = qBytes = 0; try { ws.close(1000); } catch {} }; const api = { ready, write, readPack: pack, close, get closed() { return closed; } }; ws.binaryType = 'arraybuffer'; ws.addEventListener('open', onOpen); ws.addEventListener('message', e => onData(e.data)); ws.addEventListener('error', () => end(Error())); ws.addEventListener('close', e => end(e?.code && e.code !== 1000 ? Error() : null)); openTimer = setTimeout(() => { end(Error()); close(); }, ms); signal?.addEventListener('abort', onAbort, { once: true }); if (signal?.aborted) onAbort(); return api; };
+
+  const mkWire = (ws, ms, signal, onEnd = null) => { const q = [], wait = []; let h = 0, qBytes = 0, closed = false, dead = false, up = false, fault = null; let pWake = null, pNeed, openTimer, readyOk, readyBad; const ready = new Promise((ok, bad) => { readyOk = ok; readyBad = bad; }); const onAbort = () => { end(Error()); close(); }; const onOpen = () => { if (closed) return; if (ws.protocol !== 'binary') { end(Error()); close(); return; } up = true; clearTimeout(openTimer); readyOk(api); }; const onData = v => { if (closed) return; const b = v instanceof Uint8Array ? v : new Uint8Array(v); if (!b.byteLength) return; if (b.byteLength > CFG.dnQueueMaxBytes) { end(Error('KWS message exceeds receive queue limit')); close(); return; } const waiter = wait.shift(); if (waiter) waiter.resolve(b); else { if (qBytes + b.byteLength > CFG.dnQueueMaxBytes) { end(Error('KWS receive queue limit exceeded')); close(); return; } q.push(b); qBytes += b.byteLength; if (pWake && (qBytes >= pNeed || b.byteLength >= CFG.dnPack)) pWake(); } }; const end = (err = null) => { if (closed) return; closed = true; fault = err; clearTimeout(openTimer); signal?.removeEventListener('abort', onAbort); try { onEnd?.(err); } catch {} if (!up) readyBad(err || Error()); pWake?.(); for (const waiter of wait.splice(0)) err ? waiter.reject(err) : waiter.resolve(null); }; const waitWritable = async () => { const buffered = () => Number(ws.bufferedAmount) || 0; if (buffered() <= CFG.upHighWaterBytes) return; const started = Date.now(); while (buffered() > CFG.upLowWaterBytes) { if (closed || dead || signal?.aborted || ws.readyState !== WebSocket.OPEN) throw fault || Error('KWS socket closed during upstream backpressure'); if (Date.now() - started > 30000) throw Error('KWS upstream backpressure timeout'); await new Promise(resolve => setTimeout(resolve, 5)); } }; const write = async v => { await ready; const b = u8(v); for (let offset = 0; offset < b.byteLength;) { await waitWritable(); if (closed || dead || signal?.aborted || ws.readyState !== WebSocket.OPEN) throw fault || Error('KWS socket closed'); const count = Math.min(CFG.upChunkBytes, b.byteLength - offset); ws.send(b.subarray(offset, offset + count)); offset += count; } }; const take = async () => { await ready; if (h < q.length) { const msg = q[h]; q[h++] = null; qBytes -= msg.byteLength; trim(); return msg; } if (fault) throw fault; if (closed) return null; return new Promise((ok, bad) => wait.push({ resolve: ok, reject: bad })); }; const pack = async () => { const first = await take(); if (dead) return null; if (!first || first.byteLength >= CFG.dnPack) return first; if (!closed && qBytes < CFG.dnPack - first.byteLength) await new Promise(ok => { pNeed = CFG.dnPack - first.byteLength; const timer = setTimeout(() => pWake?.(), CFG.dnMs); pWake = () => { clearTimeout(timer); pWake = null; ok(); }; }); if (dead) return null; let n = first.byteLength, endAt = h; while (endAt < q.length && n + q[endAt].byteLength <= CFG.dnPack) n += q[endAt++].byteLength; if (endAt === h) return first; const b = new Uint8Array(n); b.set(first); let o = first.byteLength; while (h < endAt) { const part = q[h]; q[h++] = null; b.set(part, o); o += part.byteLength; qBytes -= part.byteLength; } trim(); return b; }; const trim = () => { if (h === q.length) { q.length = 0; h = 0; } else if (h >= 256 && h * 2 >= q.length) { q.splice(0, h); h = 0; } }; const close = () => { if (dead) return; dead = true; if (!closed) end(); q.length = h = qBytes = 0; try { ws.close(1000); } catch {} }; const api = { ready, write, readPack: pack, close, get closed() { return closed; } }; ws.binaryType = 'arraybuffer'; ws.addEventListener('open', onOpen); ws.addEventListener('message', e => onData(e.data)); ws.addEventListener('error', () => end(Error())); ws.addEventListener('close', e => end(e?.code && e.code !== 1000 ? Error() : null)); openTimer = setTimeout(() => { end(Error()); close(); }, ms); signal?.addEventListener('abort', onAbort, { once: true }); if (signal?.aborted) onAbort(); return api; };
   const mkPkt = mode => { let tail = nil; const push = v => { const b = u8(v); if (b.byteLength) tail = tail.byteLength ? cat(tail, b) : b; const pkts = []; let o = 0; for (;;) { const avail = tail.byteLength - o; let hLen, pLen; if (mode === 0xef) { if (avail < 1) break; let words = tail[o] & 0x7f; if (words === 0x7f) { if (avail < 4) break; words = tail[o + 1] | (tail[o + 2] << 8) | (tail[o + 3] << 16); hLen = 4; } else hLen = 1; pLen = words * 4; } else { if (avail < 4) break; pLen = new DataView(tail.buffer, tail.byteOffset + o, 4).getUint32(0, true) & 0x7fffffff; hLen = 4; } if (!pLen || pLen > 8 * 1024 * 1024) throw Error(); const total = hLen + pLen; if (avail < total) break; pkts.push(tail.subarray(o, o + total)); o += total; } if (o) tail = o === tail.byteLength ? nil : tail.slice(o); if (tail.byteLength > 8 * 1024 * 1024 + 4) throw Error(); return pkts; }; const clear = () => { tail = nil; }; return { push, clear }; };
-  const mkStream = ({ secret, emit, onClose }) => { let hdr = nil, cIn = null, cOut = null, kIn = null, kOut = null, peer = null, pkt = null; let init = false, closed = false, chain = Promise.resolve(); const ac = new AbortController(), uq = new Set(); const push = v => { if (closed) return Promise.reject(Error()); const job = { bytes: u8(v) }; uq.add(job); chain = chain.then(async () => { if (closed) throw Error(); if (!job.bytes) return job.result; const jobs = [job]; let n = job.bytes.byteLength; for (const next of uq) { if (next === job) continue; if (n >= CFG.upPack || n + next.bytes.byteLength > CFG.upPack) break; n += next.bytes.byteLength; jobs.push(next); } const b = jobs.length === 1 ? job.bytes : cat(...jobs.map(x => x.bytes)); for (const item of jobs) { uq.delete(item); item.bytes = null; } const result = await feed(b); for (const item of jobs) item.result = result; return result; }); return chain; }; const feed = async b => { if (closed) throw Error(); if (init && peer.closed) return false; if (!b.byteLength) return; if (!init) { const need = 64 - hdr.byteLength; if (b.byteLength < need) { hdr = cat(hdr, b); return; } hdr = cat(hdr, b.subarray(0, need)); await start(); const rest = b.subarray(need); if (rest.byteLength) return write(rest); return; } return write(b); }; const start = async () => { const raw = hdr; const cr = await cipher(raw, secret, false); const plain = await cr.crypt(raw); if (closed) return; const info = headOf(plain); const head = mkHead(info.mode, info.target, info.media); const [cw, out, kr] = await Promise.all([cipher(raw, secret, true), wireHead(head), cipher(head, nil, true)]); if (closed) return; const kws = await dial({ target: info.target, media: info.media, signal: ac.signal, onEnd: () => close() }); if (closed) { kws.close(); return; } peer = kws; cIn = cr; cOut = cw; kOut = out.cipher; kIn = kr; pkt = mkPkt(info.mode); await kws.write(out.wire); if (closed) return; hdr = nil; init = true; pump().catch(() => close()); }; const write = async raw => { if (closed || peer.closed) return false; const plain = await cIn.crypt(raw); if (closed || peer.closed) return false; const pkts = pkt.push(plain); for (let start = 0; start < pkts.length;) { let end = start + 1, n = pkts[start].byteLength; while (end < pkts.length && n + pkts[end].byteLength <= CFG.upPack) n += pkts[end++].byteLength; const first = pkts[start]; const b = end === start + 1 ? first : new Uint8Array(first.buffer, first.byteOffset, n); if (closed || peer.closed) return false; const wire = await kOut.crypt(b); if (closed || peer.closed) return false; try { // KWS is consumed as an ordered byte stream; keep the encrypted packet bytes intact but coalesce the batch into one WS message.
+  const mkStream = ({ secret, emit, onClose, dialGate = null }) => { let hdr = nil, cIn = null, cOut = null, kIn = null, kOut = null, peer = null, pkt = null; let init = false, closed = false, chain = Promise.resolve(); const ac = new AbortController(), uq = new Set(); const push = v => { if (closed) return Promise.reject(Error()); const job = { bytes: u8(v) }; uq.add(job); chain = chain.then(async () => { if (closed) throw Error(); if (!job.bytes) return job.result; const jobs = [job]; let n = job.bytes.byteLength; for (const next of uq) { if (next === job) continue; if (n >= CFG.upPack || n + next.bytes.byteLength > CFG.upPack) break; n += next.bytes.byteLength; jobs.push(next); } const b = jobs.length === 1 ? job.bytes : cat(...jobs.map(x => x.bytes)); for (const item of jobs) { uq.delete(item); item.bytes = null; } const result = await feed(b); for (const item of jobs) item.result = result; return result; }); return chain; }; const feed = async b => { if (closed) throw Error(); if (init && peer.closed) return false; if (!b.byteLength) return; if (!init) { const need = 64 - hdr.byteLength; if (b.byteLength < need) { hdr = cat(hdr, b); return; } hdr = cat(hdr, b.subarray(0, need)); await start(); const rest = b.subarray(need); if (rest.byteLength) return write(rest); return; } return write(b); }; const start = async () => { const raw = hdr; const cr = await cipher(raw, secret, false); const plain = await cr.crypt(raw); if (closed) return; const info = headOf(plain); const head = mkHead(info.mode, info.target, info.media); const [cw, out, kr] = await Promise.all([cipher(raw, secret, true), wireHead(head), cipher(head, nil, true)]); if (closed) return; const kws = await dial({ target: info.target, media: info.media, signal: ac.signal, onEnd: () => close(), dialGate }); if (closed) { kws.close(); return; } peer = kws; cIn = cr; cOut = cw; kOut = out.cipher; kIn = kr; pkt = mkPkt(info.mode); await kws.write(out.wire); if (closed) return; hdr = nil; init = true; pump().catch(() => close()); }; const write = async raw => { if (closed || peer.closed) return false; const plain = await cIn.crypt(raw); if (closed || peer.closed) return false; const pkts = pkt.push(plain); for (let start = 0; start < pkts.length;) { let end = start + 1, n = pkts[start].byteLength; while (end < pkts.length && n + pkts[end].byteLength <= CFG.upPack) n += pkts[end++].byteLength; const first = pkts[start]; const b = end === start + 1 ? first : new Uint8Array(first.buffer, first.byteOffset, n); if (closed || peer.closed) return false; const wire = await kOut.crypt(b); if (closed || peer.closed) return false; try { // KWS is consumed as an ordered byte stream; keep the encrypted packet bytes intact but coalesce the batch into one WS message.
  await peer.write(wire); } catch (err) { if (closed || peer.closed) return false; throw err; } start = end; } }; const pump = async () => { while (!closed) { const b = await peer.readPack(); if (closed) return; if (!b) return close(); const plain = await kIn.crypt(b); if (closed) return; const raw = await cOut.crypt(plain); if (closed) return; await emit(raw); } }; const close = () => { if (closed) return; closed = true; ac.abort(); try { peer?.close(); } catch {} for (const job of uq) job.bytes = null; uq.clear(); hdr = nil; pkt?.clear(); cIn = cOut = kIn = kOut = peer = null; try { onClose(); } catch {} }; return { push, close }; };
   const mkSession = ({ secret, sid, onClose, lease }) => {
-    let sock = null, closed = false, tx = Promise.resolve(), cur = null, countedSocket = false;
+    let sock = null, closed = false, tx = Promise.resolve(), cur = null;
     const attach = ws => {
       if (sock || closed) throw Error();
       sock = ws; ws.accept({ allowHalfOpen: true }); ws.binaryType = 'arraybuffer';
-      if (!countedSocket) { countedSocket = true; stats.activeWebSockets++; stats.totalWebSockets++; }
-      ws.addEventListener('message', e => { if (closed) return; try { onData(e.data); } catch { stats.wsProtocolErrors++; close(1008); } });
+      ws.addEventListener('message', e => { if (closed) return; try { onData(e.data); } catch { close(1008); } });
       ws.addEventListener('close', () => close()); ws.addEventListener('error', () => close());
     };
     const onData = v => {
@@ -3630,7 +3573,6 @@ const TWP_RUNTIME = (() => {
       if (closed) return;
       if (cur) throw Error();
       const st = { in: 4 * 1024 * 1024, out: 4 * 1024 * 1024, wake: null, closed: false, proxy: null, pItems: 0, counted: true };
-      stats.activeLanes++; stats.totalLanes++;
       st.proxy = mkStream({ secret, emit: b => emitDn(st, b), onClose: () => { if (!closed && !st.closed) end(true); } });
       cur = st;
     };
@@ -3638,7 +3580,7 @@ const TWP_RUNTIME = (() => {
       if (closed || cur?.closed) return;
       const st = cur; if (!st || st.closed) throw Error();
       const n = data.byteLength; if (n > st.in || st.pItems >= 16384) throw Error();
-      stats.uploadBytes += n; st.in -= n; st.pItems++;
+      st.in -= n; st.pItems++;
       st.proxy.push(data).then(accepted => {
         freeUp(st); if (closed || st.closed || accepted === false) return;
         st.in += n; const delta = new Uint8Array(4); new DataView(delta.buffer).setUint32(0, n);
@@ -3651,14 +3593,13 @@ const TWP_RUNTIME = (() => {
         while (!closed && !st.closed && st.out === 0) await new Promise(ok => { st.wake = ok; });
         if (closed || st.closed) throw Error();
         const n = Math.min(64 * 1024, b.byteLength - o, st.out);
-        st.out -= n; await send(2, b.subarray(o, o + n)); stats.downloadBytes += n; o += n;
+        st.out -= n; await send(2, b.subarray(o, o + n)); o += n;
       }
     };
     const grant = n => { if (closed || cur?.closed) return; const st = cur; if (!st || st.closed) throw Error(); st.out = Math.min(0xffffffff, st.out + n); wake(st); };
     const stop = st => {
       if (st.closed) return;
       st.closed = true; st.pItems = 0;
-      if (st.counted) { st.counted = false; stats.activeLanes = Math.max(0, stats.activeLanes - 1); }
       wake(st); st.proxy.close();
     };
     const end = notify => {
@@ -3669,17 +3610,56 @@ const TWP_RUNTIME = (() => {
     const close = (code = 1000, reason = '') => {
       if (closed) return; closed = true; if (cur) stop(cur); cur = null;
       try { sock?.close(code, reason); } catch {}
-      if (countedSocket) { countedSocket = false; stats.activeWebSockets = Math.max(0, stats.activeWebSockets - 1); }
       onClose?.(); onClose = null;
     };
     return { attach, close };
   };
 
-  // Experimental shared WebSocket carrier. It preserves per-lane windows and
-  // stream engines while multiplexing their framed messages on one browser socket.
+  // Shared WebSocket carrier. Complete protocol frames are batched into bounded
+  // binary messages; per-lane windows and stream ordering remain unchanged.
   const mkMuxSession = ({ secret, onClose, lease }) => {
-    let sock = null, closed = false, tx = Promise.resolve(), countedSocket = false;
+    let sock = null, closed = false;
     const lanes = new Map();
+    const outQueue = [], outSpaceWaiters = [];
+    let outQueueBytes = 0, outFlushTimer = null, outFlushing = false;
+
+    // Cloudflare limits the number of outgoing connections still waiting for
+    // handshake headers per invocation. Shared mode can create several KWS
+    // lanes from one invocation, so keep at most five handshakes pending.
+    const dialGate = (() => {
+      const limit = 5;
+      let active = 0;
+      const waiters = [];
+      const acquire = signal => new Promise((resolve, reject) => {
+        if (signal?.aborted) { reject(Error('KWS dial aborted')); return; }
+        const grant = () => {
+          let released = false;
+          resolve(() => {
+            if (released) return;
+            released = true;
+            const next = waiters.shift();
+            if (next) {
+              next.signal?.removeEventListener('abort', next.onAbort);
+              next.grant();
+            } else active = Math.max(0, active - 1);
+          });
+        };
+        if (active < limit) { active++; grant(); return; }
+        const waiter = { signal, grant, onAbort: null };
+        waiter.onAbort = () => {
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          reject(Error('KWS dial aborted'));
+        };
+        signal?.addEventListener('abort', waiter.onAbort, { once: true });
+        waiters.push(waiter);
+      });
+      return { acquire };
+    })();
+
+    const wakeOutSpace = () => {
+      for (const wake of outSpaceWaiters.splice(0)) wake();
+    };
     const waitWritable = async () => {
       if (!sock) throw Error('WebSocket is not attached');
       const started = Date.now();
@@ -3689,40 +3669,85 @@ const TWP_RUNTIME = (() => {
         await new Promise(resolve => setTimeout(resolve, 5));
       }
     };
-    const send = (type, sid, data = nil) => {
-      const out = enc(type, sid, data);
-      const job = tx.then(async () => {
-        if (closed || !sock || sock.readyState !== WebSocket.OPEN) throw Error('Shared WebSocket is closed');
-        await waitWritable();
-        if (closed || sock.readyState !== WebSocket.OPEN) throw Error('Shared WebSocket is closed');
-        sock.send(out);
-      });
-      tx = job.catch(() => {});
-      return job;
+    const flushOut = async () => {
+      if (outFlushing || closed) return;
+      outFlushing = true;
+      if (outFlushTimer) { clearTimeout(outFlushTimer); outFlushTimer = null; }
+      let currentBatch = [];
+      try {
+        while (!closed && outQueue.length) {
+          await waitWritable();
+          if (closed || !sock || sock.readyState !== WebSocket.OPEN) throw Error('Shared WebSocket is closed');
+          const batch = [];
+          let bytes = 0;
+          while (outQueue.length) {
+            const item = outQueue[0];
+            if (batch.length && bytes + item.bytes.byteLength > CFG.muxBatchBytes) break;
+            outQueue.shift();
+            batch.push(item);
+            bytes += item.bytes.byteLength;
+            if (bytes >= CFG.muxBatchBytes) break;
+          }
+          if (!batch.length) continue;
+          currentBatch = batch;
+          const payload = batch.length === 1 ? batch[0].bytes : cat(...batch.map(item => item.bytes));
+          sock.send(payload);
+          outQueueBytes = Math.max(0, outQueueBytes - bytes);
+          wakeOutSpace();
+          for (const item of currentBatch) item.resolve();
+          currentBatch = [];
+        }
+      } catch (error) {
+        for (const item of currentBatch) item.reject(error);
+        currentBatch = [];
+        for (const item of outQueue.splice(0)) item.reject(error);
+        outQueueBytes = 0;
+        wakeOutSpace();
+        close(1011, 'shared carrier send failed');
+      } finally {
+        outFlushing = false;
+        if (!closed && outQueue.length && !outFlushTimer) {
+          outFlushTimer = setTimeout(() => { outFlushTimer = null; void flushOut(); }, 1);
+        }
+      }
     };
+    const enqueueBatch = async framesToSend => {
+      const payload = framesToSend.length === 1 ? framesToSend[0] : cat(...framesToSend);
+      if (!payload.byteLength || payload.byteLength > CFG.muxBatchBytes) throw Error('Invalid shared WebSocket batch size');
+      while (!closed && outQueueBytes + payload.byteLength > CFG.muxQueueMaxBytes) {
+        await new Promise(resolve => outSpaceWaiters.push(resolve));
+      }
+      if (closed || !sock || sock.readyState !== WebSocket.OPEN) throw Error('Shared WebSocket is closed');
+      return new Promise((resolve, reject) => {
+        outQueue.push({ bytes: payload, resolve, reject });
+        outQueueBytes += payload.byteLength;
+        if (!outFlushTimer) outFlushTimer = setTimeout(() => { outFlushTimer = null; void flushOut(); }, 1);
+      });
+    };
+    const send = (type, sid, data = nil) => enqueueBatch([enc(type, sid, data)]);
+
     const stopLane = (sid, lane, notify) => {
       if (!lane || lane.closed) return;
       lane.closed = true; lane.pItems = 0;
-      if (lane.counted) { lane.counted = false; stats.activeLanes = Math.max(0, stats.activeLanes - 1); }
       wake(lane); lane.proxy?.close(); lanes.delete(sid); lease?.active.delete(sid);
       if (notify && !closed) send(3, sid).catch(() => close());
     };
     const openLane = sid => {
       if (!sid || lanes.has(sid) || lease?.used.has(sid) || lanes.size >= 128 || lease?.used.size >= 4096 || lease?.active.size >= 128) throw Error('Invalid or excessive shared lane');
-      const lane = { in: 4 * 1024 * 1024, out: 4 * 1024 * 1024, wake: null, closed: false, proxy: null, pItems: 0, counted: true };
+      const lane = { in: 4 * 1024 * 1024, out: 4 * 1024 * 1024, wake: null, closed: false, proxy: null, pItems: 0 };
       lanes.set(sid, lane); lease?.used.add(sid); lease?.active.add(sid);
-      stats.activeLanes++; stats.totalLanes++;
-      lane.proxy = mkStream({ secret, emit: b => emitDown(sid, lane, b), onClose: () => { if (!closed && !lane.closed) stopLane(sid, lane, true); } });
+      lane.proxy = mkStream({ secret, emit: b => emitDown(sid, lane, b), onClose: () => { if (!closed && !lane.closed) stopLane(sid, lane, true); }, dialGate });
       return lane;
     };
     const write = (sid, lane, data) => {
       const n = data.byteLength;
       if (lane.closed || n > lane.in || lane.pItems >= 16384) throw Error('Shared lane upload window exceeded');
-      stats.uploadBytes += n; lane.in -= n; lane.pItems++;
+      lane.in -= n; lane.pItems++;
       lane.proxy.push(data).then(accepted => {
         if (!lane.closed) lane.pItems = Math.max(0, lane.pItems - 1);
         if (closed || lane.closed || accepted === false) return;
-        lane.in += n; const delta = new Uint8Array(4); new DataView(delta.buffer).setUint32(0, n);
+        lane.in += n;
+        const delta = new Uint8Array(4); new DataView(delta.buffer).setUint32(0, n);
         send(4, sid, delta).catch(() => close());
       }, () => {
         if (!lane.closed) lane.pItems = Math.max(0, lane.pItems - 1);
@@ -3730,12 +3755,21 @@ const TWP_RUNTIME = (() => {
       }).catch(() => close());
     };
     const emitDown = async (sid, lane, data) => {
-      for (let offset = 0; offset < data.byteLength;) {
-        while (!closed && !lane.closed && lane.out === 0) await new Promise(resolve => { lane.wake = resolve; });
-        if (closed || lane.closed) throw Error();
-        const n = Math.min(64 * 1024, data.byteLength - offset, lane.out);
-        lane.out -= n; await send(2, sid, data.subarray(offset, offset + n));
-        stats.downloadBytes += n; offset += n;
+      let offset = 0;
+      while (offset < data.byteLength) {
+        const framesToSend = [];
+        let batchBytes = 0;
+        while (offset < data.byteLength && batchBytes < CFG.muxBatchBytes) {
+          while (!closed && !lane.closed && lane.out === 0) await new Promise(ok => { lane.wake = ok; });
+          if (closed || lane.closed) throw Error();
+          const n = Math.min(64 * 1024, data.byteLength - offset, lane.out, CFG.muxBatchBytes - batchBytes - 8);
+          if (n <= 0) break;
+          lane.out -= n;
+          framesToSend.push(enc(2, sid, data.subarray(offset, offset + n)));
+          offset += n;
+          batchBytes += n + 8;
+        }
+        if (framesToSend.length) await enqueueBatch(framesToSend);
       }
     };
     const onData = value => {
@@ -3764,25 +3798,29 @@ const TWP_RUNTIME = (() => {
     const attach = ws => {
       if (sock || closed || lease?.muxActive) throw Error();
       sock = ws; lease.muxActive = true; ws.accept({ allowHalfOpen: true }); ws.binaryType = 'arraybuffer';
-      if (!countedSocket) { countedSocket = true; stats.activeWebSockets++; stats.totalWebSockets++; }
-      ws.addEventListener('message', event => { try { onData(event.data); } catch { stats.wsProtocolErrors++; close(1008); } });
+      ws.addEventListener('message', event => { try { onData(event.data); } catch { close(1008); } });
       ws.addEventListener('close', () => close()); ws.addEventListener('error', () => close());
     };
     const close = (code = 1000, reason = '') => {
-      if (closed) return; closed = true;
+      if (closed) return;
+      closed = true;
+      if (outFlushTimer) { clearTimeout(outFlushTimer); outFlushTimer = null; }
+      const error = Error('Shared WebSocket closed');
+      for (const item of outQueue.splice(0)) item.reject(error);
+      outQueueBytes = 0; wakeOutSpace();
       for (const [sid, lane] of [...lanes]) stopLane(sid, lane, false);
       try { sock?.close(code, reason); } catch {}
-      if (countedSocket) { countedSocket = false; stats.activeWebSockets = Math.max(0, stats.activeWebSockets - 1); }
       if (lease) lease.muxActive = false;
       onClose?.(); onClose = null;
     };
     return { attach, close };
   };
 
-  function mkPage(host, boot, initialCarrier = 'websocket-lanes') { const nonce = b64(rand(18)); const body = `<script nonce="__NONCE__">\n(()=>{'use strict'; const origin=__ORIGIN__,boot=__BOOTSTRAP__; let carrier=__CARRIER__;\nconst aNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash)?.[1]??''; history.replaceState(null,'',location.pathname);\nlet init=false,closed=false,port=null,token='',started=false,delSent=false; let qBytes=0,qItems=0,muxWs=null,muxPumpTimer=0;\nconst lanes=new Map(),used=new Set(),qMax=33554432,iMax=16384,msgMax=2097152; const laneMax=8388608,laneItems=1024;\nconst state=st=>port&&!closed&&port.postMessage({t:'status',state:st});\nconst opts=(method,token,body,keepalive)=>({ method,body,keepalive:!!keepalive,mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer', headers:{...(token&&{Authorization:'Bearer '+token}),...(body&&{'Content-Type':'application/octet-stream'})} });\nfunction check(v){ if(!(v instanceof ArrayBuffer)||!v.byteLength||v.byteLength>msgMax)throw Error(); const view=new DataView(v);let o=0,frames=0; while(o<v.byteLength){ if(v.byteLength-o<8||frames++>=4096)throw Error(); const type=view.getUint8(o),n=view.getUint32(o+4),end=o+8+n; if(n>1048576||end>v.byteLength||(type===2&&!n))throw Error(); o=end; } return v; }\nfunction split(v){ check(v);const view=new DataView(v),out=[];let o=0; while(o<v.byteLength){ const end=o+8+view.getUint32(o+4); out.push(o===0&&end===v.byteLength?v:v.slice(o,end));o=end; } return out; }\nfunction sid(v){const b=new Uint8Array(v);return (b[1]<<16)|(b[2]<<8)|b[3];}\nfunction hold(lane,v){ let buffered=0;if(carrier==='websocket')buffered=muxWs?.bufferedAmount??0;else for(const {ws} of lanes.values())buffered+=ws?.bufferedAmount??0; const own=carrier==='websocket'?buffered:(lane.ws?.bufferedAmount??0); if(qBytes+buffered>qMax-v.byteLength||qItems>=iMax||lane.bytes+own>laneMax-v.byteLength||lane.items>=laneItems)return false; qBytes+=v.byteLength;qItems++;lane.bytes+=v.byteLength;lane.items++;return true; }\nfunction free(lane,v){qBytes-=v.byteLength;qItems--;lane.bytes-=v.byteLength;lane.items--;}\nfunction fail(){ if(closed)return;state('failed');port?.postMessage({t:'close'});close(true); }\nfunction drop(){ if(delSent||!token)return;delSent=true; fetch(origin+'/api/v1/session',opts('DELETE',token,null,true)).catch(()=>{}); }\nfunction pump(lane){ const ws=lane.ws; if(closed||lane.done||!ws||ws.readyState!==WebSocket.OPEN||!lane.pending.length)return; if(ws.bufferedAmount>=msgMax){lane.timer ||= setTimeout(()=>{lane.timer=0;pump(lane);},10);return;} try{ const v=lane.pending.shift();ws.send(v);free(lane,v);port.postMessage({t:'traffic',up:v.byteLength,down:0});if(lane.pending.length)queueMicrotask(()=>pump(lane)); }catch{fail();} }\nfunction push(v){ try{for(const frame of split(v))pushLane(frame);}catch{fail();} }\nfunction end(lane,notify){ if(lane.done)return;lane.done=true;if(lane.timer)clearTimeout(lane.timer);qBytes-=lane.bytes;qItems-=lane.items;lane.bytes=lane.items=0;lane.pending.length=0;lanes.delete(lane.id);if(carrier!=='websocket'){try{lane.ws?.close();}catch{}}if(notify&&port&&!closed){const frame=new ArrayBuffer(8),b=new Uint8Array(frame);b[0]=3;b[1]=lane.id>>>16;b[2]=lane.id>>>8;b[3]=lane.id;port.postMessage(frame,[frame]);} }
-function pumpMux(){if(closed||carrier!=='websocket'||!muxWs||muxWs.readyState!==WebSocket.OPEN)return;if(muxWs.bufferedAmount>=msgMax){if(!muxPumpTimer)muxPumpTimer=setTimeout(()=>{muxPumpTimer=0;pumpMux();},10);return;}let sent=false;for(const lane of lanes.values()){if(!lane.done&&lane.pending.length&&muxWs.bufferedAmount<msgMax){try{const v=lane.pending.shift();muxWs.send(v);free(lane,v);sent=true;port.postMessage({t:'traffic',up:v.byteLength,down:0});}catch{fail();return;}}}if(sent&&[...lanes.values()].some(lane=>lane.pending.length))queueMicrotask(pumpMux);}
-function openMux(){if(closed||muxWs||!token)return;const target=origin.replace(/^https:/,'wss:')+'/api/v1/ws';const ws=muxWs=new WebSocket(target,'tproxy-v1.'+token);ws.binaryType='arraybuffer';ws.onopen=()=>{if(closed){ws.close();return;}for(const lane of lanes.values())lane.opened=true;state('connected');pumpMux();};ws.onmessage=e=>{if(closed)return;try{for(const frame of split(e.data)){const id=sid(frame),lane=lanes.get(id);if(!lane)continue;if(frame[0]===3)lane.rClosed=true;port.postMessage({t:'traffic',up:0,down:frame.byteLength});port.postMessage(frame,[frame]);if(frame[0]===3)end(lane,false);}state('connected');}catch{fail();}};ws.onerror=()=>{};ws.onclose=()=>{if(!closed)fail();};}
-function open(lane){if(carrier==='websocket'){openMux();if(muxWs?.readyState===WebSocket.OPEN){lane.opened=true;pumpMux();}return;}const target=origin.replace(/^https:/,'wss:')+'/api/v1/ws'; const ws=lane.ws=new WebSocket(target,'tproxy-lane-v1.'+token+'.'+lane.id);ws.binaryType='arraybuffer';ws.onopen=()=>{if(closed||lane.done){ws.close();return;}lane.opened=true;state('connected');pump(lane);};ws.onmessage=e=>{if(closed||lane.done)return;try{const frames=split(e.data);if(frames.some(frame=>sid(frame)!==lane.id))throw Error();const ended=frames.some(frame=>new Uint8Array(frame)[0]===3);if(ended)lane.rClosed=true;port.postMessage({t:'traffic',up:0,down:e.data.byteLength});port.postMessage(e.data,[e.data]);state('connected');if(ended)end(lane,false);}catch{fail();}};ws.onerror=()=>{};ws.onclose=()=>{if(closed||lane.done)return;if(!lane.opened){fail();return;}end(lane,!lane.lClosed&&!lane.rClosed);}; }\nfunction pushLane(v){ const id=sid(v),type=new Uint8Array(v)[0];let lane=lanes.get(id);if(!id)throw Error();if(!lane&&(type===2||type===3||type===4))return;if(!lane){if(type!==1||used.has(id)||lanes.size>=128||used.size>=4096)throw Error();used.add(id);lane={id,ws:null,pending:[],bytes:0,items:0,timer:0,opened:false,done:false,lClosed:false,rClosed:false};lanes.set(id,lane);}if(lane.lClosed)return;if(type===3&&!lane.opened){end(lane,false);return;}if(!hold(lane,v))throw Error();lane.pending.push(v);if(type===3)lane.lClosed=true;if(token){if(carrier==='websocket'){if(!muxWs)openMux();pumpMux();}else if(!lane.ws)open(lane);else pump(lane);} }\nasync function create(first){try{state('connecting');const res=await fetch(origin+'/api/v1/session',opts('POST',boot,first));if(res.status!==200)throw Error();const selected=res.headers.get('X-Carrier-Mode')||'websocket-lanes';if(selected!=='websocket-lanes'&&selected!=='websocket')throw Error();carrier=selected;token=res.headers.get('X-Session-Token')??'';if(!token)throw Error();const welcome=await res.arrayBuffer();check(welcome);if(closed){drop();return;}port.postMessage(welcome,[welcome]);state('connected');if(carrier==='websocket'){if(lanes.size)openMux();}else for(const lane of lanes.values())if(!lane.ws)open(lane);}catch{fail();}}\nfunction close(notify){if(closed)return;closed=true;if(muxPumpTimer)clearTimeout(muxPumpTimer);for(const lane of [...lanes.values()])end(lane,false);used.clear();try{muxWs?.close();}catch{}muxWs=null;if(notify)drop();port?.close();}\nfunction start(next){init=true;port=next;port.onmessage=msg=>{const data=msg.data;if(data instanceof ArrayBuffer){if(!started){try{check(data);}catch{fail();return;}started=true;create(data);}else push(data);}else if(data&&data.t==='close')close(true);};port.start();state('connecting');}\naddEventListener('message',e=>{if(init||e.source!==parent||e.data===null||typeof e.data!=='object')return;const keys=Object.keys(e.data).sort();if(keys.length!==2||keys[0]!=='t'||keys[1]!=='v'||e.data.t!=='tproxy-init'||e.data.v!==1||e.ports.length!==1)return;let src;try{src=new URL(e.origin);}catch{return;}if(src.protocol!=='http:'||src.hostname!=='127.0.0.1'||!src.port||src.origin!==e.origin)return;start(e.ports[0]);});const android=globalThis.TelegramWebProxy;if(!init&&aNonce&&android&&typeof android.postMessage==='function'){const aPort={onmessage:null,start(){},close(){android.onmessage=null;},postMessage(v){if(v instanceof ArrayBuffer){for(const frame of split(v))android.postMessage(frame);}else android.postMessage(JSON.stringify(v));}};android.onmessage=e=>{let data=e.data;if(typeof data==='string'){try{data=JSON.parse(data);}catch{return;}}aPort.onmessage?.({data});};start(aPort);android.postMessage(JSON.stringify({t:'tproxy-android-init',v:1,nonce:aNonce}));}addEventListener('pagehide',()=>close(true),{once:true});})();\n</script>`
+  function mkPage(host, boot, initialCarrier = 'websocket-lanes') { const nonce = b64(rand(18)); const body = `<script nonce="__NONCE__">\n(()=>{'use strict'; const origin=__ORIGIN__,boot=__BOOTSTRAP__; let carrier=__CARRIER__;\nconst aNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash)?.[1]??''; history.replaceState(null,'',location.pathname);\nlet init=false,closed=false,port=null,token='',started=false,delSent=false; let qBytes=0,qItems=0,muxWs=null,muxPumpTimer=0,muxBackpressured=false;\nconst lanes=new Map(),used=new Set(),qMax=33554432,iMax=16384,msgMax=2097152; const laneMax=8388608,laneItems=1024,muxHighWaterBytes=524288,muxLowWaterBytes=131072;\nconst state=st=>port&&!closed&&port.postMessage({t:'status',state:st});\nconst opts=(method,token,body,keepalive)=>({ method,body,keepalive:!!keepalive,mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer', headers:{...(token&&{Authorization:'Bearer '+token}),...(body&&{'Content-Type':'application/octet-stream'})} });\nfunction check(v){ if(!(v instanceof ArrayBuffer)||!v.byteLength||v.byteLength>msgMax)throw Error(); const view=new DataView(v);let o=0,frames=0; while(o<v.byteLength){ if(v.byteLength-o<8||frames++>=4096)throw Error(); const type=view.getUint8(o),n=view.getUint32(o+4),end=o+8+n; if(n>1048576||end>v.byteLength||(type===2&&!n))throw Error(); o=end; } return v; }\nfunction split(v){ check(v);const view=new DataView(v),out=[];let o=0; while(o<v.byteLength){ const end=o+8+view.getUint32(o+4); out.push(o===0&&end===v.byteLength?v:v.slice(o,end));o=end; } return out; }\nfunction sid(v){const b=new Uint8Array(v);return (b[1]<<16)|(b[2]<<8)|b[3];}\nfunction hold(lane,v){ let buffered=0;if(carrier==='websocket')buffered=muxWs?.bufferedAmount??0;else for(const {ws} of lanes.values())buffered+=ws?.bufferedAmount??0; const own=carrier==='websocket'?buffered:(lane.ws?.bufferedAmount??0); if(qBytes+buffered>qMax-v.byteLength||qItems>=iMax||lane.bytes+own>laneMax-v.byteLength||lane.items>=laneItems)return false; qBytes+=v.byteLength;qItems++;lane.bytes+=v.byteLength;lane.items++;return true; }\nfunction free(lane,v){qBytes-=v.byteLength;qItems--;lane.bytes-=v.byteLength;lane.items--;}\nfunction fail(){ if(closed)return;state('failed');port?.postMessage({t:'close'});close(true); }\nfunction drop(){ if(delSent||!token)return;delSent=true; fetch(origin+'/api/v1/session',opts('DELETE',token,null,true)).catch(()=>{}); }\nfunction pump(lane){ const ws=lane.ws; if(closed||lane.done||!ws||ws.readyState!==WebSocket.OPEN||!lane.pending.length)return; if(ws.bufferedAmount>=msgMax){lane.timer ||= setTimeout(()=>{lane.timer=0;pump(lane);},10);return;} try{ const v=lane.pending.shift();ws.send(v);free(lane,v);if(lane.pending.length)queueMicrotask(()=>pump(lane)); }catch{fail();} }\nfunction push(v){ try{for(const frame of split(v))pushLane(frame);}catch{fail();} }\nfunction end(lane,notify){ if(lane.done)return;lane.done=true;if(lane.timer)clearTimeout(lane.timer);qBytes-=lane.bytes;qItems-=lane.items;lane.bytes=lane.items=0;lane.pending.length=0;lanes.delete(lane.id);if(carrier!=='websocket'){try{lane.ws?.close();}catch{}}if(notify&&port&&!closed){const frame=new ArrayBuffer(8),b=new Uint8Array(frame);b[0]=3;b[1]=lane.id>>>16;b[2]=lane.id>>>8;b[3]=lane.id;port.postMessage(frame,[frame]);} }
+let muxBatchCursor=0;
+function pumpMux(){if(closed||carrier!=='websocket'||!muxWs||muxWs.readyState!==WebSocket.OPEN)return;const buffered=Number(muxWs.bufferedAmount)||0;if(muxBackpressured){if(buffered>muxLowWaterBytes){if(!muxPumpTimer)muxPumpTimer=setTimeout(()=>{muxPumpTimer=0;pumpMux();},5);return;}muxBackpressured=false;}if(buffered>=muxHighWaterBytes){muxBackpressured=true;if(!muxPumpTimer)muxPumpTimer=setTimeout(()=>{muxPumpTimer=0;pumpMux();},5);return;}const list=[...lanes.values()];if(!list.length)return;const parts=[];let bytes=0,idle=0;while(idle<list.length&&parts.length<4096){const index=muxBatchCursor%list.length;const lane=list[index];muxBatchCursor=(index+1)%list.length;if(lane&&!lane.done&&lane.pending.length){const v=lane.pending[0];if(parts.length&&bytes+v.byteLength>262144)break;lane.pending.shift();free(lane,v);parts.push(v);bytes+=v.byteLength;idle=0;}else idle++;}if(parts.length){try{let payload;if(parts.length===1)payload=parts[0];else{const out=new Uint8Array(bytes);let offset=0;for(const part of parts){const view=part instanceof ArrayBuffer?new Uint8Array(part):new Uint8Array(part.buffer,part.byteOffset,part.byteLength);out.set(view,offset);offset+=view.byteLength;}payload=out.buffer;}muxWs.send(payload);}catch{fail();return;}}if([...lanes.values()].some(lane=>lane.pending.length))queueMicrotask(pumpMux);}
+function openMux(){if(closed||muxWs||!token)return;const target=origin.replace(/^https:/,'wss:')+'/api/v1/ws';const ws=muxWs=new WebSocket(target,'tproxy-v1.'+token);ws.binaryType='arraybuffer';ws.onopen=()=>{if(closed){ws.close();return;}for(const lane of lanes.values())lane.opened=true;state('connected');pumpMux();};ws.onmessage=e=>{if(closed)return;try{for(const frame of split(e.data)){const id=sid(frame),lane=lanes.get(id);if(!lane)continue;if(frame[0]===3)lane.rClosed=true;port.postMessage(frame,[frame]);if(frame[0]===3)end(lane,false);}state('connected');}catch{fail();}};ws.onerror=()=>{};ws.onclose=()=>{if(!closed)fail();};}
+function open(lane){if(carrier==='websocket'){openMux();if(muxWs?.readyState===WebSocket.OPEN){lane.opened=true;pumpMux();}return;}const target=origin.replace(/^https:/,'wss:')+'/api/v1/ws'; const ws=lane.ws=new WebSocket(target,'tproxy-lane-v1.'+token+'.'+lane.id);ws.binaryType='arraybuffer';ws.onopen=()=>{if(closed||lane.done){ws.close();return;}lane.opened=true;state('connected');pump(lane);};ws.onmessage=e=>{if(closed||lane.done)return;try{const frames=split(e.data);if(frames.some(frame=>sid(frame)!==lane.id))throw Error();const ended=frames.some(frame=>new Uint8Array(frame)[0]===3);if(ended)lane.rClosed=true;port.postMessage(e.data,[e.data]);state('connected');if(ended)end(lane,false);}catch{fail();}};ws.onerror=()=>{};ws.onclose=()=>{if(closed||lane.done)return;if(!lane.opened){fail();return;}end(lane,!lane.lClosed&&!lane.rClosed);}; }\nfunction pushLane(v){ const id=sid(v),type=new Uint8Array(v)[0];let lane=lanes.get(id);if(!id)throw Error();if(!lane&&(type===2||type===3||type===4))return;if(!lane){if(type!==1||used.has(id)||lanes.size>=128||used.size>=4096)throw Error();used.add(id);lane={id,ws:null,pending:[],bytes:0,items:0,timer:0,opened:false,done:false,lClosed:false,rClosed:false};lanes.set(id,lane);}if(lane.lClosed)return;if(type===3&&!lane.opened){end(lane,false);return;}if(!hold(lane,v))throw Error();lane.pending.push(v);if(type===3)lane.lClosed=true;if(token){if(carrier==='websocket'){if(!muxWs)openMux();pumpMux();}else if(!lane.ws)open(lane);else pump(lane);} }\nasync function create(first){try{state('connecting');const res=await fetch(origin+'/api/v1/session',opts('POST',boot,first));if(res.status!==200)throw Error();const selected=res.headers.get('X-Carrier-Mode')||'websocket-lanes';if(selected!=='websocket-lanes'&&selected!=='websocket')throw Error();carrier=selected;token=res.headers.get('X-Session-Token')??'';if(!token)throw Error();const welcome=await res.arrayBuffer();check(welcome);if(closed){drop();return;}port.postMessage(welcome,[welcome]);state('connected');if(carrier==='websocket'){if(lanes.size)openMux();}else for(const lane of lanes.values())if(!lane.ws)open(lane);}catch{fail();}}\nfunction close(notify){if(closed)return;closed=true;if(muxPumpTimer)clearTimeout(muxPumpTimer);muxBackpressured=false;for(const lane of [...lanes.values()])end(lane,false);used.clear();try{muxWs?.close();}catch{}muxWs=null;if(notify)drop();port?.close();}\nfunction start(next){init=true;port=next;port.onmessage=msg=>{const data=msg.data;if(data instanceof ArrayBuffer){if(!started){try{check(data);}catch{fail();return;}started=true;create(data);}else push(data);}else if(data&&data.t==='close')close(true);};port.start();state('connecting');}\naddEventListener('message',e=>{if(init||e.source!==parent||e.data===null||typeof e.data!=='object')return;const keys=Object.keys(e.data).sort();if(keys.length!==2||keys[0]!=='t'||keys[1]!=='v'||e.data.t!=='tproxy-init'||e.data.v!==1||e.ports.length!==1)return;let src;try{src=new URL(e.origin);}catch{return;}if(src.protocol!=='http:'||src.hostname!=='127.0.0.1'||!src.port||src.origin!==e.origin)return;start(e.ports[0]);});const android=globalThis.TelegramWebProxy;if(!init&&aNonce&&android&&typeof android.postMessage==='function'){const aPort={onmessage:null,start(){},close(){android.onmessage=null;},postMessage(v){if(v instanceof ArrayBuffer){for(const frame of split(v))android.postMessage(frame);}else android.postMessage(JSON.stringify(v));}};android.onmessage=e=>{let data=e.data;if(typeof data==='string'){try{data=JSON.parse(data);}catch{return;}}aPort.onmessage?.({data});};start(aPort);android.postMessage(JSON.stringify({t:'tproxy-android-init',v:1,nonce:aNonce}));}addEventListener('pagehide',()=>close(true),{once:true});})();\n</script>`
       .replaceAll('__NONCE__', nonce)
       .replace('__ORIGIN__', JSON.stringify(`https://${host}`))
       .replace('__BOOTSTRAP__', JSON.stringify(String(boot)))
@@ -3814,7 +3852,6 @@ function open(lane){if(carrier==='websocket'){openMux();if(muxWs?.readyState===W
       const body = new Uint8Array(await request.arrayBuffer()); hello(body);
       const token = await mkSess(cfg.boot);
       const carrier = CARRIERS.has(config?.carrier) ? config.carrier : 'websocket-lanes';
-      stats.sessionsStarted++;
       return new Response(enc(0x11, 0), { status: 200, headers: { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store', 'X-Session-Token': token, 'X-Carrier-Mode': carrier } });
     } catch { return reply(); }
   }
@@ -3849,41 +3886,25 @@ function open(lane){if(carrier==='websocket'){openMux();if(muxWs?.readyState===W
 
   async function makeBridgeToken(secret, host) { return await mkCap(String(secret || '').trim(), hostOf(host)); }
   function isValidSecret(secret) { return /^[a-f0-9]{32}$/i.test(String(secret || '').trim()); }
-  return { handleBridgePage, handleSession, handleWs, makeBridgeToken, hostOf, isValidSecret, getStats: copyStats };
+  return { handleBridgePage, handleSession, handleWs, makeBridgeToken, hostOf, isValidSecret };
 })();
 
 // -------------------- TWP-CF panel configuration storage --------------------
 const TWP_CONFIG_KEY = 'panel-twp-cf-config-v1';
-let twpConfigCache = null, twpConfigCacheAt = 0, twpConfigReadPending = null;
-const TWP_CONFIG_CACHE_TTL_MS = 5000;
 function randomHex(bytes = 16) { const value = crypto.getRandomValues(new Uint8Array(bytes)); return Array.from(value, b => b.toString(16).padStart(2, '0')).join(''); }
-async function loadTwpConfig(kv, options = {}) {
-  const now = Date.now();
-  if (!options.fresh && twpConfigCache && now - twpConfigCacheAt < TWP_CONFIG_CACHE_TTL_MS) return { ...twpConfigCache };
-  if (!options.fresh && twpConfigReadPending) return { ...(await twpConfigReadPending) };
-  const read = async () => {
-    const fallback = { enabled: false, secret: '', boot: '', carrier: 'websocket-lanes', updatedAt: 0 };
-    if (PANEL_DB) {
-      await ensurePanelD1Schema();
-      const row = await PANEL_DB.prepare('SELECT value FROM panel_tg_proxy WHERE key = ?1').bind('config').first();
-      if (row?.value) return { ...fallback, ...(parseStoredJson(row.value, {}) || {}) };
-    }
-    if (kv) {
-      const stored = await kv.get(TWP_CONFIG_KEY, 'json');
-      if (stored && typeof stored === 'object') return { ...fallback, ...stored };
-      if (typeof stored === 'string') return { ...fallback, ...(parseStoredJson(stored, {}) || {}) };
-    }
-    return fallback;
-  };
-  if (options.fresh) {
-    const result = await read(); twpConfigCache = result; twpConfigCacheAt = Date.now(); return { ...result };
+async function loadTwpConfig(kv) {
+  const fallback = { enabled: false, secret: '', boot: '', carrier: 'websocket-lanes', updatedAt: 0 };
+  if (PANEL_DB) {
+    await ensurePanelD1Schema();
+    const row = await PANEL_DB.prepare('SELECT value FROM panel_tg_proxy WHERE key = ?1').bind('config').first();
+    if (row?.value) return { ...fallback, ...(parseStoredJson(row.value, {}) || {}) };
   }
-  twpConfigReadPending = read();
-  try {
-    const result = await twpConfigReadPending;
-    twpConfigCache = result; twpConfigCacheAt = Date.now();
-    return { ...result };
-  } finally { twpConfigReadPending = null; }
+  if (kv) {
+    const stored = await kv.get(TWP_CONFIG_KEY, 'json');
+    if (stored && typeof stored === 'object') return { ...fallback, ...stored };
+    if (typeof stored === 'string') return { ...fallback, ...(parseStoredJson(stored, {}) || {}) };
+  }
+  return fallback;
 }
 async function saveTwpConfig(kv, config) {
   const carrier = ['websocket-lanes', 'websocket'].includes(config.carrier) ? config.carrier : 'websocket-lanes';
@@ -3896,8 +3917,6 @@ async function saveTwpConfig(kv, config) {
   } else {
     throw new Error('برای ذخیره BRIDGE_SECRET باید D1 یا KV متصل باشد.');
   }
-  twpConfigCache = { enabled: config.enabled === true, secret: String(config.secret || '').toLowerCase(), boot: String(config.boot || ''), carrier, updatedAt: Date.now() };
-  twpConfigCacheAt = Date.now();
 }
 
 function getTwpHost(value, fallback) {
@@ -3923,7 +3942,7 @@ async function handleTwpAdminConfig(request, env, kv, url) {
   if (request.method !== 'POST') return json({ error: 'Method Not Allowed' }, 405);
   try {
     const body = await readJsonLimited(request, 2048);
-    const config = await loadTwpConfig(kv, { fresh: true });
+    const config = await loadTwpConfig(kv);
     const action = String(body.action || '').trim().toLowerCase();
     if (action === 'enable') {
       const requestedSecret = String(body.secret || '').trim();
@@ -6724,10 +6743,6 @@ tbody tr:hover { background: rgba(0, 117, 255, 0.08); }
           <div class="user-form-actions"><button type="button" id="twpSaveCarrierBtn">ذخیره Carrier</button><button type="button" class="secondary" id="twpRollbackCarrierBtn">بازگشت فوری به حالت فعلی</button></div>
         </div>
       </div>
-      <div class="card" style="margin-top:16px">
-        <div class="section-head"><div><h2>آمار زنده Telegram Web Proxy</h2><p class="small-note">پایش داخلی Worker؛ بدون نصب سرویس یا وابستگی خارجی. شمارنده‌ها مختص isolate فعلی هستند و با بازیافت isolate از نو شروع می‌شوند.</p></div><button type="button" class="secondary" id="twpStatsRefreshBtn">به‌روزرسانی آمار</button></div>
-        <div id="twpStatsGrid" class="grid-2" style="margin-top:12px"><p class="small-note">برای دریافت آمار، دکمه به‌روزرسانی را بزنید.</p></div>
-      </div>
       <div class="card telegram-hero">
         <div class="section-head"><div><h2>پروکسی تلگرام (Telegram Proxy)</h2><p class="small-note">برای هر Exit Node فعال از نوع SOCKS5، لینک استاندارد tg://socks و لینک جایگزین t.me ساخته می‌شود. خود تلگرام مستقیماً به سرور SOCKS5 واقعی متصل می‌شود؛ دامنه Worker فقط صفحه راهنمای اتصال را ارائه می‌کند.</p></div><span class="pill">SOCKS5</span></div>
         <div class="telegram-toolbar"><select id="telegramQuickSelect" aria-label="انتخاب پروکسی تلگرام"></select><button type="button" id="telegramQuickConnect">اتصال مستقیم به تلگرام</button><a class="secondary" id="telegramQuickWeb" href="https://t.me/socks" target="_blank" rel="noopener noreferrer">Open in Telegram Web</a><button type="button" class="secondary" id="telegramTestActiveBtn">تست اتصال پروکسی‌های فعال</button></div>
@@ -7015,12 +7030,10 @@ function showStatus(msg, isError = false) {
 
 // -------------------- TWP-CF panel UI --------------------
 let twpProxyState = { enabled: false, status: 'not_created', secret: '', host: '', carrier: 'websocket-lanes', links: {} };
-let twpStatsState = null;
 async function refreshTwpProxy() {
   try {
     twpProxyState = await api('/api/twp/config');
     renderTwpProxy();
-    void refreshTwpStats();
   } catch (err) {
     const status = $('twpStatusPill');
     if (status) { status.textContent = 'خطا در دریافت وضعیت'; status.className = 'pill off'; }
@@ -7061,7 +7074,7 @@ function renderTwpProxy() {
   add('صفحهٔ Bridge برای WebView پشتیبانی‌شده', twpProxyState.links.webBridge, twpProxyState.links.webBridge, true);
   add('لینک افزودن WEB Proxy (فقط کلاینت سازگار)', twpProxyState.links.tg, twpProxyState.links.tg, true);
   const guide = document.createElement('p'); guide.className = 'small-note';
-  guide.textContent = 'ابتدا لینک Bridge را در کلاینتی باز کنید که TelegramWebProxy / WebView carrier را پشتیبانی می‌کند. این قابلیت را به‌عنوان SOCKS5 یا MTProto معمولی وارد نکنید؛ برای کلاینت موبایل فاقد این قابلیت، لینک SOCKS5 را انتخاب کنید.';
+  guide.textContent = 'ابتدا لینک Bridge را در کلاینتی باز کنید که TelegramWebProxy / WebView carrier را پشتیبانی می‌کند. این قابلیت را به‌عنوان SOCKS5 یا MTProto معمولی وارد نکنید؛ برای کلاینت موبایل فاقد این قابلیت، از مسیر سازگار استفاده کنید.';
   links.appendChild(guide);
 }
 async function twpProxyAction(action) {
@@ -7069,53 +7082,18 @@ async function twpProxyAction(action) {
     const secret = $('twpBridgeSecret')?.value.trim() || '';
     const data = await api('/api/twp/config', { method: 'POST', body: JSON.stringify({ action, secret }) });
     twpProxyState = data; renderTwpProxy();
-    void refreshTwpStats();
     showStatus(action === 'disable' ? 'Telegram Web Proxy غیرفعال شد.' : action === 'regenerate' ? 'Secret جدید ساخته شد؛ لینک‌های قبلی باطل شدند.' : 'Telegram Web Proxy فعال شد.');
   } catch (err) { showStatus(err.message || 'عملیات TWP-CF ناموفق بود.', true); }
-}
-function twpFormatBytes(value) {
-  let n = Math.max(0, Number(value) || 0), unit = 'B';
-  for (const next of ['KB','MB','GB','TB']) { if (n < 1024) break; n /= 1024; unit = next; }
-  return n.toFixed(unit === 'B' ? 0 : 2) + ' ' + unit;
-}
-function renderTwpStats() {
-  const root = $('twpStatsGrid'); if (!root || !twpStatsState) return;
-  const data = twpStatsState;
-  const items = [
-    ['آپلود مصرف‌شده', twpFormatBytes(data.uploadBytes)], ['دانلود مصرف‌شده', twpFormatBytes(data.downloadBytes)],
-    ['Carrier WebSocket فعال', String(data.activeWebSockets ?? 0)], ['KWS WebSocket فعال', String(data.activeKwsWebSockets ?? 0)], ['Lane فعال', String(data.activeLanes ?? 0)],
-    ['اتصال KWS موفق', String(data.kwsDialSuccess ?? 0) + ' / ' + String(data.kwsDialAttempts ?? 0)], ['میانگین اتصال KWS', data.kwsDialSuccess ? String(Math.round((data.kwsDialTotalMs || 0) / data.kwsDialSuccess)) + ' ms' : '—'],
-    ['خطای پروتکل', String(data.wsProtocolErrors ?? 0)], ['بیشترین صف KWS', twpFormatBytes(data.peakKwsQueueBytes)]
-  ];
-  root.replaceChildren();
-  for (const [label, value] of items) {
-    const card = document.createElement('div'); card.className = 'card'; card.style.padding = '12px';
-    const title = document.createElement('div'); title.className = 'small-note'; title.textContent = label;
-    const number = document.createElement('strong'); number.dir = 'ltr'; number.style.display = 'block'; number.style.marginTop = '6px'; number.textContent = value;
-    card.append(title, number); root.appendChild(card);
-  }
-  const foot = document.createElement('p'); foot.className = 'small-note'; foot.style.gridColumn = '1/-1';
-  foot.textContent = 'مدت فعالیت isolate: ' + (data.uptimeSec ?? 0) + ' ثانیه · Cache میزبان: ' + (data.hostCacheEntries ?? 0) + ' · نشست‌ها: ' + (data.sessionsStarted ?? 0) + ' · KWS کل: ' + (data.totalKwsWebSockets ?? 0);
-  root.appendChild(foot);
-}
-async function refreshTwpStats() {
-  const root = $('twpStatsGrid');
-  try { twpStatsState = await api('/api/twp/stats'); renderTwpStats(); }
-  catch (err) { if (root) root.textContent = err?.message || 'دریافت آمار TWP ناموفق بود.'; }
 }
 async function setTwpCarrier(carrier) {
   try {
     const data = await api('/api/twp/config', { method: 'POST', body: JSON.stringify({ action: 'set-carrier', carrier }) });
     twpProxyState = data; renderTwpProxy();
     showStatus(carrier === 'websocket-lanes' ? 'Carrier به حالت فعلی بازگردانده شد؛ نشست‌های جدید از WebSocket Lanes استفاده می‌کنند.' : 'Carrier آزمایشی برای نشست‌های جدید فعال شد.');
-    void refreshTwpStats();
   } catch (err) { showStatus(err.message || 'تغییر Carrier ناموفق بود.', true); }
 }
 $('twpSaveCarrierBtn')?.addEventListener('click', () => void setTwpCarrier($('twpCarrierSelect')?.value || 'websocket-lanes'));
 $('twpRollbackCarrierBtn')?.addEventListener('click', () => void setTwpCarrier('websocket-lanes'));
-$('twpStatsRefreshBtn')?.addEventListener('click', () => { void refreshTwpStats(); });
-const TWP_STATS_REFRESH_INTERVAL_MS = 15000;
-setInterval(() => { const section = $('sec-telegram'); if (document.visibilityState === 'visible' && section?.classList.contains('active')) void refreshTwpStats(); }, TWP_STATS_REFRESH_INTERVAL_MS);
 $('twpEnableBtn')?.addEventListener('click', () => void twpProxyAction('enable'));
 $('twpDisableBtn')?.addEventListener('click', () => void twpProxyAction('disable'));
 $('twpRegenerateBtn')?.addEventListener('click', () => {
